@@ -11,19 +11,31 @@ import { BUDGET } from '../core/Budget';
 import { clamp } from '../core/math';
 
 export const PED_RENDER = {
-  cullDist: 120, bodyW: 0.44, bodyH: 0.62, bodyD: 0.26, bodyY: 1.12, headSize: 0.24, headY: 1.56,
+  cullDist: 120, bodyW: 0.44, bodyH: 0.62, bodyD: 0.26, bodyY: 1.12, headSize: 0.24, headY: 1.6,
   legW: 0.18, legH: 0.78, legD: 0.2, legX: 0.11, legTopY: 0.78, swingWalk: 0.55, swingFlee: 1.0, lyingLift: 0.22,
   armW: 0.13, armH: 0.6, armD: 0.15, armX: 0.28, armTopY: 1.38, armSwing: 0.75,
   shoeH: 0.1, shoeGrow: 1.25, hairH: 0.07, shadowR: 0.46, shadowLift: 0.03,
+  // Tapers (bottom face scale): narrow waist, narrow jaw, calf thinner than thigh. Same trick as the player model.
+  waistK: 0.74, jawK: 0.84, limbK: 0.88, neckH: 0.1, neckW: 0.11,
 };
 
 /** Vertex-colour multipliers layered under the per-instance colour: 1 keeps it, <1 darkens (hair, shoes). */
 const TINT_PLAIN = 1, TINT_HAIR = 0.32, TINT_SHOE = 0.28;
 
 /** Soft-edged limb (see PlayerRenderer): non-indexed like RoundedBoxGeometry so merges stay compatible. */
-function box(w: number, h: number, d: number, pivotTop: boolean): THREE.BufferGeometry {
+function box(w: number, h: number, d: number, pivotTop: boolean, botK = 1): THREE.BufferGeometry {
   const r = Math.min(0.045, Math.min(w, Math.min(h, d)) * 0.28);
   const g = new RoundedBoxGeometry(w, h, d, 1, r);
+  if (botK !== 1) {
+    const pos = g.attributes.position as THREE.BufferAttribute;
+    for (let i = 0; i < pos.count; i++) {
+      const t = Math.min(1, Math.max(0, pos.getY(i) / h + 0.5));
+      const k = botK + (1 - botK) * t;
+      pos.setX(i, pos.getX(i) * k);
+      pos.setZ(i, pos.getZ(i) * k);
+    }
+    g.computeVertexNormals();
+  }
   if (pivotTop) g.translate(0, -h / 2, 0);
   return g;
 }
@@ -37,19 +49,25 @@ function tinted(g: THREE.BufferGeometry, k: number): THREE.BufferGeometry {
   return g;
 }
 
-/** Head + a darker hair cap on top, merged into one instanced part. */
+/** Head: jaw-tapered skull, a darker hair cap and a neck stub, merged into one skin-coloured instanced part. */
 function headGeometry(): THREE.BufferGeometry {
   const R = PED_RENDER;
-  const skull = tinted(box(R.headSize, R.headSize + 0.04, R.headSize, false), TINT_PLAIN);
+  const skullH = R.headSize + 0.04;
+  const skull = tinted(box(R.headSize, skullH, R.headSize, false, R.jawK), TINT_PLAIN);
   const hair = box(R.headSize + 0.02, R.hairH, R.headSize + 0.02, false);
-  hair.translate(0, (R.headSize + 0.04) / 2, 0);
-  return BufferGeometryUtils.mergeGeometries([skull, tinted(hair, TINT_HAIR)], false);
+  hair.translate(0, skullH / 2 - R.hairH * 0.2, 0);
+  const back = box(R.headSize, R.hairH * 1.7, R.headSize * 0.4, false);
+  back.translate(0, skullH * 0.16, -R.headSize * 0.34);
+  // The neck rides with the head so it takes the skin colour rather than the shirt colour of the body instance.
+  const neck = tinted(box(R.neckW, R.neckH, R.neckW, false), TINT_PLAIN);
+  neck.translate(0, -skullH / 2 - R.neckH / 2 + 0.03, 0);
+  return BufferGeometryUtils.mergeGeometries([skull, tinted(hair, TINT_HAIR), tinted(back, TINT_HAIR), neck], false);
 }
 
 /** Leg + a darker shoe at the ankle, pivoted at the hip so a single rotation swings the whole limb. */
 function legGeometry(): THREE.BufferGeometry {
   const R = PED_RENDER;
-  const leg = tinted(box(R.legW, R.legH, R.legD, true), TINT_PLAIN);
+  const leg = tinted(box(R.legW, R.legH, R.legD, true, R.limbK), TINT_PLAIN);
   const shoe = box(R.legW * R.shoeGrow, R.shoeH, R.legD * R.shoeGrow + 0.06, false);
   shoe.translate(0, -R.legH + R.shoeH / 2, 0.02);
   return BufferGeometryUtils.mergeGeometries([leg, tinted(shoe, TINT_SHOE)], false);
@@ -80,12 +98,12 @@ export class PedRenderer {
     this.scene = scene;
     const R = PED_RENDER;
     const cap = BUDGET.MAX_PEDS;
-    this.body = this.make(tinted(box(R.bodyW, R.bodyH, R.bodyD, false), TINT_PLAIN), cap);
+    this.body = this.make(tinted(box(R.bodyW, R.bodyH, R.bodyD, false, R.waistK), TINT_PLAIN), cap);
     this.head = this.make(headGeometry(), cap);
     this.legL = this.make(legGeometry(), cap);
     this.legR = this.make(legGeometry(), cap);
-    this.armL = this.make(tinted(box(R.armW, R.armH, R.armD, true), TINT_PLAIN), cap);
-    this.armR = this.make(tinted(box(R.armW, R.armH, R.armD, true), TINT_PLAIN), cap);
+    this.armL = this.make(tinted(box(R.armW, R.armH, R.armD, true, R.limbK), TINT_PLAIN), cap);
+    this.armR = this.make(tinted(box(R.armW, R.armH, R.armD, true, R.limbK), TINT_PLAIN), cap);
     this.shadows = new ContactShadows(scene, cap);
   }
 
