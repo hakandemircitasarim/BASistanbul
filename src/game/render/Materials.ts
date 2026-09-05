@@ -62,14 +62,24 @@ export class Materials {
     for (let i = 0; i < STYLES.length; i++) {
       const style = STYLES[i];
       const w = tex.windows(style, i + 1);
-      this.building[style] = new THREE.MeshLambertMaterial({ vertexColors: true, map: w.map, emissiveMap: w.emissive, emissive: 0xffffff, emissiveIntensity: 0 });
+      this.building[style] = new THREE.MeshLambertMaterial({
+        vertexColors: true, map: w.map, emissiveMap: w.emissive, emissive: 0xffffff, emissiveIntensity: 0,
+        // Per-pixel relief so windows read as recessed instead of painted on a flat slab.
+        normalMap: w.normal, normalScale: new THREE.Vector2(0.75, 0.75),
+      });
     }
     this.plain = new THREE.MeshLambertMaterial({ vertexColors: true });
     this.glow = new THREE.MeshLambertMaterial({ vertexColors: true, emissiveMap: tex.glowAtlas(), emissive: 0xffffff, emissiveIntensity: 0 });
     const shop = tex.shopfront();
-    this.shopfront = new THREE.MeshLambertMaterial({ vertexColors: true, map: shop.map, emissiveMap: shop.emissive, emissive: 0xffffff, emissiveIntensity: SHOP_EMISSIVE_DAY });
+    this.shopfront = new THREE.MeshLambertMaterial({
+      vertexColors: true, map: shop.map, emissiveMap: shop.emissive, emissive: 0xffffff, emissiveIntensity: SHOP_EMISSIVE_DAY,
+      normalMap: shop.normal, normalScale: new THREE.Vector2(0.9, 0.9),
+    });
     const pl = tex.plinth();
-    this.plinth = new THREE.MeshLambertMaterial({ vertexColors: true, map: pl.map, emissiveMap: pl.emissive, emissive: 0xffffff, emissiveIntensity: 0 });
+    this.plinth = new THREE.MeshLambertMaterial({
+      vertexColors: true, map: pl.map, emissiveMap: pl.emissive, emissive: 0xffffff, emissiveIntensity: 0,
+      normalMap: pl.normal, normalScale: new THREE.Vector2(0.9, 0.9),
+    });
     this.road = new THREE.MeshLambertMaterial({ map: tex.road() });
     this.crosswalk = new THREE.MeshLambertMaterial({ map: tex.crosswalk() });
     this.roadMark = new THREE.MeshLambertMaterial({ map: tex.roadMarks(), transparent: true, alphaTest: 0.35, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -6 });

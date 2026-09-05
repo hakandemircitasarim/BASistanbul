@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import type { BuildingStyle } from '../city/CityData';
 import { Random } from '../core/Random';
 
-export interface WindowTextures { map: THREE.CanvasTexture; emissive: THREE.CanvasTexture }
+export interface WindowTextures { map: THREE.CanvasTexture; emissive: THREE.CanvasTexture; normal: THREE.CanvasTexture }
 export interface AtlasRect { u0: number; v0: number; u1: number; v1: number }
 
 /** Window tile: 256x512 px = 16 m x 28 m; the top ROOF_STRIP px (v > 0.98) are a plain wall color used by roofs and plain parts. */
@@ -84,7 +84,8 @@ export class TextureFactory {
     const key = `win:${style}:${seed}`;
     const mk = this.cache.get(key + ':map') as THREE.CanvasTexture | undefined;
     const ek = this.cache.get(key + ':emi') as THREE.CanvasTexture | undefined;
-    if (mk && ek) return { map: mk, emissive: ek };
+    const nk = this.cache.get(key + ':nrm') as THREE.CanvasTexture | undefined;
+    if (mk && ek && nk) return { map: mk, emissive: ek, normal: nk };
     const W = 256, H = 512;
     const rng = new Random(seed * 7919 + style.length);
     const m = this.canvas(W, H), e = this.canvas(W, H);
@@ -224,7 +225,82 @@ export class TextureFactory {
     e.ctx.fillRect(0, 0, W, ROOF_STRIP_PX);
     const map = this.finish(key + ':map', m.canvas, true);
     const emissive = this.finish(key + ':emi', e.canvas, true);
-    return { map, emissive };
+    const normal = this.normalFromLuminance(key + ':nrm', m.canvas, 6.5);
+    return { map, emissive, normal };
+  }
+
+  /**
+   * Derives a tangent-space normal map from a painted albedo, reading luminance as height: dark glass sinks into
+   * the wall, bright fluting and cornices stand out. Cheap way to give flat facades per-pixel relief.
+   */
+  private normalFromLuminance(key: string, src: HTMLCanvasElement, strength: number): THREE.CanvasTexture {
+    const hit = this.cache.get(key) as THREE.CanvasTexture | undefined;
+    if (hit) return hit;
+    const W = src.width, H = src.height;
+    const sctx = src.getContext('2d');
+    const out = this.canvas(W, H);
+    if (!sctx) return this.finish(key, out.canvas, false);
+    const img = sctx.getImageData(0, 0, W, H).data;
+    const n = W * H;
+    const lum = new Float32Array(n), wide = new Float32Array(n), tmp = new Float32Array(n);
+    for (let i = 0, p = 0; i < n; i++, p += 4) lum[i] = (img[p] * 0.2126 + img[p + 1] * 0.7152 + img[p + 2] * 0.0722) / 255;
+    // High pass: the painted albedo has broad gradients (a glass pane shaded top to bottom, a wall gradient) that would
+    // read as a curved surface and make every window look like a pillow. Subtracting a wide blur keeps only the sharp
+    // steps - mullions, sills, fluting, fascia edges - so panes stay flat and their frames get the relief.
+    const R = 4;
+    wide.set(lum);
+    this.boxBlur(wide, tmp, W, H, R);
+    for (let i = 0; i < n; i++) tmp[i] = lum[i] - wide[i];
+    // One 3-tap pass to take the edge off the albedo speckle noise; tiles wrap, so the taps wrap too.
+    const h = wide;
+    for (let y = 0; y < H; y++) {
+      const row = y * W;
+      for (let x = 0; x < W; x++) h[row + x] = (tmp[row + (x === 0 ? W - 1 : x - 1)] + 2 * tmp[row + x] + tmp[row + (x === W - 1 ? 0 : x + 1)]) * 0.25;
+    }
+    for (let y = 0; y < H; y++) {
+      const up = (y === 0 ? H - 1 : y - 1) * W, dn = (y === H - 1 ? 0 : y + 1) * W, row = y * W;
+      for (let x = 0; x < W; x++) tmp[row + x] = (h[up + x] + 2 * h[row + x] + h[dn + x]) * 0.25;
+    }
+    const dst = out.ctx.createImageData(W, H);
+    const d = dst.data;
+    for (let y = 0; y < H; y++) {
+      const up = (y === 0 ? H - 1 : y - 1) * W, dn = (y === H - 1 ? 0 : y + 1) * W, row = y * W;
+      for (let x = 0; x < W; x++) {
+        const xl = x === 0 ? W - 1 : x - 1, xr = x === W - 1 ? 0 : x + 1;
+        // Sobel over the height field. +Y in the normal map points up the texture, matching three's tangent frame.
+        const gx = (tmp[up + xr] + 2 * tmp[row + xr] + tmp[dn + xr]) - (tmp[up + xl] + 2 * tmp[row + xl] + tmp[dn + xl]);
+        const gy = (tmp[dn + xl] + 2 * tmp[dn + x] + tmp[dn + xr]) - (tmp[up + xl] + 2 * tmp[up + x] + tmp[up + xr]);
+        const nx = -gx * strength, ny = gy * strength;
+        const inv = 1 / Math.sqrt(nx * nx + ny * ny + 1);
+        const i = (row + x) * 4;
+        d[i] = (nx * inv * 0.5 + 0.5) * 255;
+        d[i + 1] = (ny * inv * 0.5 + 0.5) * 255;
+        d[i + 2] = (inv * 0.5 + 0.5) * 255;
+        d[i + 3] = 255;
+      }
+    }
+    out.ctx.putImageData(dst, 0, 0);
+    return this.finish(key, out.canvas, false);
+  }
+
+  /** Separable wrapping box blur of radius r, in place (tmp is scratch of the same size). */
+  private boxBlur(a: Float32Array, tmp: Float32Array, W: number, H: number, r: number): void {
+    const inv = 1 / (2 * r + 1);
+    for (let y = 0; y < H; y++) {
+      const row = y * W;
+      for (let x = 0; x < W; x++) {
+        let sum = 0;
+        for (let k = -r; k <= r; k++) sum += a[row + ((x + k + W * 2) % W)];
+        tmp[row + x] = sum * inv;
+      }
+    }
+    for (let x = 0; x < W; x++) {
+      for (let y = 0; y < H; y++) {
+        let sum = 0;
+        for (let k = -r; k <= r; k++) sum += tmp[((y + k + H * 2) % H) * W + x];
+        a[y * W + x] = sum * inv;
+      }
+    }
   }
 
   /** Ground-floor shopfront band (16 m x 4.2 m): four bays of glazing, doors and fascias; emissive = warm shop interiors + fascia glow. */
@@ -232,7 +308,8 @@ export class TextureFactory {
     const key = 'shop';
     const mk = this.cache.get(key + ':map') as THREE.CanvasTexture | undefined;
     const ek = this.cache.get(key + ':emi') as THREE.CanvasTexture | undefined;
-    if (mk && ek) return { map: mk, emissive: ek };
+    const nk = this.cache.get(key + ':nrm') as THREE.CanvasTexture | undefined;
+    if (mk && ek && nk) return { map: mk, emissive: ek, normal: nk };
     const W = 1024, H = 256;
     const rng = new Random(1301);
     const m = this.canvas(W, H), e = this.canvas(W, H);
@@ -308,7 +385,8 @@ export class TextureFactory {
     m.ctx.fillRect(0, kerbY, W, 3);
     const map = this.finish(key + ':map', m.canvas, true, true, true);
     const emissive = this.finish(key + ':emi', e.canvas, true, true, true);
-    return { map, emissive };
+    const normal = this.normalFromLuminance(key + ':nrm', m.canvas, 5.5);
+    return { map, emissive, normal };
   }
 
   /** Downtown stone plinth band (16 m x 6 m): pilasters, recessed dark glazing, brass trim; emissive = dim lobby light. */
@@ -316,7 +394,8 @@ export class TextureFactory {
     const key = 'plinth';
     const mk = this.cache.get(key + ':map') as THREE.CanvasTexture | undefined;
     const ek = this.cache.get(key + ':emi') as THREE.CanvasTexture | undefined;
-    if (mk && ek) return { map: mk, emissive: ek };
+    const nk = this.cache.get(key + ':nrm') as THREE.CanvasTexture | undefined;
+    if (mk && ek && nk) return { map: mk, emissive: ek, normal: nk };
     const W = 1024, H = 384;
     const rng = new Random(1607);
     const m = this.canvas(W, H), e = this.canvas(W, H);
@@ -370,7 +449,8 @@ export class TextureFactory {
     this.noise(m.ctx, W, H, rng, 900, 2, 0.08, true);
     const map = this.finish(key + ':map', m.canvas, true, true, true);
     const emissive = this.finish(key + ':emi', e.canvas, true, true, true);
-    return { map, emissive };
+    const normal = this.normalFromLuminance(key + ':nrm', m.canvas, 5.5);
+    return { map, emissive, normal };
   }
 
   /** Emissive atlas for landmark/traffic-light glow parts: eight 16 px cells (black, magenta, cyan, yellow, orange, red, green, white); sample centers via GLOW_U. */

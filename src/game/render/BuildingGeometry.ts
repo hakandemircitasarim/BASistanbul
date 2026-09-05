@@ -481,10 +481,10 @@ export function appendBuildingDetail(gb: GeoBuilder, b: Building, rng: Random, s
   if (h > 26 && b.roofKind !== 'spire' && rng.chance(0.5)) {
     const ax = b.x + rng.range(-rw * 0.22, rw * 0.22), az = b.z + rng.range(-rd * 0.22, rd * 0.22);
     const top = h + rng.range(5, 13);
-    gb.bar(ax, h, az, ax, top, az, 0.24, 0xb0b4ba);
+    gb.bar(ax, h, az, ax, top, az, 0.34, 0xb0b4ba);
     for (let k = 0; k < 3; k++) {
       const y = h + (top - h) * (0.42 + k * 0.18);
-      gb.bar(ax - 1.2, y, az, ax + 1.2, y, az, 0.13, 0xb0b4ba);
+      gb.bar(ax - 1.2, y, az, ax + 1.2, y, az, 0.2, 0xb0b4ba);
     }
     gb.boxPlain(ax - 0.2, top, az - 0.2, ax + 0.2, top + 0.55, az + 0.2, 0xff2418, false, GLOW_U.red);
   }

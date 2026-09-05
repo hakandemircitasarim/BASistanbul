@@ -1,4 +1,4 @@
-// Render test page (/rendertest?hour=19&view=plaza|beach|spawn|neon|fx&quality=low|high&run=1&fx=1): city + sky at a fixed camera, no Engine. Track B.
+// Render test page (/rendertest?hour=19&view=plaza|beach|spawn|neon|fx&cam=x,y,z&look=x,y,z&quality=low|high&run=1&fx=1): city + sky at a fixed camera, no Engine. Track B.
 import { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { Renderer } from '@/game/render/Renderer';
@@ -47,7 +47,16 @@ export default function RenderTest() {
     const hourParam = Number(p.get('hour'));
     const hour = p.has('hour') && isFinite(hourParam) ? hourParam : 18.7;
     const quality: Settings['quality'] = p.get('quality') === 'high' ? 'high' : 'low';
-    const view = VIEWS[p.get('view') ?? 'plaza'] ?? VIEWS.plaza;
+    // ?cam=x,y,z&look=x,y,z overrides the named view (close-up inspection of a facade, a car, a landmark).
+    const nums = (v: string | null, n: number): number[] | null => {
+      const a = (v ?? '').split(',').map(Number);
+      return a.length === n && a.every((q) => isFinite(q)) ? a : null;
+    };
+    const camAt = nums(p.get('cam'), 3), look = nums(p.get('look'), 3);
+    const named = VIEWS[p.get('view') ?? 'plaza'] ?? VIEWS.plaza;
+    const view: View = camAt && look
+      ? { x: camAt[0], y: camAt[1], z: camAt[2], tx: look[0], ty: look[1], tz: look[2] }
+      : named;
     const run = p.get('run') === '1';
     const fx = p.get('fx') === '1';
     const settings: Settings = { ...DEFAULT_SETTINGS, quality, shadows: quality === 'high' };
