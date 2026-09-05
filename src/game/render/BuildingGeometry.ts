@@ -1,7 +1,8 @@
 // Building/landmark geometry builders: world-space boxes/tiers/spires with meter UVs and vertex colors. Track B.
 import * as THREE from 'three';
 import type { Building, BuildingStyle, Landmark } from '../city/CityData';
-import { GLOW_U, ROOF_V, WINDOW_TILE_H, WINDOW_TILE_W } from './TextureFactory';
+import type { Random } from '../core/Random';
+import { GLOW_U, PLINTH_BAND_H, PLINTH_TILE_W, ROOF_V, SHOP_BAND_H, SHOP_TILE_W, WINDOW_TILE_H, WINDOW_TILE_W } from './TextureFactory';
 
 /** Material key for a landmark part: a windowed building style (plain parts use the white strip UV) or 'glow' (emissive neon parts). */
 export type LandmarkStyle = BuildingStyle | 'glow';
@@ -25,6 +26,9 @@ export class GeoBuilder {
   private glowSide: GeoBuilder | null = null;
 
   get glow(): GeoBuilder | null { return this.glowSide; }
+
+  /** Routes this builder's glow parts into a shared sink so many style builders produce a single glow mesh. */
+  setGlowSink(sink: GeoBuilder): void { this.glowSide = sink; }
 
   /** Builder + plain UV for a part: glow parts go to the sibling builder with atlas UVs, others stay here on the white strip. */
   private plainTarget(glow: number): { b: GeoBuilder; u: number; v: number } {
@@ -95,6 +99,28 @@ export class GeoBuilder {
     b.quad(x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, -1, 0, 0, u, v, u, v, u, v, u, v);
     b.quad(x0, y1, z1, x1, y1, z1, x1, y1, z0, x0, y1, z0, 0, 1, 0, u, v, u, v, u, v, u, v);
     if (bottom) b.quad(x0, y0, z0, x1, y0, z0, x1, y0, z1, x0, y0, z1, 0, -1, 0, u, v, u, v, u, v, u, v);
+  }
+
+  /** Single quad with the plain-strip UV (vertex color only); the normal comes from the winding. */
+  plainQuad(ax: number, ay: number, az: number, bx: number, by: number, bz: number, cx: number, cy: number, cz: number, dx: number, dy: number, dz: number, color: number, twoSided = false): void {
+    const ux = bx - ax, uy = by - ay, uz = bz - az, vx = cx - ax, vy = cy - ay, vz = cz - az;
+    let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    const l = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+    nx /= l; ny /= l; nz /= l;
+    const u = 0.25, v = ROOF_V;
+    this.setColor(color);
+    this.quad(ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, u, v, u, v, u, v, u, v);
+    if (twoSided) this.quad(dx, dy, dz, cx, cy, cz, bx, by, bz, ax, ay, az, -nx, -ny, -nz, u, v, u, v, u, v, u, v);
+  }
+
+  /** Four vertical faces of a street-level band: u repeats every `tileW` meters along the face, v spans 0..1 over the band height. */
+  bandBox(x0: number, y0: number, z0: number, x1: number, y1: number, z1: number, tileW: number, color: number): void {
+    const ux = (x1 - x0) / tileW, uz = (z1 - z0) / tileW;
+    this.setColor(color);
+    this.quad(x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1, 0, 0, 1, 0, 0, ux, 0, ux, 1, 0, 1);
+    this.quad(x1, y0, z0, x0, y0, z0, x0, y1, z0, x1, y1, z0, 0, 0, -1, 0, 0, ux, 0, ux, 1, 0, 1);
+    this.quad(x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, 1, 0, 0, 0, 0, uz, 0, uz, 1, 0, 1);
+    this.quad(x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, -1, 0, 0, 0, 0, uz, 0, uz, 1, 0, 1);
   }
 
   /** Four-sided pyramid over the rectangle x0..x1 / z0..z1 from y0 to apexY. */
@@ -344,4 +370,198 @@ export function landmarkGeometries(l: Landmark): LandmarkPart[] {
     }
   }
   return parts;
+}
+
+/** A big painted/neon wall sign derived deterministically for a blank facade (CityRenderer turns it into an atlas quad). */
+export interface WallSign { x: number; y: number; z: number; yaw: number; w: number; h: number; color: number; word: number }
+
+/** Street-level band geometry constants: band heights come from the band textures, `out` is how far the band steps in front of the wall. */
+export const BAND = { shopH: SHOP_BAND_H, shopTile: SHOP_TILE_W, shopOut: 0.16, plinthH: PLINTH_BAND_H, plinthTile: PLINTH_TILE_W, plinthOut: 0.34 } as const;
+
+const FACE_DIR: [number, number][] = [[0, 1], [1, 0], [0, -1], [-1, 0]];
+const FACE_YAW = [0, Math.PI / 2, Math.PI, -Math.PI / 2];
+const AWNING_COLORS: [number, number][] = [[0xd83b46, 0xf0e6d8], [0x1f7a5a, 0xf0e6d8], [0x2a5aa8, 0xf0e6d8], [0xe07a1f, 0x3a2a20], [0x8a2f70, 0xf0e6d8]];
+
+/** Nearest glow-atlas cell for an accent color (used by crowns and neon fins). */
+function glowCellFor(color: number): number {
+  const r = (color >> 16) & 255, g = (color >> 8) & 255, b = color & 255;
+  if (r > 190 && b > 150 && g < 140) return GLOW_U.magenta;
+  if (b > 190 && g > 150 && r < 140) return GLOW_U.cyan;
+  if (r > 190 && g > 190 && b < 140) return GLOW_U.yellow;
+  if (g > 190 && r < 150) return GLOW_U.green;
+  return GLOW_U.orange;
+}
+
+/**
+ * Ground floor: a band in front of the wall (shopfront glazing or downtown stone plinth) plus a cornice cap in the
+ * building mesh, and fabric awnings over the shop bays on the street-facing side.
+ */
+export function appendStreetLevel(styleGb: GeoBuilder, bandGb: GeoBuilder, b: Building, rng: Random, plinthStyle: boolean): void {
+  const out = plinthStyle ? BAND.plinthOut : BAND.shopOut;
+  const tile = plinthStyle ? BAND.plinthTile : BAND.shopTile;
+  const h = Math.min(plinthStyle ? BAND.plinthH : BAND.shopH, Math.max(3, b.h - 2.5));
+  const x0 = b.x - b.w / 2 - out, x1 = b.x + b.w / 2 + out, z0 = b.z - b.d / 2 - out, z1 = b.z + b.d / 2 + out;
+  // Slight tint from the building color so blocks do not all share one shopfront hue.
+  const tintK = plinthStyle ? 0.62 : 0.78;
+  bandGb.bandBox(x0, 0, z0, x1, h, z1, tile, lighten(b.color, tintK));
+  // Cornice capping the band (also hides the step back to the wall).
+  const cap = lighten(b.color, plinthStyle ? 0.3 : 0.55);
+  styleGb.boxPlain(x0 - 0.18, h - 0.32, z0 - 0.18, x1 + 0.18, h + 0.16, z1 + 0.18, cap);
+  if (plinthStyle) return;
+  const face = b.facing;
+  const along = face === 0 || face === 2 ? b.w : b.d;
+  if (along < 6) return;
+  const dir = FACE_DIR[face];
+  const nx = dir[0], nz = dir[1];
+  const tx = nz, tz = -nx;
+  const wall = (face === 0 || face === 2 ? b.d : b.w) / 2 + out;
+  const pal = AWNING_COLORS[rng.int(0, AWNING_COLORS.length - 1)];
+  const segs = 4;
+  const yTop = h - 0.85, yOut = yTop - 0.5, depth = 1.35, hang = 0.42;
+  const span = along - 1.2;
+  const px = (t: number, o: number): number => b.x + tx * t + nx * o;
+  const pz = (t: number, o: number): number => b.z + tz * t + nz * o;
+  for (let i = 0; i < segs; i++) {
+    const t0 = -span / 2 + (span * i) / segs, t1 = -span / 2 + (span * (i + 1)) / segs;
+    const c = i % 2 === 0 ? pal[0] : pal[1];
+    styleGb.plainQuad(px(t0, wall), yTop, pz(t0, wall), px(t1, wall), yTop, pz(t1, wall),
+      px(t1, wall + depth), yOut, pz(t1, wall + depth), px(t0, wall + depth), yOut, pz(t0, wall + depth), c, true);
+    styleGb.plainQuad(px(t0, wall + depth), yOut, pz(t0, wall + depth), px(t1, wall + depth), yOut, pz(t1, wall + depth),
+      px(t1, wall + depth), yOut - hang, pz(t1, wall + depth), px(t0, wall + depth), yOut - hang, pz(t0, wall + depth), c, true);
+  }
+}
+
+/** Roof clutter, parapets, pilasters, ledges, crowns and blank-wall sign panels for one building (all plain-strip geometry). */
+export function appendBuildingDetail(gb: GeoBuilder, b: Building, rng: Random, signs: WallSign[]): void {
+  const x0 = b.x - b.w / 2, x1 = b.x + b.w / 2, z0 = b.z - b.d / 2, z1 = b.z + b.d / 2;
+  const roof = darken(b.color, ROOF_DARKEN);
+  const h = b.h;
+  const downtown = b.district === 'downtown';
+  const stepped = b.roofKind === 'stepped' && h > 9;
+  const tiers = stepped ? (h > 40 ? 3 : 2) : 1;
+  const inset = stepped ? Math.min(b.w, b.d) * 0.14 * (tiers - 1) : 0;
+  const rx0 = x0 + inset, rx1 = x1 - inset, rz0 = z0 + inset, rz1 = z1 - inset;
+  const rw = rx1 - rx0, rd = rz1 - rz0;
+
+  // --- Roof: parapet wall + clutter -------------------------------------------------------------
+  if (b.roofKind !== 'spire' && rw > 4 && rd > 4) {
+    const t = 0.4, ph = downtown ? 1.05 : 0.8, cap = lighten(b.color, 0.28);
+    gb.boxPlain(rx0 - 0.25, h - 0.15, rz0 - 0.25, rx1 + 0.25, h + ph, rz0 + t, cap);
+    gb.boxPlain(rx0 - 0.25, h - 0.15, rz1 - t, rx1 + 0.25, h + ph, rz1 + 0.25, cap);
+    gb.boxPlain(rx0 - 0.25, h - 0.15, rz0 + t, rx0 + t, h + ph, rz1 - t, cap);
+    gb.boxPlain(rx1 - t, h - 0.15, rz0 + t, rx1 + 0.25, h + ph, rz1 - t, cap);
+  }
+  if (b.roofKind !== 'spire' && rw > 9 && rd > 9) {
+    const n = rng.int(2, 4);
+    for (let i = 0; i < n; i++) {
+      const cx = rng.range(rx0 + 2.2, rx1 - 2.2), cz = rng.range(rz0 + 2.2, rz1 - 2.2);
+      const kind = rng.int(0, 3);
+      if (kind === 0) {
+        // Water tank on a short cradle.
+        gb.boxPlain(cx - 1.15, h, cz - 1.15, cx + 1.15, h + 0.65, cz + 1.15, 0x5f5a55);
+        gb.cylinder(cx, cz, 1.2, 1.2, h + 0.65, h + 3.1, 8, 0x8a6742, false, 0x6d5238);
+      } else if (kind === 1) {
+        const m = rng.int(1, 2);
+        for (let k = 0; k < m; k++) {
+          const ox = cx + k * 2.2;
+          if (ox + 0.95 > rx1) break;
+          gb.boxPlain(ox - 0.95, h, cz - 0.65, ox + 0.95, h + 0.95, cz + 0.65, 0xacb2b8);
+          gb.boxPlain(ox - 0.7, h + 0.95, cz - 0.45, ox + 0.7, h + 1.05, cz + 0.45, 0x8b9198);
+        }
+      } else if (kind === 2) {
+        // Roof access box with a door.
+        gb.boxPlain(cx - 1.5, h, cz - 1.25, cx + 1.5, h + 2.5, cz + 1.25, lighten(roof, 0.3));
+        gb.boxPlain(cx - 0.55, h, cz + 1.25, cx + 0.55, h + 1.8, cz + 1.4, 0x39332c);
+      } else {
+        gb.cylinder(cx, cz, 0.36, 0.36, h, h + 1.5, 6, 0x9aa0a6, false, 0x767c82);
+        gb.cylinder(cx + 1.3, cz + 0.9, 0.28, 0.28, h, h + 1.05, 6, 0x9aa0a6, false, 0x767c82);
+      }
+    }
+  }
+  if (h > 26 && b.roofKind !== 'spire' && rng.chance(0.5)) {
+    const ax = b.x + rng.range(-rw * 0.22, rw * 0.22), az = b.z + rng.range(-rd * 0.22, rd * 0.22);
+    const top = h + rng.range(5, 13);
+    gb.bar(ax, h, az, ax, top, az, 0.24, 0xb0b4ba);
+    for (let k = 0; k < 3; k++) {
+      const y = h + (top - h) * (0.42 + k * 0.18);
+      gb.bar(ax - 1.2, y, az, ax + 1.2, y, az, 0.13, 0xb0b4ba);
+    }
+    gb.boxPlain(ax - 0.2, top, az - 0.2, ax + 0.2, top + 0.55, az + 0.2, 0xff2418, false, GLOW_U.red);
+  }
+
+  // --- Facade dressing --------------------------------------------------------------------------
+  if (downtown && b.roofKind === 'flat' && h >= 26) {
+    // Vertical pilaster strips running the full shaft.
+    const yb = BAND.plinthH + 0.3, yt = h - 1.4, t = 0.3, hw = 0.6, col = lighten(b.color, 0.5);
+    if (yt > yb + 4) {
+      const nX = Math.max(1, Math.round(b.w / 8) - 1);
+      for (let i = 1; i <= nX; i++) {
+        const px = x0 + (b.w * i) / (nX + 1);
+        gb.boxPlain(px - hw, yb, z0 - t, px + hw, yt, z0, col);
+        gb.boxPlain(px - hw, yb, z1, px + hw, yt, z1 + t, col);
+      }
+      const nZ = Math.max(1, Math.round(b.d / 8) - 1);
+      for (let i = 1; i <= nZ; i++) {
+        const pz = z0 + (b.d * i) / (nZ + 1);
+        gb.boxPlain(x0 - t, yb, pz - hw, x0, yt, pz + hw, col);
+        gb.boxPlain(x1, yb, pz - hw, x1 + t, yt, pz + hw, col);
+      }
+    }
+  }
+  if (h > 42) {
+    // Crown: a light cornice plus a night-glowing accent band.
+    gb.boxPlain(x0 - 0.5, h - 4.4, z0 - 0.5, x1 + 0.5, h - 3.6, z1 + 0.5, lighten(b.color, 0.55));
+    gb.boxPlain(x0 - 0.55, h - 3.4, z0 - 0.55, x1 + 0.55, h - 2.95, z1 + 0.55, b.accent, false, glowCellFor(b.accent));
+  }
+  if (b.style === 'artdeco' && !downtown) {
+    // Balcony ledges every couple of floors, with a rail on the street side.
+    const led = lighten(b.color, 0.5);
+    const dir = FACE_DIR[b.facing];
+    const front = (b.facing === 0 || b.facing === 2 ? b.d : b.w) / 2;
+    let band = 0;
+    for (let y = 7; y < h - 3.5; y += 6.5) {
+      gb.boxPlain(x0 - 0.5, y, z0 - 0.5, x1 + 0.5, y + 0.34, z1 + 0.5, led);
+      if (band < 3) {
+        const o = front + 0.5, oi = front + 0.14;
+        if (dir[0] === 0) gb.boxPlain(x0 - 0.3, y + 0.34, b.z + dir[1] * oi, x1 + 0.3, y + 1.05, b.z + dir[1] * o, darken(b.color, 0.8));
+        else gb.boxPlain(b.x + dir[0] * oi, y + 0.34, z0 - 0.3, b.x + dir[0] * o, y + 1.05, z1 + 0.3, darken(b.color, 0.8));
+      }
+      band++;
+    }
+  }
+  if (b.style === 'neon' && h > 12) {
+    // Vertical neon fin down the street-facing corner.
+    const dir = FACE_DIR[b.facing];
+    const off = (b.facing === 0 || b.facing === 2 ? b.d : b.w) / 2 + 0.2;
+    const fx = b.x + dir[0] * off, fz = b.z + dir[1] * off;
+    const ex = dir[0] !== 0 ? 0.45 : (b.w / 2) * 0.55;
+    const ez = dir[1] !== 0 ? 0.45 : (b.d / 2) * 0.55;
+    gb.boxPlain(fx - Math.max(0.3, ex * 0.12), BAND.shopH + 1, fz - Math.max(0.3, ez * 0.12), fx + Math.max(0.3, ex * 0.12), h - 1, fz + Math.max(0.3, ez * 0.12), b.neonColor, false, glowCellFor(b.neonColor));
+  }
+  if (b.style === 'residential' || b.style === 'concrete') {
+    // A string course splitting the facade, plus a chimney-ish vent block.
+    if (h > 13) gb.boxPlain(x0 - 0.35, h * 0.5, z0 - 0.35, x1 + 0.35, h * 0.5 + 0.3, z1 + 0.35, lighten(b.color, 0.45));
+  }
+
+  // --- Blank side wall with a big painted sign ---------------------------------------------------
+  if (!b.hasNeonSign && h >= 16 && rng.chance(0.24)) {
+    const face = ((b.facing + (rng.chance(0.5) ? 1 : 3)) % 4) as 0 | 1 | 2 | 3;
+    const fw = face === 0 || face === 2 ? b.w : b.d;
+    const w = Math.min(fw - 2.5, 15);
+    const sh = Math.min(w * 0.4, h - 11);
+    if (w >= 6 && sh >= 3) {
+      const dir = FACE_DIR[face];
+      const off = (face === 0 || face === 2 ? b.d : b.w) / 2;
+      const cy = rng.range(9 + sh / 2, h - 2.5 - sh / 2);
+      const panel = darken(b.color, 0.45);
+      if (dir[0] === 0) {
+        const zf = b.z + dir[1] * off;
+        gb.boxPlain(b.x - w / 2, cy - sh / 2, Math.min(zf, zf + dir[1] * 0.28), b.x + w / 2, cy + sh / 2, Math.max(zf, zf + dir[1] * 0.28), panel);
+      } else {
+        const xf = b.x + dir[0] * off;
+        gb.boxPlain(Math.min(xf, xf + dir[0] * 0.28), cy - sh / 2, b.z - w / 2, Math.max(xf, xf + dir[0] * 0.28), cy + sh / 2, b.z + w / 2, panel);
+      }
+      signs.push({ x: b.x + dir[0] * (off + 0.36), y: cy, z: b.z + dir[1] * (off + 0.36), yaw: FACE_YAW[face], w: w * 0.88, h: sh * 0.62, color: b.accent, word: rng.int(0, 999) });
+    }
+  }
 }
