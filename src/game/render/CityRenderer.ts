@@ -251,9 +251,10 @@ export class CityRenderer {
   }
 
   /** Per-frame: ferris rotation, lighthouse beam, water scroll and night-driven materials. */
-  update(time: number, nightFactor: number, _playerX: number, _playerZ: number): void {
+  update(time: number, nightFactor: number, playerX: number, playerZ: number): void {
     this.materials.setNight(nightFactor);
     this.materials.update(time);
+    if (this.props) this.props.update(playerX, playerZ);
     if (this.ferris) this.ferris.rotation.x = time * CITY_RENDER.ferrisRate;
     if (this.beam && this.beamMat) {
       this.beam.rotation.y = time * CITY_RENDER.beamRate;

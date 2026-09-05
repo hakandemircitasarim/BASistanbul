@@ -41,9 +41,9 @@ import { PedRenderer } from './render/PedRenderer';
 import { AudioSystem } from './audio/AudioSystem';
 
 /** Debug stats extended for the screenshot harness (player speed / vehicle / wanted / clock / camera yaw). */
-export interface EngineDebugStats extends DebugStats { speed: number; inVehicle: boolean; wanted: number; hour: number; camYaw: number }
+export interface EngineDebugStats extends DebugStats { speed: number; inVehicle: boolean; wanted: number; hour: number; camYaw: number; resScale: number }
 
-export interface EngineOptions { autostart?: boolean; hour?: number; quality?: 'low' | 'high'; seed?: number; debug?: boolean; stars?: number /* ?stars=2: debug wanted level at newGame */; nearCar?: boolean /* ?nearcar=1: spawn beside the nearest parked car (harness/debug) */ }
+export interface EngineOptions { autostart?: boolean; hour?: number; quality?: 'low' | 'high'; seed?: number; debug?: boolean; stars?: number /* ?stars=2: debug wanted level at newGame */; nearCar?: boolean /* ?nearcar=1: spawn beside the nearest parked car (harness/debug) */; noAdapt?: boolean /* ?noadapt=1: fixed drawing-buffer scale */ }
 
 export function parseEngineOptions(search: string): EngineOptions {
   const p = new URLSearchParams(search);
@@ -60,6 +60,7 @@ export function parseEngineOptions(search: string): EngineOptions {
   const stars = Number(p.get('stars'));
   if (p.has('stars') && isFinite(stars)) o.stars = Math.max(0, Math.min(5, Math.floor(stars)));
   if (p.has('nearcar')) o.nearCar = flag('nearcar');
+  if (p.has('noadapt')) o.noAdapt = flag('noadapt');
   return o;
 }
 
@@ -123,7 +124,7 @@ export class Engine {
   private slowMoTimer = 0;
   private respawnTimer = 0;
   private firstFrameResolve: (() => void) | null = null;
-  private readonly debugStats: EngineDebugStats = { fps: 0, drawCalls: 0, triangles: 0, tickMs: 0, vehicles: 0, peds: 0, police: 0, traffic: 0, speed: 0, inVehicle: false, wanted: 0, hour: 0, camYaw: 0 };
+  private readonly debugStats: EngineDebugStats = { fps: 0, drawCalls: 0, triangles: 0, tickMs: 0, vehicles: 0, peds: 0, police: 0, traffic: 0, speed: 0, inVehicle: false, wanted: 0, hour: 0, camYaw: 0, resScale: 1 };
   private readonly snapshot: MinimapSnapshot = createMinimapSnapshot();
   private readonly markerOut = [{ x: 0, z: 0 }, { x: 0, z: 0 }, { x: 0, z: 0 }, { x: 0, z: 0 }, { x: 0, z: 0 }, { x: 0, z: 0 }, { x: 0, z: 0 }, { x: 0, z: 0 }];
 
@@ -165,6 +166,7 @@ export class Engine {
       settings = this.store.getState().settings;
     }
     const renderer = new Renderer(this.canvas, settings);
+    if (this.options.noAdapt) renderer.adaptive = false;
     this.renderer = renderer;
     this.camera = new CameraController(renderer.camera, this.world, this.input, this.ctx.settings, this.events);
     this.ctx.camera = this.camera;
@@ -355,6 +357,7 @@ export class Engine {
     d.wanted = w.wanted.stars;
     d.hour = Math.round(w.time.hour * 100) / 100;
     d.camYaw = this.camera ? Math.round(this.camera.yaw * 100) / 100 : 0;
+    d.resScale = this.renderer ? Math.round(this.renderer.resolutionScale * 100) / 100 : 1;
     return d;
   }
 
@@ -458,7 +461,11 @@ export class Engine {
     // Audio follows the player; engine/skid/wind fall silent outside 'playing'.
     if (phase === 'playing') this.audioSys.frameUpdate(frameDt, world);
     else { this.audioSys.setEngine(false, 0, 0); this.audioSys.setSkid(0); this.audioSys.setSpeedWind(0); this.audioSys.frameUpdate(frameDt); }
-    if (this.renderer) this.renderer.render();
+    if (this.renderer) {
+      // Dynamic resolution: a struggling GPU loses pixels rather than frames (never touches the quality preset).
+      if (phase === 'playing') this.renderer.adapt(this.loop.fps, frameDt);
+      this.renderer.render();
+    }
     if (this.firstFrameResolve) {
       const r = this.firstFrameResolve;
       this.firstFrameResolve = null;

@@ -91,10 +91,31 @@ function hydrantGeometry(): THREE.BufferGeometry {
   return merged;
 }
 
-/** Builds and adds the instanced prop meshes; 7 draw calls total. */
+/** Draw radius per prop kind: past this the prop is a couple of pixels, so it is left out of the instance buffer. */
+export const PROP_RANGE = { palm: 300, lamp: 240, bench: 170, hydrant: 140, repackMove: 15 } as const;
+
+interface PropGroup {
+  /** Source placements: x, z, yaw, scale per prop (never mutated). */
+  data: Float32Array;
+  count: number;
+  range2: number;
+  meshes: THREE.InstancedMesh[];
+}
+
+/**
+ * Builds and adds the instanced prop meshes; 7 draw calls total.
+ *
+ * The city holds ~1300 lamps and ~500 palms — drawing them all costs ~125k triangles per frame even when
+ * they are half a kilometre behind the camera. Instead the source placements are kept on the CPU and only the
+ * ones inside PROP_RANGE are written into the instance buffers, repacked whenever the camera has moved
+ * `repackMove` metres. Draw calls stay at 7; the triangle count drops by roughly 6x.
+ */
 export class PropRenderer {
   private readonly meshes: THREE.InstancedMesh[] = [];
   private readonly geometries: THREE.BufferGeometry[] = [];
+  private readonly groups: PropGroup[] = [];
+  private lastX = Infinity;
+  private lastZ = Infinity;
 
   constructor(scene: THREE.Scene, props: Prop[], materials: Materials) {
     let palms = 0, lamps = 0, benches = 0, hydrants = 0;
@@ -131,35 +152,59 @@ export class PropRenderer {
     poolM.renderOrder = 2;
     const benchM = mk(bench, materials.bench, benches, true);
     const hydrantM = mk(hydrant, materials.hydrant, hydrants, false);
-    for (let i = 0; i < props.length; i++) {
-      const p = props[i];
-      dummy.position.set(p.x, CURB_H, p.z);
-      dummy.rotation.set(0, p.yaw, 0);
-      dummy.scale.set(p.scale, p.scale, p.scale);
-      dummy.updateMatrix();
-      mat.copy(dummy.matrix);
-      if (p.kind === 'palm') {
-        trunkM.setMatrixAt(trunkM.count, mat);
-        frondM.setMatrixAt(frondM.count, mat);
-        trunkM.count++; frondM.count++;
-      } else if (p.kind === 'lamp') {
-        poleM.setMatrixAt(poleM.count, mat);
-        headM.setMatrixAt(headM.count, mat);
-        poolM.setMatrixAt(poolM.count, mat);
-        poleM.count++; headM.count++; poolM.count++;
-      } else if (p.kind === 'bench') {
-        benchM.setMatrixAt(benchM.count, mat);
-        benchM.count++;
-      } else {
-        hydrantM.setMatrixAt(hydrantM.count, mat);
-        hydrantM.count++;
+    const group = (kind: Prop['kind'], n: number, range: number, meshes: THREE.InstancedMesh[]): PropGroup => {
+      const g: PropGroup = { data: new Float32Array(Math.max(1, n) * 4), count: 0, range2: range * range, meshes };
+      this.groups.push(g);
+      for (let i = 0; i < props.length; i++) {
+        const p = props[i];
+        if (p.kind !== kind) continue;
+        const o = g.count * 4;
+        g.data[o] = p.x; g.data[o + 1] = p.z; g.data[o + 2] = p.yaw; g.data[o + 3] = p.scale;
+        g.count++;
       }
-    }
-    for (let i = 0; i < this.meshes.length; i++) {
-      const m = this.meshes[i];
-      m.instanceMatrix.needsUpdate = true;
-      m.computeBoundingSphere();
-      m.frustumCulled = true;
+      return g;
+    };
+    group('palm', palms, PROP_RANGE.palm, [trunkM, frondM]);
+    group('lamp', lamps, PROP_RANGE.lamp, [poleM, headM, poolM]);
+    group('bench', benches, PROP_RANGE.bench, [benchM]);
+    group('hydrant', hydrants, PROP_RANGE.hydrant, [hydrantM]);
+    // Instanced meshes cannot be culled per instance, and their bounds span the whole city: pack by distance instead.
+    for (let i = 0; i < this.meshes.length; i++) this.meshes[i].frustumCulled = false;
+    this.repack(0, 0);
+  }
+
+  /** Refills the instance buffers with the props near (camX, camZ); cheap and only runs after real movement. */
+  update(camX: number, camZ: number): void {
+    const dx = camX - this.lastX, dz = camZ - this.lastZ;
+    if (dx * dx + dz * dz < PROP_RANGE.repackMove * PROP_RANGE.repackMove) return;
+    this.repack(camX, camZ);
+  }
+
+  private repack(camX: number, camZ: number): void {
+    this.lastX = camX;
+    this.lastZ = camZ;
+    for (let gi = 0; gi < this.groups.length; gi++) {
+      const g = this.groups[gi];
+      let written = 0;
+      for (let i = 0; i < g.count; i++) {
+        const o = i * 4;
+        const x = g.data[o], z = g.data[o + 1];
+        const ddx = x - camX, ddz = z - camZ;
+        if (ddx * ddx + ddz * ddz > g.range2) continue;
+        dummy.position.set(x, CURB_H, z);
+        dummy.rotation.set(0, g.data[o + 2], 0);
+        const sc = g.data[o + 3];
+        dummy.scale.set(sc, sc, sc);
+        dummy.updateMatrix();
+        mat.copy(dummy.matrix);
+        for (let m = 0; m < g.meshes.length; m++) g.meshes[m].setMatrixAt(written, mat);
+        written++;
+      }
+      for (let m = 0; m < g.meshes.length; m++) {
+        const mesh = g.meshes[m];
+        mesh.count = written;
+        mesh.instanceMatrix.needsUpdate = true;
+      }
     }
   }
 
