@@ -7,6 +7,86 @@ import type { Materials } from './Materials';
 
 export const PROP_DIMS = { palmTrunkH: 6.4, palmFrondLen: 4.4, palmFrondW: 3.0, lampH: 6.5, lampArm: 1.4, poolRadius: 6 } as const;
 
+/** Street furniture colours; each part is baked into the vertex colours so one material covers all four kinds. */
+const FURN = {
+  binBody: 0x33513f, binLid: 0x1d3025, pole: 0x8b9298, blade: 0x1d6a49,
+  post: 0x3a4046, roof: 0x2f353b, panel: 0x8fb4cc, seat: 0x8a6a44,
+  bollard: 0x3c4147, bollardCap: 0xc3c8cd,
+} as const;
+
+const scratchColor = new THREE.Color();
+
+/** Bakes one colour into a part's vertex colours, so merged multi-colour furniture needs a single material. */
+function paint(g: THREE.BufferGeometry, hex: number): THREE.BufferGeometry {
+  scratchColor.setHex(hex);
+  const n = g.attributes.position.count;
+  const c = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) { c[i * 3] = scratchColor.r; c[i * 3 + 1] = scratchColor.g; c[i * 3 + 2] = scratchColor.b; }
+  g.setAttribute('color', new THREE.BufferAttribute(c, 3));
+  return g;
+}
+
+function fuse(parts: THREE.BufferGeometry[]): THREE.BufferGeometry {
+  const merged = mergeGeometries(parts, false);
+  for (let i = 0; i < parts.length; i++) parts[i].dispose();
+  return merged;
+}
+
+/** Litter bin: a slightly conical body with a heavier lid. */
+function binGeometry(): THREE.BufferGeometry {
+  const body = new THREE.CylinderGeometry(0.27, 0.22, 0.72, 10, 1);
+  body.translate(0, 0.36, 0);
+  const lid = new THREE.CylinderGeometry(0.3, 0.3, 0.07, 10, 1);
+  lid.translate(0, 0.755, 0);
+  return fuse([paint(body, FURN.binBody), paint(lid, FURN.binLid)]);
+}
+
+/** Street-name sign: a pole with two blades crossing near the top so both streets are labelled. */
+function signGeometry(): THREE.BufferGeometry {
+  const pole = new THREE.CylinderGeometry(0.045, 0.055, 2.5, 6, 1);
+  pole.translate(0, 1.25, 0);
+  const a = new THREE.BoxGeometry(0.95, 0.17, 0.035);
+  a.translate(0.36, 2.3, 0);
+  const b = new THREE.BoxGeometry(0.035, 0.17, 0.95);
+  b.translate(0, 2.08, 0.36);
+  return fuse([paint(pole, FURN.pole), paint(a, FURN.blade), paint(b, FURN.blade)]);
+}
+
+/** Bus shelter: four posts, a flat roof, a glazed back panel and a bench. Faces -Z (the road) at yaw 0. */
+function shelterGeometry(): THREE.BufferGeometry {
+  const parts: THREE.BufferGeometry[] = [];
+  for (let i = 0; i < 4; i++) {
+    const px = i < 2 ? -1.72 : 1.72, pz = i % 2 === 0 ? -0.62 : 0.62;
+    const post = new THREE.BoxGeometry(0.09, 2.4, 0.09);
+    post.translate(px, 1.2, pz);
+    parts.push(paint(post, FURN.post));
+  }
+  const roof = new THREE.BoxGeometry(3.75, 0.12, 1.55);
+  roof.translate(0, 2.46, 0);
+  parts.push(paint(roof, FURN.roof));
+  const back = new THREE.BoxGeometry(3.5, 1.6, 0.06);
+  back.translate(0, 1.24, 0.7);
+  parts.push(paint(back, FURN.panel));
+  const seat = new THREE.BoxGeometry(3.0, 0.08, 0.42);
+  seat.translate(0, 0.46, 0.44);
+  parts.push(paint(seat, FURN.seat));
+  for (let i = 0; i < 2; i++) {
+    const leg = new THREE.BoxGeometry(0.07, 0.46, 0.4);
+    leg.translate(i === 0 ? -1.25 : 1.25, 0.23, 0.44);
+    parts.push(paint(leg, FURN.post));
+  }
+  return fuse(parts);
+}
+
+/** Promenade bollard: a short post with a light cap. */
+function bollardGeometry(): THREE.BufferGeometry {
+  const post = new THREE.CylinderGeometry(0.09, 0.11, 0.82, 8, 1);
+  post.translate(0, 0.41, 0);
+  const cap = new THREE.SphereGeometry(0.095, 8, 5);
+  cap.translate(0, 0.84, 0);
+  return fuse([paint(post, FURN.bollard), paint(cap, FURN.bollardCap)]);
+}
+
 const dummy = new THREE.Object3D();
 const mat = new THREE.Matrix4();
 
@@ -113,7 +193,7 @@ function hydrantGeometry(): THREE.BufferGeometry {
 }
 
 /** Draw radius per prop kind: past this the prop is a couple of pixels, so it is left out of the instance buffer. */
-export const PROP_RANGE = { palm: 300, lamp: 240, bench: 170, hydrant: 140, repackMove: 15 } as const;
+export const PROP_RANGE = { palm: 300, lamp: 240, bench: 170, hydrant: 140, bin: 130, sign: 175, shelter: 210, bollard: 120, repackMove: 15 } as const;
 
 interface PropGroup {
   /** Source placements: x, z, yaw, scale per prop (never mutated). */
@@ -124,7 +204,7 @@ interface PropGroup {
 }
 
 /**
- * Builds and adds the instanced prop meshes; 7 draw calls total.
+ * Builds and adds the instanced prop meshes; 11 draw calls total.
  *
  * The city holds ~1300 lamps and ~500 palms — drawing them all costs ~125k triangles per frame even when
  * they are half a kilometre behind the camera. Instead the source placements are kept on the CPU and only the
@@ -139,11 +219,8 @@ export class PropRenderer {
   private lastZ = Infinity;
 
   constructor(scene: THREE.Scene, props: Prop[], materials: Materials) {
-    let palms = 0, lamps = 0, benches = 0, hydrants = 0;
-    for (let i = 0; i < props.length; i++) {
-      const k = props[i].kind;
-      if (k === 'palm') palms++; else if (k === 'lamp') lamps++; else if (k === 'bench') benches++; else hydrants++;
-    }
+    const counts: Record<Prop['kind'], number> = { palm: 0, lamp: 0, bench: 0, hydrant: 0, bin: 0, sign: 0, shelter: 0, bollard: 0 };
+    for (let i = 0; i < props.length; i++) counts[props[i].kind]++;
     const trunk = trunkGeometry();
     const fronds = frondsGeometry(trunk.userData.topX as number, trunk.userData.topY as number);
     const pole = poleGeometry();
@@ -154,7 +231,11 @@ export class PropRenderer {
     pool.translate(0, 0.06, PROP_DIMS.lampArm - 0.3);
     const bench = benchGeometry();
     const hydrant = hydrantGeometry();
-    this.geometries.push(trunk, fronds, pole, head, pool, bench, hydrant);
+    const bin = binGeometry();
+    const sign = signGeometry();
+    const shelter = shelterGeometry();
+    const bollard = bollardGeometry();
+    this.geometries.push(trunk, fronds, pole, head, pool, bench, hydrant, bin, sign, shelter, bollard);
     const mk = (g: THREE.BufferGeometry, m: THREE.Material, n: number, shadow: boolean): THREE.InstancedMesh => {
       const im = new THREE.InstancedMesh(g, m, Math.max(1, n));
       im.count = 0;
@@ -165,14 +246,18 @@ export class PropRenderer {
       scene.add(im);
       return im;
     };
-    const trunkM = mk(trunk, materials.palmTrunk, palms, true);
-    const frondM = mk(fronds, materials.palmFrond, palms, true);
-    const poleM = mk(pole, materials.lampPole, lamps, true);
-    const headM = mk(head, materials.lampHead(), lamps, false);
-    const poolM = mk(pool, materials.lightPool(), lamps, false);
+    const trunkM = mk(trunk, materials.palmTrunk, counts.palm, true);
+    const frondM = mk(fronds, materials.palmFrond, counts.palm, true);
+    const poleM = mk(pole, materials.lampPole, counts.lamp, true);
+    const headM = mk(head, materials.lampHead(), counts.lamp, false);
+    const poolM = mk(pool, materials.lightPool(), counts.lamp, false);
     poolM.renderOrder = 2;
-    const benchM = mk(bench, materials.bench, benches, true);
-    const hydrantM = mk(hydrant, materials.hydrant, hydrants, false);
+    const benchM = mk(bench, materials.bench, counts.bench, true);
+    const hydrantM = mk(hydrant, materials.hydrant, counts.hydrant, false);
+    const binM = mk(bin, materials.furniture, counts.bin, true);
+    const signM = mk(sign, materials.furniture, counts.sign, true);
+    const shelterM = mk(shelter, materials.furniture, counts.shelter, true);
+    const bollardM = mk(bollard, materials.furniture, counts.bollard, false);
     const group = (kind: Prop['kind'], n: number, range: number, meshes: THREE.InstancedMesh[]): PropGroup => {
       const g: PropGroup = { data: new Float32Array(Math.max(1, n) * 4), count: 0, range2: range * range, meshes };
       this.groups.push(g);
@@ -185,10 +270,14 @@ export class PropRenderer {
       }
       return g;
     };
-    group('palm', palms, PROP_RANGE.palm, [trunkM, frondM]);
-    group('lamp', lamps, PROP_RANGE.lamp, [poleM, headM, poolM]);
-    group('bench', benches, PROP_RANGE.bench, [benchM]);
-    group('hydrant', hydrants, PROP_RANGE.hydrant, [hydrantM]);
+    group('palm', counts.palm, PROP_RANGE.palm, [trunkM, frondM]);
+    group('lamp', counts.lamp, PROP_RANGE.lamp, [poleM, headM, poolM]);
+    group('bench', counts.bench, PROP_RANGE.bench, [benchM]);
+    group('hydrant', counts.hydrant, PROP_RANGE.hydrant, [hydrantM]);
+    group('bin', counts.bin, PROP_RANGE.bin, [binM]);
+    group('sign', counts.sign, PROP_RANGE.sign, [signM]);
+    group('shelter', counts.shelter, PROP_RANGE.shelter, [shelterM]);
+    group('bollard', counts.bollard, PROP_RANGE.bollard, [bollardM]);
     // Instanced meshes cannot be culled per instance, and their bounds span the whole city: pack by distance instead.
     for (let i = 0; i < this.meshes.length; i++) this.meshes[i].frustumCulled = false;
     this.repack(0, 0);

@@ -6,7 +6,7 @@ import { RoadGraph } from './RoadGraph';
 import { SidewalkGraph } from './SidewalkGraph';
 import { blockIndex, createContext, makeBlocks } from './CityBuild';
 import { buildLots } from './CityLots';
-import { PROMENADE_X, SPAWN_BLOCK, addLandmarks, addPromenadePalms, addStreetProps, addWaterAndBounds, furnishPark, furnishPlazas, makePoints, placeParkedSpots } from './CityProps';
+import { PROMENADE_X, SPAWN_BLOCK, addLandmarks, addPromenadeBollards, addPromenadePalms, addStreetProps, addWaterAndBounds, furnishPark, furnishPlazas, makePoints, placeParkedSpots } from './CityProps';
 export { validateCity } from './CityValidate';
 export { districtOf, blockKind } from './CityBuild';
 
@@ -30,6 +30,7 @@ export function generateCity(seed: number = CITY_SEED): GeneratedCity {
   furnishPark(ctx);
   addStreetProps(ctx);
   addPromenadePalms(ctx);
+  addPromenadeBollards(ctx);
   const points = makePoints(ctx);
   placeParkedSpots(ctx, points.playerSpawn);
   const city: CityData = {

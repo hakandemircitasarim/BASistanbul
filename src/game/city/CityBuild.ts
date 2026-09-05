@@ -75,7 +75,7 @@ export function addCircle(ctx: GenContext, cx: number, cz: number, r: number, ta
 
 export function addProp(ctx: GenContext, kind: Prop['kind'], x: number, z: number, yaw: number, scale: number, colliderR: number): void {
   ctx.props.push({ kind, x, z, yaw, scale });
-  if (colliderR > 0) addCircle(ctx, x, z, colliderR * scale, 'prop', kind === 'palm' ? 7 * scale : kind === 'lamp' ? 6 : 1);
+  if (colliderR > 0) addCircle(ctx, x, z, colliderR * scale, 'prop', kind === 'palm' ? 7 * scale : kind === 'lamp' ? 6 : kind === 'sign' ? 2.6 : kind === 'shelter' ? 2.5 : 1);
 }
 
 /** Distance from a point to a collider's surface (negative when inside an AABB / circle). */

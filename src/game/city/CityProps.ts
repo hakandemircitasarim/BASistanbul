@@ -20,6 +20,13 @@ const LAMP_R = 0.2;
 const PALM_R = 0.35;
 const BENCH_R = 0.7;
 const HYDRANT_R = 0.25;
+const BIN_R = 0.3;
+const SIGN_R = 0.12;
+const SHELTER_R = 0;      // decorative: a collider here would wall off the sidewalk graph
+const BOLLARD_R = 0.12;
+const BINS_PER_BLOCK = 2;
+const SHELTER_EVERY = 3;  // one bus shelter per N building blocks
+const BOLLARD_SPACING = 3.5;
 const PALM_SIDEWALK_OFFSET = 2.3; // from the block edge (0.7 m from the curb)
 const PLAZA_FOUNTAIN_R = 5;
 const PLAZA_BENCH_RING = 9;
@@ -159,12 +166,53 @@ export function addStreetProps(ctx: GenContext): void {
     const hx = edge === 0 ? b.x0 + t : edge === 1 ? b.x1 + o : edge === 2 ? b.x0 + t : b.x0 - o;
     const hz = edge === 0 ? b.z0 - o : edge === 1 ? b.z0 + t : edge === 2 ? b.z1 + o : b.z0 + t;
     if (clearance(ctx.hash, hx, hz, 4) >= 0.8) addProp(ctx, 'hydrant', hx, hz, 0, 1, HYDRANT_R);
+    addBlockFurniture(ctx, b, bi);
   }
+}
+
+/**
+ * Sidewalk dressing for one building block: a street-name sign on the corner nearest the intersection, a couple of
+ * litter bins along random edges and, every few blocks, a bus shelter facing the road. Everything is placed with a
+ * clearance test so nothing lands inside a building, a lamp or a parked car.
+ */
+function addBlockFurniture(ctx: GenContext, b: Block, bi: number): void {
+  const rng = ctx.rng;
+  // Street-name sign just off the block's south-west corner. It has to clear the intersection box (INTERSECTION_R
+  // around the node), so it sits a few metres up the side street rather than on the corner itself.
+  const sx = b.x0 - 1.15, sz = b.z0 + 4;
+  if (clearance(ctx.hash, sx, sz, 4) >= 0.7) addProp(ctx, 'sign', sx, sz, Math.PI / 4, 1, SIGN_R);
+  for (let k = 0; k < BINS_PER_BLOCK; k++) {
+    const edge = rng.int(0, 3), t = rng.range(11, BLOCK - 11), e = 0.85;
+    const x = edge === 0 ? b.x0 + t : edge === 1 ? b.x1 + e : edge === 2 ? b.x0 + t : b.x0 - e;
+    const z = edge === 0 ? b.z0 - e : edge === 1 ? b.z0 + t : edge === 2 ? b.z1 + e : b.z0 + t;
+    if (clearance(ctx.hash, x, z, 4) >= 0.7) addProp(ctx, 'bin', x, z, rng.range(0, Math.PI * 2), 1, BIN_R);
+  }
+  if (bi % SHELTER_EVERY !== 0) return;
+  // Bus shelter set back from the curb, its back to the block and its opening on the road side.
+  const side = (bi / SHELTER_EVERY) % 4;
+  const mid = BLOCK / 2 + rng.range(-8, 8), s = 1.6;
+  const hx = side === 0 ? b.x0 + mid : side === 1 ? b.x1 + s : side === 2 ? b.x0 + mid : b.x0 - s;
+  const hz = side === 0 ? b.z0 - s : side === 1 ? b.z0 + mid : side === 2 ? b.z1 + s : b.z0 + mid;
+  // The shelter's glazed back is its local +Z, so each side turns it towards the block and leaves the opening
+  // facing the road.
+  const yaw = side === 0 ? 0 : side === 1 ? -Math.PI / 2 : side === 2 ? Math.PI : Math.PI / 2;
+  if (clearance(ctx.hash, hx, hz, 6) >= 2.2) addProp(ctx, 'shelter', hx, hz, yaw, 1, SHELTER_R);
 }
 
 function tryPalm(ctx: GenContext, x: number, z: number): void {
   if (clearance(ctx.hash, x, z, 4) < 1) return;
   addProp(ctx, 'palm', x, z, ctx.rng.range(0, Math.PI * 2), ctx.rng.range(0.85, 1.15), PALM_R);
+}
+
+/** Bollards along the promenade edge, keeping cars off the beach walk. */
+export function addPromenadeBollards(ctx: GenContext): void {
+  // On the beach side of the boundary road, and never inside an intersection box.
+  const x = BEACH_X0 + 1.4;
+  for (let z = 16; z <= CITY_MAX_Z - 16; z += BOLLARD_SPACING) {
+    if (distToNearestRoadNode(ctx.roads, x, z) < 14) continue;
+    if (clearance(ctx.hash, x, z, 4) < 0.6) continue;
+    addProp(ctx, 'bollard', x, z, 0, 1, BOLLARD_R);
+  }
 }
 
 /** Promenade palms: two rows (BEACH_X0 + 4 and + 14), every 12 m. */

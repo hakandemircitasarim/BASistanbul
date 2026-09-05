@@ -41,6 +41,8 @@ export class Materials {
   readonly water: THREE.MeshPhongMaterial;
   /** Surf line where the sea meets the sand (scrolls in update). */
   readonly foam: THREE.MeshLambertMaterial;
+  /** Shared vertex-coloured material for the multi-part street furniture (bins, signs, shelters, bollards). */
+  readonly furniture: THREE.MeshLambertMaterial;
   readonly palmTrunk: THREE.MeshLambertMaterial;
   readonly palmFrond: THREE.MeshLambertMaterial;
   readonly lampPole: THREE.MeshLambertMaterial;
@@ -95,6 +97,7 @@ export class Materials {
     const wn = this.water.normalMap;
     if (wn) wn.repeat.set(3, 3);
     this.foam = new THREE.MeshLambertMaterial({ map: tex.foam(), color: 0xffffff, transparent: true, opacity: 0.75, depthWrite: false, side: THREE.DoubleSide });
+    this.furniture = new THREE.MeshLambertMaterial({ vertexColors: true });
     this.palmTrunk = new THREE.MeshLambertMaterial({ color: 0xa8814f });
         // Front side only: the frond geometry carries its own back faces, whose normals still point at the sky. With
     // DoubleSide three flips the normal on back faces, so at midday every frond seen from below turned black.
@@ -195,7 +198,7 @@ export class Materials {
     this.plain.dispose(); this.glow.dispose(); this.shopfront.dispose(); this.plinth.dispose();
     this.road.dispose(); this.crosswalk.dispose(); this.roadMark.dispose(); this.sidewalk.dispose(); this.sand.dispose();
     this.grass.dispose(); this.plaza.dispose(); this.pavement.dispose(); this.dirt.dispose(); this.water.dispose(); this.foam.dispose();
-    this.palmTrunk.dispose(); this.palmFrond.dispose(); this.lampPole.dispose(); this.bench.dispose(); this.hydrant.dispose();
+    this.furniture.dispose(); this.palmTrunk.dispose(); this.palmFrond.dispose(); this.lampPole.dispose(); this.bench.dispose(); this.hydrant.dispose();
     this.lampHeadMat.dispose(); this.lightPoolMat.dispose();
     if (this.neonMat) this.neonMat.dispose();
     if (this.neonBloomMat) this.neonBloomMat.dispose();
