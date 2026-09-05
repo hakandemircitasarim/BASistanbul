@@ -95,8 +95,12 @@ export class Materials {
     const wn = this.water.normalMap;
     if (wn) wn.repeat.set(3, 3);
     this.foam = new THREE.MeshLambertMaterial({ map: tex.foam(), color: 0xffffff, transparent: true, opacity: 0.75, depthWrite: false, side: THREE.DoubleSide });
-    this.palmTrunk = new THREE.MeshLambertMaterial({ color: 0x7a5a3a });
-    this.palmFrond = new THREE.MeshLambertMaterial({ map: tex.palmFrond(), alphaTest: 0.5, side: THREE.DoubleSide, color: 0xc8e8a0 });
+    this.palmTrunk = new THREE.MeshLambertMaterial({ color: 0xa8814f });
+        // Front side only: the frond geometry carries its own back faces, whose normals still point at the sky. With
+    // DoubleSide three flips the normal on back faces, so at midday every frond seen from below turned black.
+    this.palmFrond = new THREE.MeshLambertMaterial({ map: tex.palmFrond(), alphaTest: 0.34, side: THREE.FrontSide, color: 0xdcecc4 });
+    // Alpha-to-coverage lets the MSAA resolve feather the leaf edges instead of the hard alpha-test stair-step.
+    this.palmFrond.alphaToCoverage = true;
     this.lampPole = new THREE.MeshLambertMaterial({ color: 0x3a3d44 });
     this.bench = new THREE.MeshLambertMaterial({ color: 0x8a5a30 });
     this.hydrant = new THREE.MeshLambertMaterial({ color: 0xd8302a });

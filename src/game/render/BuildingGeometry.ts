@@ -510,7 +510,9 @@ export function appendBuildingDetail(gb: GeoBuilder, b: Building, rng: Random, s
   }
   if (h > 42) {
     // Crown: a light cornice plus a night-glowing accent band.
-    gb.boxPlain(x0 - 0.5, h - 4.4, z0 - 0.5, x1 + 0.5, h - 3.6, z1 + 0.5, lighten(b.color, 0.55));
+    // Deep enough to survive a few hundred metres of perspective, and only mildly lighter than the wall: a bright
+    // 0.8 m band around a dark shaft read as a floating wire once it fell under a pixel.
+    gb.boxPlain(x0 - 0.4, h - 4.8, z0 - 0.4, x1 + 0.4, h - 3.6, z1 + 0.4, lighten(b.color, 0.32));
     gb.boxPlain(x0 - 0.55, h - 3.4, z0 - 0.55, x1 + 0.55, h - 2.95, z1 + 0.55, b.accent, false, glowCellFor(b.accent));
   }
   if (b.style === 'artdeco' && !downtown) {

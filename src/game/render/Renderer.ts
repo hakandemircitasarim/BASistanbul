@@ -14,7 +14,7 @@ export const CAMERA_NEAR = 0.3;
 export const CAMERA_FAR = 900;
 
 /** Bloom over the neon/emissive parts, then a filmic grade + vignette, then FXAA. */
-export const POSTFX = { bloomStrength: 0.9, bloomRadius: 0.6, bloomThreshold: 0.95, dayScale: 0.35, vignette: 0.9, saturation: 1.1, contrast: 1.04 } as const;
+export const POSTFX = { bloomStrength: 0.9, bloomRadius: 0.6, bloomThreshold: 0.95, dayScale: 0.35, vignette: 0.9, saturation: 1.1, contrast: 1.04, msaaSamples: 4 } as const;
 
 /** Cheap grade: lifts saturation/contrast a touch and darkens the corners so the frame reads less flat. */
 const GradeShader = {
@@ -131,16 +131,26 @@ export class Renderer {
   /** Builds the post chain on first use: scene -> bloom -> tone map/sRGB -> grade+vignette -> FXAA. */
   private ensureComposer(): void {
     if (this.composer) return;
-    const composer = new EffectComposer(this.gl);
-    composer.addPass(new RenderPass(this.scene, this.camera));
     const size = new THREE.Vector2(1, 1);
     this.gl.getSize(size);
+    const r = this.gl.getPixelRatio();
+    // The composer's own target has no multisampling by default, which is what made thin geometry - cornices, window
+    // mullions, lamp posts, roof masts - crawl and break into dashes at distance. Ask for MSAA on it; FXAA then only
+    // has to clean up what the resolve misses, so it can stay off while the hardware does the work.
+    const rt = new THREE.WebGLRenderTarget(Math.max(1, Math.floor(size.x * r)), Math.max(1, Math.floor(size.y * r)), {
+      type: THREE.HalfFloatType, samples: POSTFX.msaaSamples,
+    });
+    rt.texture.name = 'EffectComposer.rt1';
+    const composer = new EffectComposer(this.gl, rt);
+    composer.addPass(new RenderPass(this.scene, this.camera));
     this.bloom = new UnrealBloomPass(size, POSTFX.bloomStrength, POSTFX.bloomRadius, POSTFX.bloomThreshold);
     composer.addPass(this.bloom);
     composer.addPass(new OutputPass());
     composer.addPass(new ShaderPass(GradeShader));
-    this.fxaa = new ShaderPass(FXAAShader);
-    composer.addPass(this.fxaa);
+    if (POSTFX.msaaSamples <= 0) {
+      this.fxaa = new ShaderPass(FXAAShader);
+      composer.addPass(this.fxaa);
+    }
     this.composer = composer;
     this.resize();
   }

@@ -71,6 +71,48 @@ export class TextureFactory {
     return t;
   }
 
+  /**
+   * Bleeds colour outwards into fully transparent pixels, leaving alpha untouched. Mipmapping averages RGB and alpha
+   * independently, so a shape drawn on a cleared (transparent black) canvas darkens towards black in the lower mips
+   * and an alpha-tested material grows black fringes at distance. Filling the empty pixels with the neighbouring
+   * colour removes them without changing the silhouette.
+   */
+  private bleedAlpha(ctx: CanvasRenderingContext2D, W: number, H: number, passes: number): void {
+    const img = ctx.getImageData(0, 0, W, H);
+    const d = img.data;
+    const n = W * H;
+    const filled = new Uint8Array(n);
+    for (let i = 0; i < n; i++) filled[i] = d[i * 4 + 3] > 0 ? 1 : 0;
+    const added: number[] = [];
+    for (let p = 0; p < passes; p++) {
+      added.length = 0;
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          const k = y * W + x;
+          if (filled[k]) continue;
+          let r = 0, g = 0, b = 0, c = 0;
+          for (let oy = -1; oy <= 1; oy++) {
+            const yy = y + oy;
+            if (yy < 0 || yy >= H) continue;
+            for (let ox = -1; ox <= 1; ox++) {
+              const xx = x + ox;
+              if (xx < 0 || xx >= W) continue;
+              const j = yy * W + xx;
+              if (!filled[j]) continue;
+              r += d[j * 4]; g += d[j * 4 + 1]; b += d[j * 4 + 2]; c++;
+            }
+          }
+          if (!c) continue;
+          d[k * 4] = r / c; d[k * 4 + 1] = g / c; d[k * 4 + 2] = b / c;
+          added.push(k);
+        }
+      }
+      if (!added.length) break;
+      for (let i = 0; i < added.length; i++) filled[added[i]] = 1;
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+
   private noise(ctx: CanvasRenderingContext2D, w: number, h: number, rng: Random, count: number, size: number, alpha: number, light: boolean): void {
     for (let i = 0; i < count; i++) {
       const v = light ? 255 : 0;
@@ -893,28 +935,40 @@ export class TextureFactory {
     const { canvas, ctx } = this.canvas(W, H);
     ctx.clearRect(0, 0, W, H);
     const rng = new Random(81);
-    for (let i = 0; i < 26; i++) {
-      const t = i / 26;
-      const y = H - 8 - t * (H - 16);
-      const len = (1 - t * 0.85) * 52 + 6;
-      const g = 120 + rng.int(0, 60);
-      ctx.strokeStyle = rgba(40 + rng.int(0, 30), g, 40, 1);
-      ctx.lineWidth = 5;
-      ctx.beginPath();
-      ctx.moveTo(W / 2, y);
-      ctx.lineTo(W / 2 - len, y - 26 - t * 6);
-      ctx.moveTo(W / 2, y);
-      ctx.lineTo(W / 2 + len, y - 26 - t * 6);
-      ctx.stroke();
+    const cx = W / 2;
+    // Leaflets are filled slivers, not hairlines: an alpha-tested texture with thin strokes dissolves in the lower
+    // mips and the palm turns into a cloud of speckles a few metres away.
+    for (let i = 0; i < 20; i++) {
+      const t = i / 20;
+      const y = H - 10 - t * (H - 22);
+      const len = (1 - t * 0.8) * 54 + 8;
+      const drop = 24 + t * 8;
+      const wid = 9 - t * 3.5;
+      // Bright leaflets on purpose: around midday the sun is nearly overhead, so a near-vertical frond only gets sky
+      // fill and a dark green albedo would come out black.
+      const g = 156 + rng.int(0, 46);
+      ctx.fillStyle = rgba(74 + rng.int(0, 30), g, 72 + rng.int(0, 22), 1);
+      for (const dir of [-1, 1]) {
+        const ex = cx + dir * len, ey = y - drop;
+        ctx.beginPath();
+        ctx.moveTo(cx, y + wid * 0.5);
+        ctx.quadraticCurveTo(cx + dir * len * 0.55, y - drop * 0.15, ex, ey);
+        ctx.quadraticCurveTo(cx + dir * len * 0.5, y - drop * 0.5 + wid, cx, y - wid * 0.5);
+        ctx.closePath();
+        ctx.fill();
+      }
     }
-    ctx.strokeStyle = '#6b8c3a';
-    ctx.lineWidth = 7;
+    // Rachis, tapering to the tip.
+    ctx.fillStyle = '#87a955';
     ctx.beginPath();
-    ctx.moveTo(W / 2, H);
-    ctx.lineTo(W / 2, 4);
-    ctx.stroke();
-    const t = this.finish(key, canvas, true, false);
-    return t;
+    ctx.moveTo(cx - 5, H);
+    ctx.lineTo(cx + 5, H);
+    ctx.lineTo(cx + 1.5, 4);
+    ctx.lineTo(cx - 1.5, 4);
+    ctx.closePath();
+    ctx.fill();
+    this.bleedAlpha(ctx, W, H, 6);
+    return this.finish(key, canvas, true, false);
   }
 
   /** Soft radial white glow (sprites, light pools, particles, neon bloom). */

@@ -32,6 +32,25 @@ function trunkGeometry(): THREE.BufferGeometry {
   return merged;
 }
 
+/**
+ * Adds a back face to every triangle without flipping its normal: the copy has reversed winding but keeps the
+ * sky-facing normal, so a frond seen from below is shaded like foliage instead of going black at midday (which is
+ * what THREE.DoubleSide does, since it negates the normal on back faces).
+ */
+function withBackFaces(g: THREE.BufferGeometry): THREE.BufferGeometry {
+  const back = g.clone();
+  const idx = back.getIndex();
+  if (idx) {
+    const a = idx.array as ArrayLike<number>;
+    const flipped = new Uint32Array(a.length);
+    for (let i = 0; i < a.length; i += 3) { flipped[i] = a[i]; flipped[i + 1] = a[i + 2]; flipped[i + 2] = a[i + 1]; }
+    back.setIndex(new THREE.BufferAttribute(flipped, 1));
+  }
+  const merged = mergeGeometries([g, back], false);
+  back.dispose();
+  return merged;
+}
+
 function frondsGeometry(topX: number, topY: number): THREE.BufferGeometry {
   const parts: THREE.BufferGeometry[] = [];
   const L = PROP_DIMS.palmFrondLen, W = PROP_DIMS.palmFrondW;
@@ -48,7 +67,9 @@ function frondsGeometry(topX: number, topY: number): THREE.BufferGeometry {
     g.rotateX(-Math.PI / 2 + 0.55 + (i % 2) * 0.25);
     g.rotateY((i / 7) * Math.PI * 2);
     g.translate(topX, topY, 0);
-    parts.push(g);
+    const both = withBackFaces(g);
+    g.dispose();
+    parts.push(both);
   }
   const merged = mergeGeometries(parts, false);
   for (let i = 0; i < parts.length; i++) parts[i].dispose();

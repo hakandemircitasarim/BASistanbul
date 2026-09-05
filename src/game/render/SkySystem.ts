@@ -20,7 +20,11 @@ export const SKY_KEYS: SkyKey[] = [
   { hour: 22, top: 0x07081f, horizon: 0x1e1c44, sun: 0x000000, fog: 0x0e1030, sunI: 0, ambI: 0.28, fogNear: 60, fogFar: 380 },
 ];
 
-export const SKY_TUNING = { domeRadius: 850, sunDist: 700, sunScale: 130, moonScale: 55, starCount: 1400, shadowBox: 120, shadowMap: 2048, lightUnits: 3.0 } as const;
+export const SKY_TUNING = {
+  domeRadius: 850, sunDist: 700, sunScale: 130, moonScale: 55, starCount: 1400, shadowBox: 120, shadowMap: 2048, lightUnits: 3.0,
+  // Clouds: uv scale of the flat-plane projection, density cut/softness, day and night coverage, drift per game hour.
+  cloudScale: 0.6, cloudCut: 0.16, cloudSoft: 0.5, cloudDay: 0.78, cloudNight: 0.4, cloudDrift: 0.018,
+} as const;
 
 const VERT = `
 varying vec3 vDir;
@@ -32,7 +36,11 @@ void main() {
 
 const FRAG = `
 precision highp float;
+#define CLOUD_SCALE ${SKY_TUNING.cloudScale.toFixed(4)}
+#define CLOUD_CUT ${SKY_TUNING.cloudCut.toFixed(3)}
+#define CLOUD_SOFT ${SKY_TUNING.cloudSoft.toFixed(3)}
 uniform vec3 uTop; uniform vec3 uHorizon; uniform vec3 uSunDir; uniform vec3 uSunColor; uniform float uStars; uniform sampler2D uStarTex;
+uniform sampler2D uCloudTex; uniform vec3 uCloudLit; uniform vec3 uCloudDark; uniform float uCloudAmt; uniform vec2 uCloudDrift;
 varying vec3 vDir;
 void main() {
   vec3 d = normalize(vDir);
@@ -45,6 +53,20 @@ void main() {
   vec2 uv = vec2(atan(d.z, d.x) / 6.2831853 + 0.5, asin(y) / 3.14159265 + 0.5);
   vec3 stars = texture2D(uStarTex, uv).rgb;
   col += stars * uStars * clamp(y * 2.5, 0.0, 1.0);
+  // Clouds: a tiling density field projected onto a flat plane above the camera, so the sheet stretches towards the
+  // horizon like a real cloud deck instead of pinching at the zenith. Two octaves, the second drifting the other way.
+  if (uCloudAmt > 0.001) {
+    vec2 base = d.xz / max(y, 0.05) * CLOUD_SCALE;
+    float a = texture2D(uCloudTex, base + uCloudDrift).r;
+    float b = texture2D(uCloudTex, base * 2.17 + vec2(0.37, 0.11) - uCloudDrift * 1.6).r;
+    float dens = smoothstep(CLOUD_CUT, CLOUD_CUT + CLOUD_SOFT, a * 0.85 + b * 0.55);
+    // Fade into the horizon haze, and thin out overhead where the deck is seen edge-on the least.
+    dens *= smoothstep(0.008, 0.13, y) * uCloudAmt;
+    // Silver lining: the side facing the sun keeps the sun colour, the rest falls to the shaded underside tone.
+    float lit = pow(max(dot(d, uSunDir), 0.0), 3.0);
+    vec3 cloud = mix(uCloudDark, uCloudLit, clamp(lit * 0.85 + 0.25, 0.0, 1.0));
+    col = mix(col, cloud, dens);
+  }
   gl_FragColor = vec4(col, 1.0);
 }`;
 
@@ -66,6 +88,7 @@ export class SkySystem {
   private readonly cFog = new THREE.Color();
   private readonly cA = new THREE.Color();
   private readonly cB = new THREE.Color();
+  private readonly white = new THREE.Color(0xffffff);
   // Reflection probe: a tiny equirect gradient of the current sky, PMREM-filtered into scene.environment.
   private readonly targetScene: THREE.Scene;
   private gl: THREE.WebGLRenderer | null = null;
@@ -89,7 +112,14 @@ export class SkySystem {
     if (gl) this.attachRenderer(gl);
     const domeGeo = new THREE.SphereGeometry(SKY_TUNING.domeRadius, 32, 16);
     this.domeMat = new THREE.ShaderMaterial({
-      uniforms: { uTop: { value: new THREE.Color(0x2f7fe0) }, uHorizon: { value: new THREE.Color(0xb8dcf8) }, uSunDir: { value: new THREE.Vector3(0, 1, 0) }, uSunColor: { value: new THREE.Color(0xffffff) }, uStars: { value: 0 }, uStarTex: { value: tex.starField() } },
+      uniforms: {
+        uTop: { value: new THREE.Color(0x2f7fe0) }, uHorizon: { value: new THREE.Color(0xb8dcf8) },
+        uSunDir: { value: new THREE.Vector3(0, 1, 0) }, uSunColor: { value: new THREE.Color(0xffffff) },
+        uStars: { value: 0 }, uStarTex: { value: tex.starField() },
+        uCloudTex: { value: tex.clouds() }, uCloudLit: { value: new THREE.Color(0xffffff) },
+        uCloudDark: { value: new THREE.Color(0x8fa4bc) }, uCloudAmt: { value: SKY_TUNING.cloudDay },
+        uCloudDrift: { value: new THREE.Vector2() },
+      },
       vertexShader: VERT, fragmentShader: FRAG, side: THREE.BackSide, depthWrite: false, fog: false,
     });
     this.dome = new THREE.Mesh(domeGeo, this.domeMat);
@@ -213,6 +243,11 @@ export class SkySystem {
     (u.uHorizon.value as THREE.Color).copy(this.cHor);
     (u.uSunDir.value as THREE.Vector3).set(sunDir.x, sunDir.y, sunDir.z);
     (u.uSunColor.value as THREE.Color).copy(this.cSun);
+    // Cloud tones ride the sky keys: pale near-white by day, orange-lined at sunset, near-black overcast at night.
+    (u.uCloudLit.value as THREE.Color).copy(this.cHor).lerp(this.white, 0.5 - nightFactor * 0.42);
+    (u.uCloudDark.value as THREE.Color).copy(this.cTop).lerp(this.cHor, 0.35).multiplyScalar(0.78);
+    u.uCloudAmt.value = lerp(SKY_TUNING.cloudDay, SKY_TUNING.cloudNight, nightFactor);
+    (u.uCloudDrift.value as THREE.Vector2).set(hour * SKY_TUNING.cloudDrift, hour * SKY_TUNING.cloudDrift * 0.4);
     const starK = nightFactor * nightFactor * nightFactor;
     u.uStars.value = starK * 0.7;
     this.starMat.opacity = starK * 0.9;
@@ -246,7 +281,9 @@ export class SkySystem {
     }
     this.hemi.color.copy(this.cTop).lerp(this.cHor, 0.4).lerp(this.nightAmbient, nightFactor * 0.85);
     this.hemi.groundColor.setHex(moon ? 0x181a26 : 0x4a3a34);
-    this.hemi.intensity = s.ambI * L * 0.9 + nightFactor * 0.35;
+    // Sky fill carries every vertical surface around midday (the sun is nearly overhead then, so facades, tree trunks
+    // and lamp posts get almost no direct light); it is dialled back after dusk so the neon still reads.
+    this.hemi.intensity = s.ambI * L * (0.9 + 0.65 * (1 - nightFactor)) + nightFactor * 0.35;
     // Shadow box follows the player, snapped to shadow-map texels to avoid swimming.
     const texel = SKY_TUNING.shadowBox / SKY_TUNING.shadowMap;
     const tx = Math.round(playerX / texel) * texel, tz = Math.round(playerZ / texel) * texel;
