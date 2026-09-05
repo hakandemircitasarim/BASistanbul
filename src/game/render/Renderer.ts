@@ -14,7 +14,9 @@ export const CAMERA_NEAR = 0.3;
 export const CAMERA_FAR = 900;
 
 /** Bloom over the neon/emissive parts, then a filmic grade + vignette; MSAA replaces the old FXAA pass. */
-export const POSTFX = { bloomStrength: 0.9, bloomRadius: 0.6, bloomThreshold: 0.9, bloomThresholdDay: 1.25, dayScale: 0.35, vignette: 0.9, saturation: 1.1, contrast: 1.04, msaaSamples: 4 } as const;
+export const POSTFX = { bloomStrength: 0.9, bloomRadius: 0.6, bloomThreshold: 0.9, bloomThresholdDay: 1.25, dayScale: 0.35, vignette: 0.9, saturation: 1.12, contrast: 1.1, msaaSamples: 4,
+  // Split tone: cool shadows, warm highlights. A flat, ungraded frame is half of what makes a render look dated.
+  shadowTint: [0.86, 0.94, 1.1] as const, highlightTint: [1.05, 1.0, 0.93] as const, tintAmount: 0.16 } as const;
 
 
 /** Cheap grade: lifts saturation/contrast a touch and darkens the corners so the frame reads less flat. */
@@ -24,6 +26,9 @@ const GradeShader = {
     uVignette: { value: POSTFX.vignette },
     uSaturation: { value: POSTFX.saturation },
     uContrast: { value: POSTFX.contrast },
+    uShadowTint: { value: new THREE.Vector3(...POSTFX.shadowTint) },
+    uHighlightTint: { value: new THREE.Vector3(...POSTFX.highlightTint) },
+    uTint: { value: POSTFX.tintAmount },
   },
   vertexShader: `
     varying vec2 vUv;
@@ -34,6 +39,9 @@ const GradeShader = {
     uniform float uVignette;
     uniform float uSaturation;
     uniform float uContrast;
+    uniform vec3 uShadowTint;
+    uniform vec3 uHighlightTint;
+    uniform float uTint;
     varying vec2 vUv;
     void main() {
       vec4 c = texture2D( tDiffuse, vUv );
@@ -41,6 +49,9 @@ const GradeShader = {
       float l = dot( col, vec3( 0.2126, 0.7152, 0.0722 ) );
       col = mix( vec3( l ), col, uSaturation );
       col = ( col - 0.5 ) * uContrast + 0.5;
+      float lum = clamp( dot( col, vec3( 0.2126, 0.7152, 0.0722 ) ), 0.0, 1.0 );
+      vec3 tint = mix( uShadowTint, uHighlightTint, smoothstep( 0.15, 0.85, lum ) );
+      col = mix( col, col * tint, uTint );
       vec2 d = vUv - 0.5;
       float v = smoothstep( 0.85, 0.28, dot( d, d ) * uVignette * 2.4 );
       col *= mix( 0.78, 1.0, v );

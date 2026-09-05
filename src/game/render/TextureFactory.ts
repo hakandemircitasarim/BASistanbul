@@ -52,7 +52,8 @@ export class TextureFactory {
     const canvas = document.createElement('canvas');
     canvas.width = w;
     canvas.height = h;
-    const ctx = canvas.getContext('2d');
+    // willReadFrequently: the normal and roughness generators read every one of these canvases back with getImageData.
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) throw new Error('2D canvas unavailable');
     return { canvas, ctx };
   }
@@ -944,15 +945,48 @@ export class TextureFactory {
     const S = 256;
     const { canvas, ctx } = this.canvas(S, S);
     const rng = new Random(71);
-    ctx.fillStyle = '#b8a8b8';
+    const CELL = 64; // 2 m slabs on an 8 m tile
+    ctx.fillStyle = '#b0a9a6';
     ctx.fillRect(0, 0, S, S);
-    ctx.fillStyle = '#d8b8c8';
-    for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) if ((x + y) % 2 === 0) ctx.fillRect(x * 64, y * 64, 64, 64);
-    ctx.fillStyle = '#ff7a00';
-    ctx.fillRect(112, 112, 32, 32);
-    this.noise(ctx, S, S, rng, 1500, 2, 0.12, false);
-    ctx.fillStyle = rgba(0, 0, 0, 0.25);
-    for (let i = 0; i < 4; i++) { ctx.fillRect(0, i * 64, S, 2); ctx.fillRect(i * 64, 0, 2, S); }
+    // Two slab tones laid in a check, then a per-slab tonal jitter so the pattern does not read as a chessboard.
+    for (let j = 0; j < 4; j++) {
+      for (let i = 0; i < 4; i++) {
+        ctx.fillStyle = (i + j) % 2 === 0 ? '#c2b6ad' : '#a89f9c';
+        ctx.fillRect(i * CELL, j * CELL, CELL, CELL);
+        const k = rng.range(-0.06, 0.07);
+        ctx.fillStyle = k > 0 ? rgba(255, 255, 255, k * 1.8) : rgba(0, 0, 0, -k * 1.8);
+        ctx.fillRect(i * CELL, j * CELL, CELL, CELL);
+      }
+    }
+    this.noise(ctx, S, S, rng, 2600, 2, 0.13, false);
+    this.noise(ctx, S, S, rng, 1400, 2, 0.11, true);
+    // Joints: a dark line with a light lip on the far side, so the slabs read as laid rather than painted.
+    for (let i = 0; i < 4; i++) {
+      ctx.fillStyle = rgba(0, 0, 0, 0.28);
+      ctx.fillRect(0, i * CELL, S, 2);
+      ctx.fillRect(i * CELL, 0, 2, S);
+      ctx.fillStyle = rgba(255, 255, 255, 0.14);
+      ctx.fillRect(0, i * CELL + 2, S, 1);
+      ctx.fillRect(i * CELL + 2, 0, 1, S);
+    }
+    // Cracks running across a couple of slabs, and damp patches.
+    ctx.strokeStyle = rgba(0, 0, 0, 0.2);
+    ctx.lineWidth = 1;
+    for (let i = 0; i < 7; i++) {
+      let x = rng.range(0, S), y = rng.range(0, S);
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      for (let k = 0; k < 5; k++) { x += rng.range(-16, 16); y += rng.range(-16, 16); ctx.lineTo(x, y); }
+      ctx.stroke();
+    }
+    for (let i = 0; i < 9; i++) {
+      const x = rng.range(0, S), y = rng.range(0, S), r = rng.range(10, 34);
+      const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+      g.addColorStop(0, rgba(40, 36, 34, 0.09 + rng.next() * 0.06));
+      g.addColorStop(1, rgba(0, 0, 0, 0));
+      ctx.fillStyle = g;
+      ctx.fillRect(x - r, y - r, r * 2, r * 2);
+    }
     return this.finish(key, canvas, true);
   }
 
