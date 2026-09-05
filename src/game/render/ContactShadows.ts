@@ -13,8 +13,9 @@ export const SHADOW_TUNING = {
   texSize: 64,
   /** Radius (0..1) of the fully opaque core; the rest fades to nothing at the rim. */
   core: 0.34,
-  dayOpacity: 0.55,
-  nightOpacity: 0.17,
+  /** Real cast shadows overlap the blobs by day; at night the moon shadow is faint, so the blob keeps cars grounded. */
+  dayOpacity: 0.3,
+  nightOpacity: 0.3,
   color: 0x120b1c,
 } as const;
 

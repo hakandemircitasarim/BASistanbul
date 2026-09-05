@@ -13,10 +13,16 @@ export function isNightHour(hour: number): boolean {
   return h >= DAY_TUNING.lightsOnHour || h < DAY_TUNING.lightsOffHour;
 }
 
-/** Sun path: rises east (+X) at 06:45, culminates at 12:45, sets west (-X) at 18:45; a small +Z tilt keeps shadows off-axis. */
+/**
+ * Sun path: rises east (+X) at 06:45, culminates at 12:45, sets west (-X) at 18:45; a small +Z tilt keeps shadows off-axis.
+ * SOUTH_LEAN pushes the arc toward +Z as the sun climbs (noon elevation ~49 deg instead of ~55) so facades and lamp
+ * posts throw long, readable shadows at midday, while the elevation at the horizon - and therefore the sunrise/sunset
+ * azimuth and the nightFactor timing - is untouched.
+ */
 const SUNRISE_HOUR = 6.75;
 const MAX_ELEVATION = 0.82;
 const PATH_TILT = 0.22;
+const SOUTH_LEAN = 0.55;
 const TWO_PI = Math.PI * 2;
 
 export class DayNightSystem implements System {
@@ -98,7 +104,7 @@ export class DayNightSystem implements System {
     const a = ((this.hour() - SUNRISE_HOUR) / 24) * TWO_PI;
     const x = Math.cos(a);
     const y = Math.sin(a) * MAX_ELEVATION;
-    const z = PATH_TILT;
+    const z = PATH_TILT + SOUTH_LEAN * Math.max(0, y);
     const inv = 1 / Math.sqrt(x * x + y * y + z * z);
     this.dir.x = x * inv;
     this.dir.y = y * inv;
