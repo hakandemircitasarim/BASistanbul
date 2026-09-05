@@ -4,6 +4,7 @@ import type { World } from '../world/World';
 import type { Transform } from '../core/Types';
 import { createTransform, lerpTransform } from '../core/Transform';
 import { damp } from '../core/math';
+import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
 import { ContactShadows, groundYAt } from './ContactShadows';
 
 const SHIRT = 0xff7a00;
@@ -14,8 +15,10 @@ const SHOE = 0x1b1b20;
 const SHADOW_R = 0.56;
 const SHADOW_LIFT = 0.03;
 
+/** Soft-edged limb: the bevel is what stops the character reading as a stack of cubes. */
 function box(w: number, h: number, d: number, mat: THREE.Material, pivotTop: boolean): THREE.Mesh {
-  const g = new THREE.BoxGeometry(w, h, d);
+  const r = Math.min(0.05, Math.min(w, Math.min(h, d)) * 0.28);
+  const g = new RoundedBoxGeometry(w, h, d, 1, r);
   if (pivotTop) g.translate(0, -h / 2, 0);
   const m = new THREE.Mesh(g, mat);
   m.castShadow = true;

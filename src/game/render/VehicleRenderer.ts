@@ -6,6 +6,7 @@
 // That keeps glass dark blue and bumpers grey on a bright yellow taxi while still costing one draw call per spec.
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
+import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
 import type { World } from '../world/World';
 import type { Vehicle } from '../entities/Vehicle';
 import type { VehicleKey, VehicleSpec } from '../entities/VehicleSpecs';
@@ -56,8 +57,24 @@ interface PrismDef {
 
 const authorColor = new THREE.Color();
 
+/** Bevel on every body panel: sharp cube corners are what read as "boxy"; a small radius catches the light instead. */
+const PRISM_BEVEL = 0.085;
+const PRISM_SEGMENTS = 1;
+
+/** Panels smaller than this stay plain boxes: a bevel would be invisible and 9x the triangles. */
+const PRISM_BEVEL_MIN_SIZE = 0.55;
+
 function prism(p: PrismDef): THREE.BufferGeometry {
-  const g = new THREE.BoxGeometry(1, 1, 1);
+  const by1p = p.by1 ?? p.by0;
+  const ty1p = p.ty1 ?? p.ty0;
+  const spanZ = Math.max(p.bz1 - p.bz0, p.tz1 - p.tz0);
+  const spanY = Math.max(p.ty0 - p.by0, ty1p - by1p);
+  const spanX = 2 * Math.max(p.bw0, p.bw1, p.tw0, p.tw1);
+  const big = Math.max(spanX, spanY, spanZ) >= PRISM_BEVEL_MIN_SIZE;
+  // RoundedBoxGeometry is non-indexed; keep the plain boxes non-indexed too or mergeGeometries rejects the mix.
+  const g: THREE.BufferGeometry = big
+    ? new RoundedBoxGeometry(1, 1, 1, PRISM_SEGMENTS, PRISM_BEVEL)
+    : new THREE.BoxGeometry(1, 1, 1).toNonIndexed();
   const pos = g.attributes.position;
   const n = pos.count;
   const colors = new Float32Array(n * 3);
@@ -68,13 +85,14 @@ function prism(p: PrismDef): THREE.BufferGeometry {
   authorColor.setHex(p.col);
   const paint = p.paint ?? 1;
   for (let i = 0; i < n; i++) {
-    const front = pos.getZ(i) > 0;
-    const top = pos.getY(i) > 0;
-    const sx = pos.getX(i) > 0 ? 1 : -1;
-    const hw = top ? (front ? p.tw1 : p.tw0) : (front ? p.bw1 : p.bw0);
-    const z = top ? (front ? p.tz1 : p.tz0) : (front ? p.bz1 : p.bz0);
-    const y = top ? (front ? ty1 : p.ty0) : (front ? by1 : p.by0);
-    pos.setXYZ(i, xc + sx * hw, y, z);
+    // Unit cube coords -> 0..1 weights. Rounded corners sit slightly inside, so the bevel survives the taper.
+    const u = pos.getX(i) * 2;                       // -1..1 across the width
+    const v = Math.min(1, Math.max(0, pos.getY(i) + 0.5)); // 0 bottom, 1 top
+    const w = Math.min(1, Math.max(0, pos.getZ(i) + 0.5)); // 0 back, 1 front
+    const hw = (p.bw0 * (1 - w) + p.bw1 * w) * (1 - v) + (p.tw0 * (1 - w) + p.tw1 * w) * v;
+    const z = (p.bz0 * (1 - w) + p.bz1 * w) * (1 - v) + (p.tz0 * (1 - w) + p.tz1 * w) * v;
+    const y = (p.by0 * (1 - w) + by1 * w) * (1 - v) + (p.ty0 * (1 - w) + ty1 * w) * v;
+    pos.setXYZ(i, xc + u * hw, y, z);
     colors[i * 3] = authorColor.r; colors[i * 3 + 1] = authorColor.g; colors[i * 3 + 2] = authorColor.b;
     paints[i] = paint;
   }
@@ -344,9 +362,9 @@ function wheelGeometry(): THREE.BufferGeometry {
     geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     parts.push(geo);
   };
-  add(new THREE.CylinderGeometry(R.wheelRadius, R.wheelRadius, R.wheelWidth, 14), 0x141416);
-  add(new THREE.CylinderGeometry(R.wheelRadius * 0.62, R.wheelRadius * 0.62, R.wheelWidth + 0.03, 12), 0xb9bec6);
-  add(new THREE.CylinderGeometry(R.wheelRadius * 0.30, R.wheelRadius * 0.30, R.wheelWidth + 0.05, 8), 0x4a4e56);
+  add(new THREE.CylinderGeometry(R.wheelRadius, R.wheelRadius, R.wheelWidth, 12), 0x141416);
+  add(new THREE.CylinderGeometry(R.wheelRadius * 0.62, R.wheelRadius * 0.62, R.wheelWidth + 0.03, 10), 0xb9bec6);
+  add(new THREE.CylinderGeometry(R.wheelRadius * 0.30, R.wheelRadius * 0.30, R.wheelWidth + 0.05, 6), 0x4a4e56);
   const merged = mergeGeometries(parts, false);
   for (let i = 0; i < parts.length; i++) parts[i].dispose();
   return merged;

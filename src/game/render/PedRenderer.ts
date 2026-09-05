@@ -1,6 +1,7 @@
 // Instanced pedestrian rendering: body/head/arms/legs InstancedMeshes with per-ped colors, walk swing, tumble/lying pose, fade, distance collapse. Track E.
 import * as THREE from 'three';
 import * as BufferGeometryUtils from 'three/examples/jsm/utils/BufferGeometryUtils.js';
+import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
 import { ContactShadows, groundYAt } from './ContactShadows';
 import type { World } from '../world/World';
 import type { Pedestrian } from '../entities/Pedestrian';
@@ -19,8 +20,10 @@ export const PED_RENDER = {
 /** Vertex-colour multipliers layered under the per-instance colour: 1 keeps it, <1 darkens (hair, shoes). */
 const TINT_PLAIN = 1, TINT_HAIR = 0.32, TINT_SHOE = 0.28;
 
-function box(w: number, h: number, d: number, pivotTop: boolean): THREE.BoxGeometry {
-  const g = new THREE.BoxGeometry(w, h, d);
+/** Soft-edged limb (see PlayerRenderer): non-indexed like RoundedBoxGeometry so merges stay compatible. */
+function box(w: number, h: number, d: number, pivotTop: boolean): THREE.BufferGeometry {
+  const r = Math.min(0.045, Math.min(w, Math.min(h, d)) * 0.28);
+  const g = new RoundedBoxGeometry(w, h, d, 1, r);
   if (pivotTop) g.translate(0, -h / 2, 0);
   return g;
 }
