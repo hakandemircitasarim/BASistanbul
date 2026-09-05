@@ -82,7 +82,7 @@ export class PedRenderer {
   private readonly armL: THREE.InstancedMesh;
   private readonly armR: THREE.InstancedMesh;
   private readonly shadows: ContactShadows;
-  private readonly mat = new THREE.MeshLambertMaterial({ color: 0xffffff, vertexColors: true });
+  private readonly mat = new THREE.MeshStandardMaterial({ color: 0xffffff, vertexColors: true, roughness: 0.74, metalness: 0.04, envMapIntensity: 0.5 });
   private readonly interp: Transform = createTransform();
   private readonly base = new THREE.Matrix4();
   private readonly part = new THREE.Matrix4();

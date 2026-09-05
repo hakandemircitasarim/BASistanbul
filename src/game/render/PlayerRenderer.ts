@@ -130,7 +130,7 @@ export class PlayerRenderer {
   private readonly legL: THREE.Mesh;
   private readonly legR: THREE.Mesh;
   private readonly shadows: ContactShadows;
-  private readonly mat = new THREE.MeshLambertMaterial({ vertexColors: true });
+  private readonly mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.72, metalness: 0.04, envMapIntensity: 0.55 });
   private readonly interp: Transform = createTransform();
   private readonly scene: THREE.Scene;
   private swing = 0;

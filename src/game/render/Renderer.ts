@@ -13,8 +13,9 @@ export const CAMERA_FOV = 65;
 export const CAMERA_NEAR = 0.3;
 export const CAMERA_FAR = 900;
 
-/** Bloom over the neon/emissive parts, then a filmic grade + vignette, then FXAA. */
-export const POSTFX = { bloomStrength: 0.9, bloomRadius: 0.6, bloomThreshold: 0.95, dayScale: 0.35, vignette: 0.9, saturation: 1.1, contrast: 1.04, msaaSamples: 4 } as const;
+/** Bloom over the neon/emissive parts, then a filmic grade + vignette; MSAA replaces the old FXAA pass. */
+export const POSTFX = { bloomStrength: 0.9, bloomRadius: 0.6, bloomThreshold: 0.9, bloomThresholdDay: 1.25, dayScale: 0.35, vignette: 0.9, saturation: 1.1, contrast: 1.04, msaaSamples: 4 } as const;
+
 
 /** Cheap grade: lifts saturation/contrast a touch and darkens the corners so the frame reads less flat. */
 const GradeShader = {
@@ -163,6 +164,9 @@ export class Renderer {
     if (!this.bloom) return;
     const k = POSTFX.dayScale + (1 - POSTFX.dayScale) * nightFactor;
     this.bloom.strength = POSTFX.bloomStrength * k;
+    // Sunlit white paint and render sit just under 1 after tone mapping; by day the threshold has to clear them or
+    // road markings glow like neon.
+    this.bloom.threshold = POSTFX.bloomThresholdDay + (POSTFX.bloomThreshold - POSTFX.bloomThresholdDay) * nightFactor;
   }
 
   /** Pixel ratio and shadow toggling; antialias is fixed at construction. */

@@ -10,6 +10,13 @@ const GLOW_V = 0.5;
 export interface LandmarkPart { geometry: THREE.BufferGeometry; style: LandmarkStyle; /** Part rotates about local X (ferris wheel); geometry centered on the hub. */ rotating: boolean; hubX: number; hubY: number; hubZ: number }
 
 const BASE_Y = -0.2;
+/**
+ * Baked ambient occlusion. A street is darker where walls meet the pavement, and without that gradient every box
+ * looks pasted onto the ground. The ramp is applied in the vertex colour, so it costs nothing at runtime and it
+ * leaves the emissive channel (lit windows, shop interiors, neon) alone.
+ */
+const AO_HEIGHT = 6;
+const AO_FLOOR = 0.5;
 const ROOF_DARKEN = 0.62;
 const WALL_LIGHTEN = 0.35;
 const tmpColor = new THREE.Color();
@@ -22,18 +29,20 @@ export class GeoBuilder {
   private col: number[] = [];
   private idx: number[] = [];
   private r = 1; private g = 1; private b = 1;
+  /** Glow parts skip the ground ramp: a neon sign at street level must not be dimmed by fake occlusion. */
+  bakeAo = true;
   /** Sibling builder receiving every glow part (rendered with Materials.glow + the glow atlas); null until first used. */
   private glowSide: GeoBuilder | null = null;
 
   get glow(): GeoBuilder | null { return this.glowSide; }
 
   /** Routes this builder's glow parts into a shared sink so many style builders produce a single glow mesh. */
-  setGlowSink(sink: GeoBuilder): void { this.glowSide = sink; }
+  setGlowSink(sink: GeoBuilder): void { this.glowSide = sink; sink.bakeAo = false; }
 
   /** Builder + plain UV for a part: glow parts go to the sibling builder with atlas UVs, others stay here on the white strip. */
   private plainTarget(glow: number): { b: GeoBuilder; u: number; v: number } {
     if (glow === GLOW_U.none) return { b: this, u: 0.25, v: ROOF_V };
-    if (!this.glowSide) this.glowSide = new GeoBuilder();
+    if (!this.glowSide) { this.glowSide = new GeoBuilder(); this.glowSide.bakeAo = false; }
     return { b: this.glowSide, u: glow, v: GLOW_V };
   }
 
@@ -46,7 +55,13 @@ export class GeoBuilder {
     this.pos.push(x, y, z);
     this.nor.push(nx, ny, nz);
     this.uv.push(u, v);
-    this.col.push(this.r, this.g, this.b);
+    if (this.bakeAo && y < AO_HEIGHT) {
+      const t = Math.max(0, y) / AO_HEIGHT;
+      const k = AO_FLOOR + (1 - AO_FLOOR) * (t * t * (3 - 2 * t));
+      this.col.push(this.r * k, this.g * k, this.b * k);
+    } else {
+      this.col.push(this.r, this.g, this.b);
+    }
     return this.pos.length / 3 - 1;
   }
 

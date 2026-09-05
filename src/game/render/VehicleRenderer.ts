@@ -380,7 +380,7 @@ export class VehicleRenderer {
   private readonly lights: THREE.InstancedMesh;
   private readonly shadows: ContactShadows;
   private readonly bodyMat: THREE.MeshStandardMaterial;
-  private readonly wheelMat = new THREE.MeshLambertMaterial({ vertexColors: true });
+  private readonly wheelMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.62, metalness: 0.35, envMapIntensity: 0.9 });
   private readonly lightMat = new THREE.MeshBasicMaterial({ color: 0xffffff, vertexColors: true, side: THREE.DoubleSide, fog: false, toneMapped: false });
   private readonly spotL: THREE.SpotLight;
   private readonly spotR: THREE.SpotLight;

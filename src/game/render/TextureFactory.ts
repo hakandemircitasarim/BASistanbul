@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import type { BuildingStyle } from '../city/CityData';
 import { Random } from '../core/Random';
 
-export interface WindowTextures { map: THREE.CanvasTexture; emissive: THREE.CanvasTexture; normal: THREE.CanvasTexture }
+export interface WindowTextures { map: THREE.CanvasTexture; emissive: THREE.CanvasTexture; normal: THREE.CanvasTexture; rough: THREE.CanvasTexture }
 export interface AtlasRect { u0: number; v0: number; u1: number; v1: number }
 
 /** Window tile: 256x512 px = 16 m x 28 m; the top ROOF_STRIP px (v > 0.98) are a plain wall color used by roofs and plain parts. */
@@ -121,13 +121,48 @@ export class TextureFactory {
     }
   }
 
+  /**
+   * Weathering pass over a finished facade tile: grime washing down from the sills, soft dirt blotches and a little
+   * colour drift. Clean flat panels are the thing that dates a procedural city most, and because the normal and
+   * roughness maps are derived from this albedo the streaks show up in the shading too, not just the colour.
+   */
+  private grime(ctx: CanvasRenderingContext2D, W: number, H: number, rng: Random, rowH: number, top: number): void {
+    // Streaks: they start just under a floor line and fade downwards.
+    const streaks = Math.round(W / 7);
+    for (let i = 0; i < streaks; i++) {
+      const x = rng.range(0, W);
+      const w = rng.range(1, 4);
+      const row = Math.floor(rng.range(0, Math.max(1, (H - top) / rowH)));
+      const y = top + row * rowH + rowH * rng.range(0.55, 0.95);
+      const len = rowH * rng.range(0.3, 1.4);
+      const g = ctx.createLinearGradient(0, y, 0, y + len);
+      const a = 0.05 + rng.next() * 0.09;
+      g.addColorStop(0, rgba(30, 26, 22, a));
+      g.addColorStop(1, rgba(30, 26, 22, 0));
+      ctx.fillStyle = g;
+      ctx.fillRect(x, y, w, len);
+    }
+    // Soft blotches of dirt and damp.
+    for (let i = 0; i < 14; i++) {
+      const x = rng.range(0, W), y = rng.range(top, H), r = rng.range(W * 0.08, W * 0.3);
+      const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+      const a = 0.03 + rng.next() * 0.05;
+      const warm = rng.chance(0.35);
+      g.addColorStop(0, warm ? rgba(96, 74, 46, a) : rgba(28, 30, 34, a));
+      g.addColorStop(1, rgba(0, 0, 0, 0));
+      ctx.fillStyle = g;
+      ctx.fillRect(x - r, y - r, r * 2, r * 2);
+    }
+  }
+
   /** Albedo + emissive window tiles for a building style. 4 columns x 8 rows per 16 m x 28 m tile; lit windows cluster per floor. */
   windows(style: BuildingStyle, seed = 1): WindowTextures {
     const key = `win:${style}:${seed}`;
     const mk = this.cache.get(key + ':map') as THREE.CanvasTexture | undefined;
     const ek = this.cache.get(key + ':emi') as THREE.CanvasTexture | undefined;
     const nk = this.cache.get(key + ':nrm') as THREE.CanvasTexture | undefined;
-    if (mk && ek && nk) return { map: mk, emissive: ek, normal: nk };
+    const rk = this.cache.get(key + ':rgh') as THREE.CanvasTexture | undefined;
+    if (mk && ek && nk && rk) return { map: mk, emissive: ek, normal: nk, rough: rk };
     const W = 256, H = 512;
     const rng = new Random(seed * 7919 + style.length);
     const m = this.canvas(W, H), e = this.canvas(W, H);
@@ -259,6 +294,7 @@ export class TextureFactory {
         }
       }
     }
+    this.grime(m.ctx, W, H, rng, rh, top);
     // Plain strip at the top (v > 0.98): white in the albedo (vertex color shows exactly), black in the emissive.
     // The strip stays fully non-emissive: walls tile through it, so anything lit here would show up as bands on facades.
     m.ctx.fillStyle = '#ffffff';
@@ -268,7 +304,8 @@ export class TextureFactory {
     const map = this.finish(key + ':map', m.canvas, true);
     const emissive = this.finish(key + ':emi', e.canvas, true);
     const normal = this.normalFromLuminance(key + ':nrm', m.canvas, 6.5);
-    return { map, emissive, normal };
+    const rough = this.roughFromLuminance(key + ':rgh', m.canvas, 0.12, 0.95);
+    return { map, emissive, normal, rough };
   }
 
   /**
@@ -325,6 +362,31 @@ export class TextureFactory {
     return this.finish(key, out.canvas, false);
   }
 
+  /**
+   * Turns an albedo into a roughness map by reading luminance: the dark parts of these facade textures are glazing
+   * (smooth, so the sky reflects in them) and the light parts are render, stone or concrete (rough). Without this
+   * every surface answers the sky probe identically and the city reads as one flat plastic material.
+   */
+  private roughFromLuminance(key: string, src: HTMLCanvasElement, lo: number, hi: number): THREE.CanvasTexture {
+    const hit = this.cache.get(key) as THREE.CanvasTexture | undefined;
+    if (hit) return hit;
+    const W = src.width, H = src.height;
+    const sctx = src.getContext('2d');
+    const out = this.canvas(W, H);
+    if (!sctx) return this.finish(key, out.canvas, false);
+    const img = sctx.getImageData(0, 0, W, H).data;
+    const dst = out.ctx.createImageData(W, H);
+    const d = dst.data;
+    for (let i = 0; i < W * H; i++) {
+      const p = i * 4;
+      const lum = (img[p] * 0.2126 + img[p + 1] * 0.7152 + img[p + 2] * 0.0722) / 255;
+      const r = Math.round(255 * Math.min(1, Math.max(0, lo + (hi - lo) * lum)));
+      d[p] = r; d[p + 1] = r; d[p + 2] = r; d[p + 3] = 255;
+    }
+    out.ctx.putImageData(dst, 0, 0);
+    return this.finish(key, out.canvas, false);
+  }
+
   /** Separable wrapping box blur of radius r, in place (tmp is scratch of the same size). */
   private boxBlur(a: Float32Array, tmp: Float32Array, W: number, H: number, r: number): void {
     const inv = 1 / (2 * r + 1);
@@ -351,7 +413,8 @@ export class TextureFactory {
     const mk = this.cache.get(key + ':map') as THREE.CanvasTexture | undefined;
     const ek = this.cache.get(key + ':emi') as THREE.CanvasTexture | undefined;
     const nk = this.cache.get(key + ':nrm') as THREE.CanvasTexture | undefined;
-    if (mk && ek && nk) return { map: mk, emissive: ek, normal: nk };
+    const rk = this.cache.get(key + ':rgh') as THREE.CanvasTexture | undefined;
+    if (mk && ek && nk && rk) return { map: mk, emissive: ek, normal: nk, rough: rk };
     const W = 1024, H = 256;
     const rng = new Random(1301);
     const m = this.canvas(W, H), e = this.canvas(W, H);
@@ -425,10 +488,12 @@ export class TextureFactory {
     this.noise(m.ctx, W, H - kerbY + 1, rng, 400, 2, 0.2, true);
     m.ctx.fillStyle = rgba(0, 0, 0, 0.3);
     m.ctx.fillRect(0, kerbY, W, 3);
+    this.grime(m.ctx, W, H, rng, H * 0.6, 0);
     const map = this.finish(key + ':map', m.canvas, true, true, true);
     const emissive = this.finish(key + ':emi', e.canvas, true, true, true);
     const normal = this.normalFromLuminance(key + ':nrm', m.canvas, 5.5);
-    return { map, emissive, normal };
+    const rough = this.roughFromLuminance(key + ':rgh', m.canvas, 0.1, 0.92);
+    return { map, emissive, normal, rough };
   }
 
   /** Downtown stone plinth band (16 m x 6 m): pilasters, recessed dark glazing, brass trim; emissive = dim lobby light. */
@@ -437,7 +502,8 @@ export class TextureFactory {
     const mk = this.cache.get(key + ':map') as THREE.CanvasTexture | undefined;
     const ek = this.cache.get(key + ':emi') as THREE.CanvasTexture | undefined;
     const nk = this.cache.get(key + ':nrm') as THREE.CanvasTexture | undefined;
-    if (mk && ek && nk) return { map: mk, emissive: ek, normal: nk };
+    const rk = this.cache.get(key + ':rgh') as THREE.CanvasTexture | undefined;
+    if (mk && ek && nk && rk) return { map: mk, emissive: ek, normal: nk, rough: rk };
     const W = 1024, H = 384;
     const rng = new Random(1607);
     const m = this.canvas(W, H), e = this.canvas(W, H);
@@ -489,10 +555,12 @@ export class TextureFactory {
     m.ctx.fillStyle = '#2f333b';
     m.ctx.fillRect(0, base, W, H - base);
     this.noise(m.ctx, W, H, rng, 900, 2, 0.08, true);
+    this.grime(m.ctx, W, H, rng, H * 0.6, 0);
     const map = this.finish(key + ':map', m.canvas, true, true, true);
     const emissive = this.finish(key + ':emi', e.canvas, true, true, true);
     const normal = this.normalFromLuminance(key + ':nrm', m.canvas, 5.5);
-    return { map, emissive, normal };
+    const rough = this.roughFromLuminance(key + ':rgh', m.canvas, 0.1, 0.92);
+    return { map, emissive, normal, rough };
   }
 
   /** Emissive atlas for landmark/traffic-light glow parts: eight 16 px cells (black, magenta, cyan, yellow, orange, red, green, white); sample centers via GLOW_U. */
@@ -546,10 +614,10 @@ export class TextureFactory {
     // Darker tyre tracks in the wheel paths.
     ctx.fillStyle = rgba(0, 0, 0, 0.12);
     for (const off of [-5.4, -1.9, 1.9, 5.4]) ctx.fillRect(cx + off * px - 0.5 * px, 0, 1.0 * px, S);
-    ctx.fillStyle = '#e8c840';
+    ctx.fillStyle = '#c9ab3c';
     ctx.fillRect(cx - 0.35 * px, 0, 0.15 * px, S);
     ctx.fillRect(cx + 0.2 * px, 0, 0.15 * px, S);
-    ctx.fillStyle = '#e6e6e0';
+    ctx.fillStyle = '#c2c2bd';
     for (let side = -1; side <= 1; side += 2) {
       const x = cx + side * 3.5 * px - 0.08 * px;
       for (let y = 0; y < S; y += 3 * px) ctx.fillRect(x, y, 0.16 * px, 1.5 * px);
@@ -575,7 +643,7 @@ export class TextureFactory {
     for (let i = 0; i < 4; i++) ctx.fillRect(rng.range(0, S), rng.range(0, S), rng.range(40, 120), rng.range(40, 120));
     const px = S / ROAD_TILE_M;
     const band = 2.4 * px, m = 0.6 * px, stripe = 0.6 * px, gap = 0.5 * px;
-    ctx.fillStyle = '#e0e0da';
+    ctx.fillStyle = '#bdbdb7';
     for (let x = 1.4 * px; x < S - 1.4 * px; x += stripe + gap) {
       ctx.fillRect(x, m, stripe, band);
       ctx.fillRect(x, S - m - band, stripe, band);
@@ -584,7 +652,7 @@ export class TextureFactory {
     }
     // Stop bars just inside the zebra on the approach halves.
     const sb = 0.45 * px, sy = m + band + 0.35 * px;
-    ctx.fillStyle = '#d8d8d0';
+    ctx.fillStyle = '#b6b6ae';
     ctx.fillRect(S / 2 + 0.2 * px, sy, S / 2 - 1.4 * px, sb);
     ctx.fillRect(1.4 * px, S - sy - sb, S / 2 - 1.6 * px, sb);
     ctx.fillRect(sy, 1.4 * px, sb, S / 2 - 1.6 * px);
@@ -969,6 +1037,16 @@ export class TextureFactory {
     ctx.fill();
     this.bleedAlpha(ctx, W, H, 6);
     return this.finish(key, canvas, true, false);
+  }
+
+  /** Roughness for the asphalt: the painted markings are smoother than the aggregate around them. */
+  roadRough(): THREE.CanvasTexture {
+    const key = 'road:rgh';
+    const hit = this.cache.get(key) as THREE.CanvasTexture | undefined;
+    if (hit) return hit;
+    const src = this.road().image as HTMLCanvasElement | undefined;
+    if (!src || !src.width) return this.finish(key, this.canvas(4, 4).canvas, false);
+    return this.roughFromLuminance(key, src, 0.62, 1);
   }
 
   /** Soft radial white glow (sprites, light pools, particles, neon bloom). */
