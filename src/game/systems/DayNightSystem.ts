@@ -5,7 +5,13 @@ import type { World } from '../world/World';
 import type { EventBus } from '../core/EventBus';
 import type { EngineContext, System } from './System';
 
-export const DAY_TUNING = { dayLengthSec: 600, startHour: 18.0, lightsOnElevation: 0.05, lightsFadeHours: 0.5 };
+export const DAY_TUNING = { dayLengthSec: 600, startHour: 18.0, lightsOnElevation: 0.05, lightsFadeHours: 0.5, lightsOnHour: 18.5, lightsOffHour: 6.5 };
+
+/** Plain hour-window night test for anything that only needs "are the headlights on" (no sun vector to hand). */
+export function isNightHour(hour: number): boolean {
+  const h = ((hour % 24) + 24) % 24;
+  return h >= DAY_TUNING.lightsOnHour || h < DAY_TUNING.lightsOffHour;
+}
 
 /** Sun path: rises east (+X) at 06:45, culminates at 12:45, sets west (-X) at 18:45; a small +Z tilt keeps shadows off-axis. */
 const SUNRISE_HOUR = 6.75;

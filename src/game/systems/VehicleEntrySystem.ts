@@ -10,6 +10,7 @@ import type { Circle, Manifold, OBB, StaticCollider } from '../core/Collision';
 import { staticVsCircle, circleVsObb } from '../core/Collision';
 import { resetControls } from '../core/Types';
 import { damagePlayer } from './PlayerMoveSystem';
+import { isNightHour } from './DayNightSystem';
 
 export const ENTRY_TUNING = {
   enterRadius: 3.0, exitPad: 1.0, enterCooldown: 0.6,
@@ -194,6 +195,8 @@ export class VehicleEntrySystem implements System {
     v.sleeping = false;
     v.idleTimer = 0;
     resetControls(v.controls);
+    // Headlights come on by themselves when you get in after dark; L still toggles them from there.
+    if (isNightHour(world.time.hour)) v.lightsOn = true;
     v.controls.headlights = v.lightsOn;
     this.current = v;
     this.syncSeat();

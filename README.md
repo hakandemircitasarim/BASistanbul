@@ -8,14 +8,16 @@ Tüm görseller ve sesler prosedüreldir (hazır model, doku veya ses dosyası y
 ## Neler var?
 
 - **Şehir**: 10×10 blokluk ızgara, ~360 bina (art-deco sahil, cam gökdelenli merkez, banliyö), plajlar, okyanus,
-  iskele ve dönme dolap, Turuncu Kule, arena, hastane, polis merkezi, park ve plazalar; ~1300 sokak lambası, ~500 palmiye.
+  iskele ve dönme dolap, Turuncu Kule, arena, hastane, polis merkezi, park ve plazalar; ~1300 sokak lambası, ~500 palmiye,
+  sokak tabelaları, çöp kutuları, otobüs durakları ve sahil babaları.
 - **Oyuncu**: WASD ile kameraya göre hareket, koşma, zıplama, fare ile kamera (işaretçi kilidi) veya Q/R ile klavye kamerası.
 - **Araçlar**: sedan, spor, kamyonet, taksi, polis; arcade fizik (hız bağımlı direksiyon, el freniyle drift, hasar, farlar).
 - **Trafik ve yayalar**: şerit grafı üzerinde süren araçlar, dur işaretli kavşaklar, kaldırımlarda dolaşan ve tehlikede kaçan yayalar.
 - **Aranma sistemi**: 0–5 yıldız; yaya veya araç çarpmak yıldız kazandırır, polis A* ile yol bulup kovalar, yakalar ("YAKALANDIN").
 - **HUD**: mini harita, can/zırh, para, yıldızlar, hız göstergesi, bağlamsal istek ("E - Araca bin"), görev metni, bildirimler.
 - **Görevler**: Sahil Yürüyüşü, Turuncu Kurye, Sıcak Takip (plazalardaki turuncu işaretlere girerek başlar).
-- **Gece/gündüz**: 10 dakikalık gün döngüsü; gün batımında neonlar, pencereler, lambalar ve farlar yanar.
+- **Gece/gündüz**: 10 dakikalık gün döngüsü; gün batımında neonlar, pencereler, lambalar ve farlar yanar. Gökyüzünde
+  saate göre renk alan bulut katmanı, gökyüzü yansıması (PMREM) ve 4x MSAA'lı post-processing zinciri.
 - **Ses**: WebAudio ile sentezlenen motor, korna, siren, dalga sesi, çarpma ve arayüz sesleri.
 
 ## Kontroller
@@ -27,7 +29,7 @@ Tüm görseller ve sesler prosedüreldir (hazır model, doku veya ses dosyası y
 | Boşluk | Zıpla (yaya) / El freni (araç) |
 | E | Araca bin / araçtan in / görevi başlat |
 | H | Korna |
-| L | Farlar |
+| L | Farlar (gece araca binince kendiliğinden yanar) |
 | V | Kamera mesafesi |
 | Q / R | Kamera (fare kilidi yokken) |
 | M | Sessiz |
@@ -56,7 +58,8 @@ npm run shot -- "http://127.0.0.1:8080/?autostart=1&hour=19" out.png   # headles
 Hata ayıklama için URL seçenekleri: `?autostart=1` (menüyü atla), `?hour=19`, `?quality=low|high`, `?seed=7`,
 `?stars=2` (aranma seviyesi), `?nearcar=1` (en yakın park halindeki arabanın yanında başla), `?debug=1`,
 `?noadapt=1` (dinamik çözünürlüğü kapat).
-`/rendertest?hour=19` sayfası şehir render katmanını motor olmadan gösterir.
+`/rendertest?hour=19` sayfası şehir render katmanını motor olmadan gösterir; `&view=plaza|beach|spawn|neon|fx`
+veya `&cam=x,y,z&look=x,y,z` ile kamerayı serbestçe konumlandırabilirsiniz.
 
 ## Mimari
 
