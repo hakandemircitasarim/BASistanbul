@@ -8,7 +8,9 @@ import type { Materials } from './Materials';
 import { STYLES, TILE_M } from './Materials';
 import type { TextureFactory } from './TextureFactory';
 import { GLOW_U } from './TextureFactory';
-import { GeoBuilder, appendBuilding, landmarkGeometries } from './BuildingGeometry';
+import { GeoBuilder, appendBuilding, appendBuildingDetail, landmarkGeometries } from './BuildingGeometry';
+import type { WallSign } from './BuildingGeometry';
+import { Random } from '../core/Random';
 import { PropRenderer } from './CityRendererProps';
 
 /** Asphalt half width: ROAD_W/2 - SIDEWALK_W = 7 m (curbs cover the rest). */
@@ -90,13 +92,22 @@ export class CityRenderer {
     const builders: Record<string, GeoBuilder> = {};
     for (let i = 0; i < STYLES.length; i++) builders[STYLES[i]] = new GeoBuilder();
     const list = this.city.buildings;
-    for (let i = 0; i < list.length; i++) appendBuilding(builders[list[i].style], list[i]);
+    // Seeded from the city so parapets, roof clutter and painted signs are identical for a given seed.
+    const rng = new Random(this.city.seed ^ 0x5eed);
+    for (let i = 0; i < list.length; i++) {
+      const b = list[i];
+      appendBuilding(builders[b.style], b);
+      appendBuildingDetail(builders[b.style], b, rng, this.wallSigns);
+    }
     for (let i = 0; i < STYLES.length; i++) {
       const gb = builders[STYLES[i]];
       if (gb.vertexCount === 0) continue;
       this.addGeo(gb.build(), this.materials.building[STYLES[i]], true, true);
     }
   }
+
+  /** Painted wall signs collected by the building detail pass, drawn with the neon atlas. */
+  private readonly wallSigns: WallSign[] = [];
 
   private buildLandmarks(): void {
     const list = this.city.landmarks;
@@ -232,9 +243,21 @@ export class CityRenderer {
 
   private buildNeon(): void {
     const signs = this.city.neonSigns;
-    if (signs.length === 0) return;
+    if (signs.length === 0 && this.wallSigns.length === 0) return;
     const atlas = this.tex.neonAtlas(SIGN_WORDS);
     const gb = new GeoBuilder();
+    // Big painted words on blank side walls: same atlas, picked by the detail pass's word index.
+    for (let i = 0; i < this.wallSigns.length; i++) {
+      const s = this.wallSigns[i];
+      const rect = atlas.rects.get(SIGN_WORDS[s.word % SIGN_WORDS.length]);
+      if (!rect) continue;
+      const rx = Math.cos(s.yaw), rz = -Math.sin(s.yaw);
+      const nx = Math.sin(s.yaw), nz = Math.cos(s.yaw);
+      const hw = s.w / 2, hh = s.h / 2;
+      gb.setColor(s.color);
+      gb.quad(s.x - rx * hw, s.y - hh, s.z - rz * hw, s.x + rx * hw, s.y - hh, s.z + rz * hw, s.x + rx * hw, s.y + hh, s.z + rz * hw, s.x - rx * hw, s.y + hh, s.z - rz * hw,
+        nx, 0, nz, rect.u0, rect.v0, rect.u1, rect.v0, rect.u1, rect.v1, rect.u0, rect.v1);
+    }
     for (let i = 0; i < signs.length; i++) {
       const s = signs[i];
       const rect = atlas.rects.get(s.text);

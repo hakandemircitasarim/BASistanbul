@@ -180,7 +180,7 @@ export class Engine {
     this.materials = materials;
     this.cityRenderer = new CityRenderer(renderer.scene, this.world.city, this.world.roads, materials, tex);
     this.cityRenderer.build();
-    this.sky = new SkySystem(renderer.scene, renderer.camera, tex);
+    this.sky = new SkySystem(renderer.scene, renderer.camera, tex, renderer.gl);
     this.markers = new MarkerRenderer(renderer.scene, materials, (out) => this.missions.availableMarkers(out));
     this.effects = new EffectsRenderer(renderer.scene, this.events, tex);
     this.playerRenderer = new PlayerRenderer(renderer.scene);
@@ -452,6 +452,7 @@ export class Engine {
     const settings = this.ctx.settings();
     const px = world.player.curr.x, pz = world.player.curr.z;
     if (this.sky) this.sky.update(world.time.hour, this.sunDir, nf, px, pz, settings.quality === 'high' && settings.shadows);
+    if (this.renderer) this.renderer.setBloomForNight(nf);
     if (this.cityRenderer) this.cityRenderer.update(t, nf, px, pz);
     if (this.vehicleRenderer) { this.vehicleRenderer.setNightFactor(nf); this.vehicleRenderer.sync(world, alpha, t, camX, camZ); }
     if (this.playerRenderer) this.playerRenderer.sync(world, alpha, frameDt);

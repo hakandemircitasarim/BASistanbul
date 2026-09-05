@@ -66,6 +66,14 @@ export class SkySystem {
   private readonly cFog = new THREE.Color();
   private readonly cA = new THREE.Color();
   private readonly cB = new THREE.Color();
+  // Reflection probe: a tiny equirect gradient of the current sky, PMREM-filtered into scene.environment.
+  private readonly targetScene: THREE.Scene;
+  private gl: THREE.WebGLRenderer | null = null;
+  private pmrem: THREE.PMREMGenerator | null = null;
+  private envCanvas: HTMLCanvasElement | null = null;
+  private envTex: THREE.CanvasTexture | null = null;
+  private envRT: THREE.WebGLRenderTarget | null = null;
+  private lastEnvHour = -99;
   private readonly moonColor = new THREE.Color(0x8fa0ff);
   private readonly nightAmbient = new THREE.Color(0x4a5a8a);
   private readonly sunLightColor = new THREE.Color();
@@ -73,9 +81,12 @@ export class SkySystem {
   private readonly geometries: THREE.BufferGeometry[] = [];
   private readonly materials: THREE.Material[] = [];
 
-  constructor(scene: THREE.Scene, camera: THREE.Camera, tex: TextureFactory) {
+  /** Renderer is optional: without it the sky still draws, it just cannot build the reflection probe. */
+  constructor(scene: THREE.Scene, camera: THREE.Camera, tex: TextureFactory, gl?: THREE.WebGLRenderer) {
     this.scene = scene;
+    this.targetScene = scene;
     this.camera = camera;
+    if (gl) this.attachRenderer(gl);
     const domeGeo = new THREE.SphereGeometry(SKY_TUNING.domeRadius, 32, 16);
     this.domeMat = new THREE.ShaderMaterial({
       uniforms: { uTop: { value: new THREE.Color(0x2f7fe0) }, uHorizon: { value: new THREE.Color(0xb8dcf8) }, uSunDir: { value: new THREE.Vector3(0, 1, 0) }, uSunColor: { value: new THREE.Color(0xffffff) }, uStars: { value: 0 }, uStarTex: { value: tex.starField() } },
@@ -152,9 +163,51 @@ export class SkySystem {
   /** Multiplies the fog distances (Engine sets < 1 on low quality to hide the far city sooner). */
   fogScale = 1;
 
+  /** Enables the reflection probe (needs a WebGL renderer for PMREM filtering). */
+  attachRenderer(gl: THREE.WebGLRenderer): void {
+    if (this.gl || typeof document === 'undefined') return;
+    this.gl = gl;
+    this.pmrem = new THREE.PMREMGenerator(gl);
+    this.pmrem.compileEquirectangularShader();
+    const c = document.createElement('canvas');
+    c.width = 64; c.height = 32;
+    this.envCanvas = c;
+    this.envTex = new THREE.CanvasTexture(c);
+    this.envTex.mapping = THREE.EquirectangularReflectionMapping;
+    this.envTex.colorSpace = THREE.SRGBColorSpace;
+    this.lastEnvHour = -99;
+  }
+
+  /**
+   * Repaints the sky gradient into the probe texture and refilters it. Cheap (64x32 source) and only runs when the
+   * sky has actually moved on, so car paint and glass keep reflecting the right sky through the day.
+   */
+  private refreshEnvironment(hour: number): void {
+    const c = this.envCanvas, tex = this.envTex, pm = this.pmrem;
+    if (!c || !tex || !pm) return;
+    const ctx = c.getContext('2d');
+    if (!ctx) return;
+    const g = ctx.createLinearGradient(0, 0, 0, c.height);
+    g.addColorStop(0, '#' + this.cTop.getHexString());
+    g.addColorStop(0.48, '#' + this.cHor.getHexString());
+    g.addColorStop(0.52, '#' + this.cFog.getHexString());
+    g.addColorStop(1, '#' + this.cFog.clone().multiplyScalar(0.45).getHexString());
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, c.width, c.height);
+    tex.needsUpdate = true;
+    const rt = pm.fromEquirectangular(tex);
+    if (this.envRT) this.envRT.dispose();
+    this.envRT = rt;
+    this.targetScene.environment = rt.texture;
+  }
+
   update(hour: number, sunDir: Vec3, nightFactor: number, playerX: number, playerZ: number, shadows: boolean): void {
     const s = this.scalars;
     this.sample(hour, s);
+    if (this.pmrem && Math.abs(hour - this.lastEnvHour) > 0.3) {
+      this.lastEnvHour = hour;
+      this.refreshEnvironment(hour);
+    }
     const u = this.domeMat.uniforms;
     (u.uTop.value as THREE.Color).copy(this.cTop);
     (u.uHorizon.value as THREE.Color).copy(this.cHor);
@@ -206,6 +259,10 @@ export class SkySystem {
   }
 
   dispose(): void {
+    if (this.envRT) { this.envRT.dispose(); this.envRT = null; }
+    if (this.envTex) { this.envTex.dispose(); this.envTex = null; }
+    if (this.pmrem) { this.pmrem.dispose(); this.pmrem = null; }
+    this.targetScene.environment = null;
     this.scene.remove(this.dome, this.sunSprite, this.moonSprite, this.stars, this.sun, this.sun.target, this.hemi);
     for (let i = 0; i < this.geometries.length; i++) this.geometries[i].dispose();
     for (let i = 0; i < this.materials.length; i++) this.materials[i].dispose();

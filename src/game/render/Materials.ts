@@ -55,7 +55,7 @@ export class Materials {
   private readonly lampDay = new THREE.Color(0x6a6a70);
   private readonly lampNight = new THREE.Color(0xfff2c8);
   private carPaintMat: THREE.MeshLambertMaterial | null = null;
-  private glassMat: THREE.MeshLambertMaterial | null = null;
+  private glassMat: THREE.MeshStandardMaterial | null = null;
 
   constructor(tex: TextureFactory) {
     this.building = {} as Record<BuildingStyle, THREE.MeshLambertMaterial>;
@@ -104,8 +104,8 @@ export class Materials {
     return this.carPaintMat;
   }
 
-  glass(): THREE.MeshLambertMaterial {
-    if (!this.glassMat) this.glassMat = new THREE.MeshLambertMaterial({ color: 0x1c2a3a, transparent: true, opacity: 0.85 });
+  glass(): THREE.MeshStandardMaterial {
+    if (!this.glassMat) this.glassMat = new THREE.MeshStandardMaterial({ color: 0x14202e, metalness: 0.95, roughness: 0.08, envMapIntensity: 1.4, transparent: true, opacity: 0.86 });
     return this.glassMat;
   }
 

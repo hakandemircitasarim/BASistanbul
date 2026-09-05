@@ -361,7 +361,7 @@ export class VehicleRenderer {
   private readonly wheels: THREE.InstancedMesh;
   private readonly lights: THREE.InstancedMesh;
   private readonly shadows: ContactShadows;
-  private readonly bodyMat: THREE.MeshLambertMaterial;
+  private readonly bodyMat: THREE.MeshStandardMaterial;
   private readonly wheelMat = new THREE.MeshLambertMaterial({ vertexColors: true });
   private readonly lightMat = new THREE.MeshBasicMaterial({ color: 0xffffff, vertexColors: true, side: THREE.DoubleSide, fog: false, toneMapped: false });
   private readonly spotL: THREE.SpotLight;
@@ -419,8 +419,9 @@ export class VehicleRenderer {
    * Lambert + `paintMix`: the per-instance paint colour is blended in only where the geometry asks for it, so glass,
    * bumpers, lamps and liveries keep their authored colour on every car.
    */
-  private makeBodyMaterial(): THREE.MeshLambertMaterial {
-    const m = new THREE.MeshLambertMaterial({ vertexColors: true });
+  private makeBodyMaterial(): THREE.MeshStandardMaterial {
+    // Standard (not Lambert) so the sky probe reflects off the paint: that is what stops the cars reading as flat boxes.
+    const m = new THREE.MeshStandardMaterial({ vertexColors: true, metalness: 0.45, roughness: 0.34, envMapIntensity: 1.15 });
     m.onBeforeCompile = (shader) => {
       shader.vertexShader = shader.vertexShader
         .replace('#include <common>', '#include <common>\nattribute float paintMix;')
