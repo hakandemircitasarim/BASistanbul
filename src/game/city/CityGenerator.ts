@@ -42,6 +42,7 @@ export function generateCity(seed: number = CITY_SEED): GeneratedCity {
     parkedSpots: ctx.parkedSpots,
     staticColliders: ctx.colliders,
     neonSigns: ctx.neonSigns,
+    lots: ctx.emptyLots,
     bounds: { minX: CITY_MIN_X, minZ: CITY_MIN_Z, maxX: OCEAN_X0 + BOUNDS_EAST_PAD, maxZ: CITY_MAX_Z },
     points,
   };

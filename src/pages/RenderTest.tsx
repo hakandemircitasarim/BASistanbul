@@ -115,6 +115,8 @@ export default function RenderTest() {
       }
       dayNight.sunDir(sunDir);
       nightFactor = dayNight.nightFactor();
+      renderer.setBloomForNight(nightFactor);
+      renderer.setGrade(nightFactor, sunDir.y > -0.05 && sunDir.y < 0.15 ? 1 : 0, t);
       sky.update(dayNight.hour(), sunDir, nightFactor, cam.position.x, cam.position.z, settings.shadows);
       city.update(t, nightFactor, cam.position.x, cam.position.z);
       markers.update(world, t);

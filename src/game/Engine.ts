@@ -75,6 +75,13 @@ const RESPAWN_INVULN_SECONDS = 3;
 /** Low quality pulls the fog in (fewer far fragments) on top of the lower pixel ratio and disabled shadows. */
 const LOW_QUALITY_FOG_SCALE = 0.85;
 
+/** 1 while the sun sits just above/below the horizon (sunDir.y in [-0.05, 0.15]), fading out over 0.1 either side. */
+function duskFactor(sunY: number): number {
+  const lo = sunY < -0.05 ? Math.max(0, 1 - (-0.05 - sunY) / 0.1) : 1;
+  const hi = sunY > 0.15 ? Math.max(0, 1 - (sunY - 0.15) / 0.1) : 1;
+  return Math.min(lo, hi);
+}
+
 const nowMs = (): number => (typeof performance !== 'undefined' ? performance.now() : Date.now());
 const nextTask = (): Promise<void> => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
@@ -452,7 +459,7 @@ export class Engine {
     const settings = this.ctx.settings();
     const px = world.player.curr.x, pz = world.player.curr.z;
     if (this.sky) this.sky.update(world.time.hour, this.sunDir, nf, px, pz, settings.quality === 'high' && settings.shadows);
-    if (this.renderer) this.renderer.setBloomForNight(nf);
+    if (this.renderer) { this.renderer.setBloomForNight(nf); this.renderer.setGrade(nf, duskFactor(this.sunDir.y), t); }
     if (this.cityRenderer) this.cityRenderer.update(t, nf, px, pz);
     if (this.vehicleRenderer) { this.vehicleRenderer.setNightFactor(nf); this.vehicleRenderer.sync(world, alpha, t, camX, camZ); }
     if (this.playerRenderer) this.playerRenderer.sync(world, alpha, frameDt);

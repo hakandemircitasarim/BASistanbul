@@ -6,12 +6,13 @@ import { Random } from '../core/Random';
 export interface WindowTextures { map: THREE.CanvasTexture; emissive: THREE.CanvasTexture; normal: THREE.CanvasTexture; rough: THREE.CanvasTexture }
 export interface AtlasRect { u0: number; v0: number; u1: number; v1: number }
 
-/** Window tile: 256x512 px = 16 m x 28 m; the top ROOF_STRIP px (v > 0.98) are a plain wall color used by roofs and plain parts. */
+/** Window tile: 512x1024 px = 16 m x 28 m; the top ROOF_STRIP px (v > 0.98) are a plain wall color used by roofs and plain parts. */
 export const WINDOW_TILE_W = 16;
 export const WINDOW_TILE_H = 28;
-export const ROOF_STRIP_PX = 10;
+export const WINDOW_TILE_PX_H = 1024;
+export const ROOF_STRIP_PX = 20;
 /** UV v of the plain strip center (used by roofs/landmark plain parts). */
-export const ROOF_V = 1 - ROOF_STRIP_PX / 2 / 512;
+export const ROOF_V = 1 - ROOF_STRIP_PX / 2 / WINDOW_TILE_PX_H;
 /** UV u of a cell in the glow atlas (see glowAtlas()): cell 0 is non-emissive, the rest are night-glow colors. Glow parts use their own material. */
 export const GLOW_U = { none: 0.0625, magenta: 0.1875, cyan: 0.3125, yellow: 0.4375, orange: 0.5625, red: 0.6875, green: 0.8125, white: 0.9375 } as const;
 const GLOW_CELLS: number[] = [0x000000, 0xff2d95, 0x00e5ff, 0xfff03b, 0xff7a00, 0xff2418, 0x2bff6a, 0xf0f4ff];
@@ -35,6 +36,12 @@ function hex(c: number): string {
 
 function rgba(r: number, g: number, b: number, a: number): string {
   return `rgba(${r | 0},${g | 0},${b | 0},${a})`;
+}
+
+/** Neutral grey at luminance l (0..1), for painting roughness maps directly. */
+function grey(l: number): string {
+  const v = Math.round(255 * Math.min(1, Math.max(0, l)));
+  return rgba(v, v, v, 1);
 }
 
 /** Mixes toward white (k > 0) for texture-side highlights. */
@@ -66,7 +73,7 @@ export class TextureFactory {
     t.generateMipmaps = true;
     t.minFilter = THREE.LinearMipmapLinearFilter;
     t.magFilter = THREE.LinearFilter;
-    t.anisotropy = 4;
+    t.anisotropy = 8;
     t.needsUpdate = true;
     this.cache.set(key, t);
     return t;
@@ -123,16 +130,67 @@ export class TextureFactory {
   }
 
   /**
+   * Soft tonal mottle: overlapping radial gradients of low alpha (drawn wrapped so the tile stays seamless) plus a
+   * 1 px grain that vanishes in the first mip. This replaces the 2 px speckle that used to sit on every surface -
+   * speckle reads as video static at any distance, a mottle reads as render, stucco or aggregate.
+   */
+  private mottle(ctx: CanvasRenderingContext2D, W: number, H: number, rng: Random, count: number, rMin: number, rMax: number, alpha: number, grain: number, grainAlpha: number, warm: boolean): void {
+    for (let i = 0; i < count; i++) {
+      const x = rng.range(0, W), y = rng.range(0, H), r = rng.range(rMin, rMax);
+      const light = rng.chance(0.5);
+      const a = alpha * (0.5 + rng.next() * 0.5);
+      const cr = light ? 255 : warm ? 40 : 0, cg = light ? (warm ? 246 : 255) : warm ? 30 : 0, cb = light ? (warm ? 228 : 255) : warm ? 20 : 0;
+      for (let ox = -1; ox <= 1; ox++) {
+        for (let oy = -1; oy <= 1; oy++) {
+          const cx = x + ox * W, cy = y + oy * H;
+          if (cx < -r || cx > W + r || cy < -r || cy > H + r) continue;
+          const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+          g.addColorStop(0, rgba(cr, cg, cb, a));
+          g.addColorStop(1, rgba(cr, cg, cb, 0));
+          ctx.fillStyle = g;
+          ctx.fillRect(cx - r, cy - r, r * 2, r * 2);
+        }
+      }
+    }
+    for (let i = 0; i < grain; i++) {
+      const v = rng.chance(0.5) ? 255 : 0;
+      ctx.fillStyle = rgba(v, v, v, grainAlpha * rng.next());
+      ctx.fillRect(rng.range(0, W), rng.range(0, H), 1, 1);
+    }
+  }
+
+  /** In-place wrapping 3 x 3 box blur of a canvas (softens 1 px flecks into aggregate). */
+  private blur3(ctx: CanvasRenderingContext2D, W: number, H: number): void {
+    const img = ctx.getImageData(0, 0, W, H);
+    const s = img.data, d = new Uint8ClampedArray(s.length);
+    for (let y = 0; y < H; y++) {
+      const up = (y === 0 ? H - 1 : y - 1) * W, dn = (y === H - 1 ? 0 : y + 1) * W, row = y * W;
+      for (let x = 0; x < W; x++) {
+        const xl = x === 0 ? W - 1 : x - 1, xr = x === W - 1 ? 0 : x + 1;
+        for (let ch = 0; ch < 3; ch++) {
+          const sum = s[(up + xl) * 4 + ch] + s[(up + x) * 4 + ch] + s[(up + xr) * 4 + ch]
+            + s[(row + xl) * 4 + ch] + s[(row + x) * 4 + ch] + s[(row + xr) * 4 + ch]
+            + s[(dn + xl) * 4 + ch] + s[(dn + x) * 4 + ch] + s[(dn + xr) * 4 + ch];
+          d[(row + x) * 4 + ch] = sum / 9;
+        }
+        d[(row + x) * 4 + 3] = 255;
+      }
+    }
+    img.data.set(d);
+    ctx.putImageData(img, 0, 0);
+  }
+
+  /**
    * Weathering pass over a finished facade tile: grime washing down from the sills, soft dirt blotches and a little
    * colour drift. Clean flat panels are the thing that dates a procedural city most, and because the normal and
    * roughness maps are derived from this albedo the streaks show up in the shading too, not just the colour.
    */
-  private grime(ctx: CanvasRenderingContext2D, W: number, H: number, rng: Random, rowH: number, top: number): void {
+  private grime(ctx: CanvasRenderingContext2D, W: number, H: number, rng: Random, rowH: number, top: number, scale = 1): void {
     // Streaks: they start just under a floor line and fade downwards.
     const streaks = Math.round(W / 7);
     for (let i = 0; i < streaks; i++) {
       const x = rng.range(0, W);
-      const w = rng.range(1, 4);
+      const w = rng.range(1, 4) * scale;
       const row = Math.floor(rng.range(0, Math.max(1, (H - top) / rowH)));
       const y = top + row * rowH + rowH * rng.range(0.55, 0.95);
       const len = rowH * rng.range(0.3, 1.4);
@@ -156,7 +214,11 @@ export class TextureFactory {
     }
   }
 
-  /** Albedo + emissive window tiles for a building style. 4 columns x 8 rows per 16 m x 28 m tile; lit windows cluster per floor. */
+  /**
+   * Albedo + emissive window tiles for a building style. 4 columns x 8 rows per 16 m x 28 m tile; lit windows cluster
+   * per floor. 512 x 1024 px so mullions and blinds stay crisp at street level; the relief map is derived from a
+   * half-res copy and the roughness is painted directly (glazing smooth, render rough) instead of read from luminance.
+   */
   windows(style: BuildingStyle, seed = 1): WindowTextures {
     const key = `win:${style}:${seed}`;
     const mk = this.cache.get(key + ':map') as THREE.CanvasTexture | undefined;
@@ -164,16 +226,20 @@ export class TextureFactory {
     const nk = this.cache.get(key + ':nrm') as THREE.CanvasTexture | undefined;
     const rk = this.cache.get(key + ':rgh') as THREE.CanvasTexture | undefined;
     if (mk && ek && nk && rk) return { map: mk, emissive: ek, normal: nk, rough: rk };
-    const W = 256, H = 512;
+    // P = pixels per "design pixel": every hand-placed size below is written for the old 256 x 512 layout.
+    const W = 512, H = 1024, P = 2;
     const rng = new Random(seed * 7919 + style.length);
-    const m = this.canvas(W, H), e = this.canvas(W, H);
+    const m = this.canvas(W, H), e = this.canvas(W, H), r = this.canvas(W / 2, H / 2);
+    r.ctx.scale(0.5, 0.5);
     const wall = style === 'glass' ? 0x9fb4c8 : style === 'concrete' ? 0xb8b8b4 : style === 'artdeco' ? 0xd8d0c0 : style === 'neon' ? 0xe8e0e8 : 0xd4cfc4;
     m.ctx.fillStyle = hex(wall);
     m.ctx.fillRect(0, 0, W, H);
-    this.noise(m.ctx, W, H, rng, 1400, 2, 0.12, false);
-    this.noise(m.ctx, W, H, rng, 600, 2, 0.1, true);
+    // Render / stucco: broad soft tonal patches plus a fine grain, instead of the 2 px speckle that read as static.
+    this.mottle(m.ctx, W, H, rng, 110, 20, 60, 0.04, 5000, 0.03, true);
     e.ctx.fillStyle = '#000';
     e.ctx.fillRect(0, 0, W, H);
+    r.ctx.fillStyle = grey(0.92);
+    r.ctx.fillRect(0, 0, W, H);
     const cols = 4, rows = 8;
     const cw = W / cols, rh = (H - ROOF_STRIP_PX) / rows;
     const top = ROOF_STRIP_PX;
@@ -183,17 +249,17 @@ export class TextureFactory {
       for (let c = 0; c <= cols; c++) {
         const x = c * cw;
         m.ctx.fillStyle = tint(wall, 0.22);
-        m.ctx.fillRect(x - 5, top, 10, H - top);
+        m.ctx.fillRect(x - 5 * P, top, 10 * P, H - top);
         m.ctx.fillStyle = rgba(0, 0, 0, 0.16);
-        m.ctx.fillRect(x + 5, top, 3, H - top);
+        m.ctx.fillRect(x + 5 * P, top, 3 * P, H - top);
       }
     } else if (style === 'concrete') {
       // Precast panel joints.
       m.ctx.fillStyle = rgba(0, 0, 0, 0.2);
-      for (let c = 0; c <= cols; c++) m.ctx.fillRect(c * cw - 1, top, 2, H - top);
+      for (let c = 0; c <= cols; c++) m.ctx.fillRect(c * cw - P, top, 2 * P, H - top);
     } else if (style === 'residential') {
       m.ctx.fillStyle = rgba(0, 0, 0, 0.07);
-      for (let i = 0; i < 26; i++) m.ctx.fillRect(0, top + rng.range(0, H), W, 1);
+      for (let i = 0; i < 26; i++) m.ctx.fillRect(0, top + rng.range(0, H), W, P);
     }
     // Per-style window shapes (fractions of a cell).
     let wx = 0.2, wy = 0.25, ww = 0.6, wh = 0.5;
@@ -202,110 +268,186 @@ export class TextureFactory {
     else if (style === 'artdeco') { wx = 0.28; wy = 0.14; ww = 0.44; wh = 0.66; }
     else if (style === 'neon') { wx = 0.06; wy = 0.24; ww = 0.88; wh = 0.46; }
     else { wx = 0.16; wy = 0.2; ww = 0.68; wh = 0.5; }
-    const glassDay = style === 'glass' ? '#43678d' : style === 'neon' ? '#334255' : '#2e3a48';
-    for (let r = 0; r < rows; r++) {
-      const y0 = top + r * rh;
-      const ground = r === rows - 1;
+    // Lighter glass: the old near-black panes made every facade a grid of holes. Curtain walls are a sky blue-grey,
+    // punched windows a slate that still reads as glass beside a light wall.
+    const glassBase = style === 'glass' ? '#7f9fbd' : '#5c728c';
+    // Night colour temperatures: warm white, tungsten, cool fluorescent. Each seed favours one of them so two towers
+    // side by side do not light identically.
+    const HUES: [number, number, number][] = [[255, 240, 200], [255, 210, 138], [217, 232, 255]];
+    const bias = seed % 3;
+    // Mullion / frame: a 4 px bar with a 1 px lighter edge along its top or left, so it reads as a lit frame and not a black line.
+    const frame = (x: number, y: number, w: number, h: number, dark: string, light: string): void => {
+      m.ctx.fillStyle = dark;
+      m.ctx.fillRect(x, y, w, h);
+      m.ctx.fillStyle = light;
+      if (w >= h) m.ctx.fillRect(x, y, w, 1); else m.ctx.fillRect(x, y, 1, h);
+      e.ctx.fillStyle = '#000';
+      e.ctx.fillRect(x, y, w, h);
+      r.ctx.fillStyle = grey(0.7);
+      r.ctx.fillRect(x, y, w, h);
+    };
+    for (let row = 0; row < rows; row++) {
+      const y0 = top + row * rh;
+      const ground = row === rows - 1;
       // Floor bands / cornices.
       if (style === 'artdeco') {
         m.ctx.fillStyle = tint(wall, 0.3);
-        m.ctx.fillRect(0, y0 + rh - 6, W, 4);
+        m.ctx.fillRect(0, y0 + rh - 6 * P, W, 4 * P);
         m.ctx.fillStyle = rgba(0, 0, 0, 0.22);
-        m.ctx.fillRect(0, y0 + rh - 2, W, 3);
-        for (let d = 0; d < 16; d++) { m.ctx.fillStyle = rgba(0, 0, 0, 0.12); m.ctx.fillRect(d * (W / 16) + 4, y0 + rh - 10, 6, 4); }
+        m.ctx.fillRect(0, y0 + rh - 2 * P, W, 3 * P);
+        for (let d = 0; d < 16; d++) { m.ctx.fillStyle = rgba(0, 0, 0, 0.12); m.ctx.fillRect(d * (W / 16) + 4 * P, y0 + rh - 10 * P, 6 * P, 4 * P); }
       } else if (style === 'residential') {
         m.ctx.fillStyle = rgba(0, 0, 0, 0.18);
-        m.ctx.fillRect(0, y0 + rh - 3, W, 3);
+        m.ctx.fillRect(0, y0 + rh - 3 * P, W, 3 * P);
         // Balcony rail on alternating floors: a light band with bars.
-        if (r % 2 === 0) {
+        if (row % 2 === 0) {
           m.ctx.fillStyle = tint(wall, 0.35);
-          m.ctx.fillRect(0, y0 + rh * 0.62, W, 3);
-          m.ctx.fillRect(0, y0 + rh * 0.86, W, 4);
+          m.ctx.fillRect(0, y0 + rh * 0.62, W, 3 * P);
+          m.ctx.fillRect(0, y0 + rh * 0.86, W, 4 * P);
           m.ctx.fillStyle = rgba(70, 62, 54, 0.55);
-          for (let bx = 3; bx < W; bx += 9) m.ctx.fillRect(bx, y0 + rh * 0.62, 2, rh * 0.26);
+          for (let bx = 3 * P; bx < W; bx += 9 * P) m.ctx.fillRect(bx, y0 + rh * 0.62, 2 * P, rh * 0.26);
         }
       } else if (style === 'neon') {
-        m.ctx.fillStyle = r % 2 === 0 ? rgba(255, 120, 200, 0.4) : rgba(90, 220, 255, 0.4);
-        m.ctx.fillRect(0, y0 + rh - 6, W, 3);
+        m.ctx.fillStyle = row % 2 === 0 ? rgba(255, 120, 200, 0.4) : rgba(90, 220, 255, 0.4);
+        m.ctx.fillRect(0, y0 + rh - 6 * P, W, 3 * P);
         m.ctx.fillStyle = rgba(0, 0, 0, 0.14);
-        m.ctx.fillRect(0, y0 + rh - 3, W, 2);
+        m.ctx.fillRect(0, y0 + rh - 3 * P, W, 2 * P);
       } else if (style === 'glass') {
         // Opaque spandrel under every floor of the curtain wall.
         m.ctx.fillStyle = rgba(28, 40, 56, 0.85);
         m.ctx.fillRect(0, y0 + rh * 0.78, W, rh * 0.22);
         m.ctx.fillStyle = rgba(210, 226, 240, 0.35);
-        m.ctx.fillRect(0, y0 + rh * 0.78, W, 2);
+        m.ctx.fillRect(0, y0 + rh * 0.78, W, 2 * P);
+        r.ctx.fillStyle = grey(0.5);
+        r.ctx.fillRect(0, y0 + rh * 0.78, W, rh * 0.22);
       } else {
         m.ctx.fillStyle = rgba(0, 0, 0, 0.12);
-        m.ctx.fillRect(0, y0 + rh - 2, W, 2);
+        m.ctx.fillRect(0, y0 + rh - 2 * P, W, 2 * P);
       }
+      // Per-row luminance drift: eight identical floors stacked read as stripes, a few percent either way breaks it.
+      const rowLum = rng.range(-0.06, 0.06);
       // Lit windows cluster per floor: pick a density for the whole row.
       const rowLit = ground ? 0.75 : rng.chance(0.25) ? 0.75 : rng.chance(0.4) ? 0.35 : 0.08;
       for (let c = 0; c < cols; c++) {
         const x0 = c * cw;
         let gx = x0 + wx * cw, gy = y0 + wy * rh, gw = ww * cw, gh = wh * rh;
         if (ground && style !== 'glass') { gx = x0 + 0.1 * cw; gy = y0 + 0.12 * rh; gw = 0.8 * cw; gh = 0.86 * rh; }
-        m.ctx.fillStyle = glassDay;
+        m.ctx.fillStyle = glassBase;
         m.ctx.fillRect(gx, gy, gw, gh);
-        // Sky reflection: brighter at the top of each pane.
+        m.ctx.fillStyle = rowLum > 0 ? rgba(255, 255, 255, rowLum) : rgba(0, 0, 0, -rowLum);
+        m.ctx.fillRect(gx, gy, gw, gh);
+        // What is behind the glass: blinds, a curtain, a dark room, a cool office - so panes stop being one flat tone.
+        const roll = rng.next();
+        const blinds = roll < 0.24;
+        let curtainX = -1, curtainW = 0;
+        if (blinds) {
+          // Slats are far below texel size, so blinds are a lighter cream pane with only a faint stripe.
+          m.ctx.fillStyle = rgba(228, 222, 210, 0.32);
+          m.ctx.fillRect(gx, gy, gw, gh);
+          m.ctx.fillStyle = rgba(240, 236, 226, 0.16);
+          for (let yy = gy + 2 * P; yy < gy + gh - P; yy += 6 * P) m.ctx.fillRect(gx, yy, gw, 2 * P);
+        } else if (roll < 0.4) {
+          curtainW = gw * rng.range(0.4, 0.55);
+          curtainX = rng.chance(0.5) ? gx : gx + gw - curtainW;
+          m.ctx.fillStyle = rgba(236, 226, 210, 0.6);
+          m.ctx.fillRect(curtainX, gy, curtainW, gh);
+        } else if (roll < 0.6) {
+          m.ctx.fillStyle = rgba(0, 0, 0, 0.25);
+          m.ctx.fillRect(gx, gy, gw, gh);
+        } else if (roll < 0.7) {
+          m.ctx.fillStyle = rgba(205, 228, 255, 0.3);
+          m.ctx.fillRect(gx, gy, gw, gh);
+        }
+        // Sky reflection: a faint vertical gradient (8% light at the head, 6% dark at the sill).
         const grad = m.ctx.createLinearGradient(gx, gy, gx, gy + gh);
-        grad.addColorStop(0, 'rgba(255,255,255,0.3)');
-        grad.addColorStop(0.45, 'rgba(255,255,255,0.06)');
-        grad.addColorStop(1, 'rgba(0,0,0,0.18)');
+        grad.addColorStop(0, 'rgba(255,255,255,0.08)');
+        grad.addColorStop(0.45, 'rgba(255,255,255,0)');
+        grad.addColorStop(1, 'rgba(0,0,0,0.06)');
         m.ctx.fillStyle = grad;
         m.ctx.fillRect(gx, gy, gw, gh);
+        r.ctx.fillStyle = grey(blinds ? 0.55 : 0.18);
+        r.ctx.fillRect(gx, gy, gw, gh);
+        // Night: a lit pane is brightest at the ceiling and falls off to the floor; hue and level vary per pane.
+        if (rng.chance(rowLit)) {
+          const hue = rng.chance(0.55) ? HUES[bias] : HUES[rng.int(0, 2)];
+          // Big ground-floor panes at full level saturate to flat white after tone mapping: keep them lower.
+          const I = ground && style !== 'glass' ? rng.range(0.32, 0.6) : rng.range(0.5, 1.0);
+          const g = e.ctx.createLinearGradient(gx, gy, gx, gy + gh);
+          g.addColorStop(0, rgba(hue[0] * I, hue[1] * I, hue[2] * I, 1));
+          g.addColorStop(0.2, rgba(hue[0] * I, hue[1] * I, hue[2] * I, 1));
+          g.addColorStop(1, rgba(hue[0] * I * 0.45, hue[1] * I * 0.45, hue[2] * I * 0.45, 1));
+          e.ctx.fillStyle = g;
+          e.ctx.fillRect(gx, gy, gw, gh);
+          if (blinds) {
+            // Slats glow through as stripes.
+            e.ctx.fillStyle = rgba(0, 0, 0, 0.3);
+            for (let yy = gy + 2 * P; yy < gy + gh - P; yy += 6 * P) e.ctx.fillRect(gx, yy, gw, 2 * P);
+          }
+          if (curtainX >= 0) {
+            e.ctx.fillStyle = rgba(0, 0, 0, 0.5);
+            e.ctx.fillRect(curtainX, gy, curtainW, gh);
+          }
+          if (rng.chance(0.3)) {
+            e.ctx.fillStyle = rgba(0, 0, 0, 0.7);
+            e.ctx.fillRect(gx, gy + gh * rng.range(0.1, 0.5), gw, 3);
+          }
+        }
+        // Frames and mullions (cut black out of the emissive too).
         if (style === 'glass') {
-          m.ctx.fillStyle = rgba(150, 176, 200, 0.7);
-          m.ctx.fillRect(gx + gw / 2 - 1, gy, 2, gh);
-          m.ctx.fillRect(gx - 1, gy, 2, gh);
+          const dk = rgba(150, 176, 200, 0.7), lt = rgba(224, 236, 246, 0.8);
+          frame(gx + gw / 2 - 2, gy, 4, gh, dk, lt);
+          frame(gx - 2, gy, 4, gh, dk, lt);
         } else if (style === 'neon') {
-          m.ctx.fillStyle = rgba(20, 26, 34, 0.7);
-          for (let k = 1; k < 4; k++) m.ctx.fillRect(gx + (gw * k) / 4 - 1, gy, 2, gh);
+          const dk = rgba(20, 26, 34, 0.7), lt = rgba(120, 130, 140, 0.7);
+          for (let k = 1; k < 4; k++) frame(gx + (gw * k) / 4 - 2, gy, 4, gh, dk, lt);
         } else if (style === 'concrete') {
           // Deep reveal: shadow along the top and left of the punched opening.
           m.ctx.fillStyle = rgba(0, 0, 0, 0.35);
-          m.ctx.fillRect(gx - 2, gy - 2, gw + 4, 3);
-          m.ctx.fillRect(gx - 2, gy - 2, 3, gh + 4);
+          m.ctx.fillRect(gx - 2 * P, gy - 2 * P, gw + 4 * P, 3 * P);
+          m.ctx.fillRect(gx - 2 * P, gy - 2 * P, 3 * P, gh + 4 * P);
           m.ctx.fillStyle = tint(wall, 0.3);
-          m.ctx.fillRect(gx - 2, gy + gh, gw + 4, 3);
+          m.ctx.fillRect(gx - 2 * P, gy + gh, gw + 4 * P, 3 * P);
+          frame(gx + gw / 2 - 2, gy, 4, gh, rgba(40, 44, 50, 0.8), rgba(150, 150, 146, 0.8));
         } else if (style === 'artdeco') {
           m.ctx.fillStyle = tint(wall, 0.45);
-          m.ctx.fillRect(gx - 3, gy - 3, gw + 6, 3);
-          m.ctx.fillRect(gx - 3, gy + gh, gw + 6, 4);
-          m.ctx.fillStyle = rgba(60, 60, 70, 0.7);
-          m.ctx.fillRect(gx + gw / 2 - 1, gy, 2, gh);
+          m.ctx.fillRect(gx - 3 * P, gy - 3 * P, gw + 6 * P, 3 * P);
+          m.ctx.fillRect(gx - 3 * P, gy + gh, gw + 6 * P, 4 * P);
+          frame(gx + gw / 2 - 2, gy, 4, gh, rgba(60, 60, 70, 0.7), rgba(180, 176, 168, 0.8));
         } else if (!ground) {
           // Residential: white frame, sill and an occasional shutter.
           m.ctx.fillStyle = rgba(250, 248, 244, 0.9);
-          m.ctx.fillRect(gx - 3, gy - 3, gw + 6, 3);
-          m.ctx.fillRect(gx - 3, gy + gh, gw + 6, 4);
-          m.ctx.fillRect(gx + gw / 2 - 1, gy, 2, gh);
-          if (rng.chance(0.3)) { m.ctx.fillStyle = rgba(120, 150, 130, 0.85); m.ctx.fillRect(gx, gy, gw * 0.45, gh); }
-        }
-        const lit = rng.chance(rowLit);
-        if (lit) {
-          const warm = rng.chance(style === 'glass' ? 0.45 : 0.85);
-          const rr = warm ? 255 : 180, gg = warm ? 200 + rng.int(0, 45) : 220, bb = warm ? 115 + rng.int(0, 65) : 255;
-          e.ctx.fillStyle = rgba(rr, gg, bb, 0.9 + rng.next() * 0.1);
-          e.ctx.fillRect(gx, gy, gw, gh);
-          // Blinds / furniture blocking part of the pane.
-          e.ctx.fillStyle = rgba(0, 0, 0, 0.3);
-          if (rng.chance(0.45)) e.ctx.fillRect(gx, gy, gw * (0.3 + rng.next() * 0.35), gh);
-          if (rng.chance(0.35)) e.ctx.fillRect(gx, gy, gw, gh * 0.3);
+          m.ctx.fillRect(gx - 3 * P, gy - 3 * P, gw + 6 * P, 3 * P);
+          m.ctx.fillRect(gx - 3 * P, gy + gh, gw + 6 * P, 4 * P);
+          frame(gx + gw / 2 - 2, gy, 4, gh, rgba(236, 232, 226, 0.9), rgba(255, 255, 255, 0.9));
+          if (rng.chance(0.3)) {
+            m.ctx.fillStyle = rgba(120, 150, 130, 0.85);
+            m.ctx.fillRect(gx, gy, gw * 0.45, gh);
+            e.ctx.fillStyle = '#000';
+            e.ctx.fillRect(gx, gy, gw * 0.45, gh);
+            r.ctx.fillStyle = grey(0.8);
+            r.ctx.fillRect(gx, gy, gw * 0.45, gh);
+          }
+        } else {
+          frame(gx + gw / 2 - 2, gy, 4, gh, rgba(40, 44, 50, 0.8), rgba(150, 150, 146, 0.8));
         }
       }
     }
-    this.grime(m.ctx, W, H, rng, rh, top);
+    this.grime(m.ctx, W, H, rng, rh, top, P);
     // Plain strip at the top (v > 0.98): white in the albedo (vertex color shows exactly), black in the emissive.
     // The strip stays fully non-emissive: walls tile through it, so anything lit here would show up as bands on facades.
     m.ctx.fillStyle = '#ffffff';
     m.ctx.fillRect(0, 0, W, ROOF_STRIP_PX);
     e.ctx.fillStyle = '#000';
     e.ctx.fillRect(0, 0, W, ROOF_STRIP_PX);
+    r.ctx.fillStyle = grey(0.9);
+    r.ctx.fillRect(0, 0, W, ROOF_STRIP_PX);
     const map = this.finish(key + ':map', m.canvas, true);
     const emissive = this.finish(key + ':emi', e.canvas, true);
-    const normal = this.normalFromLuminance(key + ':nrm', m.canvas, 6.5);
-    const rough = this.roughFromLuminance(key + ':rgh', m.canvas, 0.12, 0.95);
+    // The relief only needs the frame steps, not the grain: derive it from a half-res copy.
+    const half = this.canvas(W / 2, H / 2);
+    half.ctx.drawImage(m.canvas, 0, 0, W / 2, H / 2);
+    const normal = this.normalFromLuminance(key + ':nrm', half.canvas, 6.5);
+    const rough = this.finish(key + ':rgh', r.canvas, false);
     return { map, emissive, normal, rough };
   }
 
@@ -421,7 +563,7 @@ export class TextureFactory {
     const m = this.canvas(W, H), e = this.canvas(W, H);
     m.ctx.fillStyle = '#c8c2b6';
     m.ctx.fillRect(0, 0, W, H);
-    this.noise(m.ctx, W, H, rng, 2600, 2, 0.13, false);
+    this.mottle(m.ctx, W, H, rng, 60, 20, 60, 0.05, 4000, 0.03, true);
     e.ctx.fillStyle = '#000';
     e.ctx.fillRect(0, 0, W, H);
     const FASCIA = [0x1f3a5c, 0x7a2140, 0x1f5a48, 0x6a3a12];
@@ -456,19 +598,32 @@ export class TextureFactory {
       m.ctx.fillRect(x + 1, fasciaH, 4, H - fasciaH);
       // Glazing + door.
       const gx = x + 18, gy = fasciaH + 12, gw = bw - 36, gh = kerbY - gy;
-      m.ctx.fillStyle = '#1b2a36';
+      m.ctx.fillStyle = '#2c3e4e';
       m.ctx.fillRect(gx, gy, gw, gh);
       const doorW = 54, doorX = i % 2 === 0 ? gx + gw - doorW - 8 : gx + 8;
-      // Warm interior in the emissive.
-      e.ctx.fillStyle = rgba(255, 214, 150, 0.95);
+      // Interior: a dim warm base, ceiling spots that bloom, and shelving / counters as dark silhouettes against them.
+      e.ctx.fillStyle = rgba(150, 118, 78, 1);
       e.ctx.fillRect(gx, gy, gw, gh);
-      e.ctx.fillStyle = rgba(0, 0, 0, 0.5);
-      e.ctx.fillRect(gx, gy + gh * 0.62, gw, gh * 0.38);
-      for (let k = 0; k < 5; k++) {
-        if (rng.chance(0.5)) continue;
-        const sx = gx + rng.range(6, gw - 40);
-        e.ctx.fillStyle = rgba(0, 0, 0, 0.45);
-        e.ctx.fillRect(sx, gy + rng.range(4, gh * 0.5), rng.range(14, 34), gh * 0.5);
+      const spots = rng.int(2, 3);
+      for (let k = 0; k < spots; k++) {
+        const sx = gx + gw * ((k + 0.5) / spots) + rng.range(-18, 18), sy = gy + gh * 0.12, sr = gh * rng.range(0.45, 0.65);
+        const g = e.ctx.createRadialGradient(sx, sy, 0, sx, sy, sr);
+        g.addColorStop(0, rgba(255, 236, 200, 1));
+        g.addColorStop(0.35, rgba(255, 220, 160, 0.55));
+        g.addColorStop(1, rgba(255, 200, 130, 0));
+        e.ctx.fillStyle = g;
+        e.ctx.fillRect(sx - sr, sy - sr, sr * 2, sr * 2);
+      }
+      e.ctx.fillStyle = rgba(0, 0, 0, 0.35);
+      e.ctx.fillRect(gx, gy + gh * 0.66, gw, gh * 0.34);
+      const shelves = rng.int(3, 5);
+      for (let k = 0; k < shelves; k++) {
+        const sw = rng.range(14, 40), sh = gh * rng.range(0.3, 0.62);
+        const sx = gx + rng.range(4, gw - sw - 4);
+        e.ctx.fillStyle = rgba(0, 0, 0, 0.62);
+        e.ctx.fillRect(sx, gy + gh - sh, sw, sh);
+        m.ctx.fillStyle = rgba(0, 0, 0, 0.18);
+        m.ctx.fillRect(sx, gy + gh - sh, sw, sh);
       }
       // Mullions over the glass in both maps.
       for (const c of [m.ctx, e.ctx]) {
@@ -479,6 +634,8 @@ export class TextureFactory {
         c.fillRect(doorX + doorW, gy, 4, gh);
         c.fillRect(doorX, gy + gh * 0.18, doorW, 5);
       }
+      m.ctx.fillStyle = rgba(200, 216, 230, 0.35);
+      for (let k = 1; k < 4; k++) m.ctx.fillRect(gx + (gw * k) / 4 - 3, gy, 1, gh);
       // Awning valance stub drawn on the wall (the real awning is geometry).
       m.ctx.fillStyle = rgba(0, 0, 0, 0.28);
       m.ctx.fillRect(x + 2, fasciaH, bw - 4, 7);
@@ -486,7 +643,6 @@ export class TextureFactory {
     // Kerb / plinth strip along the bottom.
     m.ctx.fillStyle = '#6c6a66';
     m.ctx.fillRect(0, kerbY, W, H - kerbY);
-    this.noise(m.ctx, W, H - kerbY + 1, rng, 400, 2, 0.2, true);
     m.ctx.fillStyle = rgba(0, 0, 0, 0.3);
     m.ctx.fillRect(0, kerbY, W, 3);
     this.grime(m.ctx, W, H, rng, H * 0.6, 0);
@@ -510,8 +666,7 @@ export class TextureFactory {
     const m = this.canvas(W, H), e = this.canvas(W, H);
     m.ctx.fillStyle = '#4a4e58';
     m.ctx.fillRect(0, 0, W, H);
-    this.noise(m.ctx, W, H, rng, 4000, 3, 0.18, false);
-    this.noise(m.ctx, W, H, rng, 2000, 2, 0.1, true);
+    this.mottle(m.ctx, W, H, rng, 70, 20, 60, 0.06, 4000, 0.03, false);
     e.ctx.fillStyle = '#000';
     e.ctx.fillRect(0, 0, W, H);
     const cornice = 44, base = H - 26;
@@ -520,14 +675,30 @@ export class TextureFactory {
       const x = i * bw;
       // Recessed dark glazing between pilasters.
       const gx = x + pw / 2 + 6, gw = bw - pw - 12, gy = cornice + 18, gh = base - gy - 10;
-      m.ctx.fillStyle = '#16202c';
+      m.ctx.fillStyle = '#243040';
       m.ctx.fillRect(gx, gy, gw, gh);
       m.ctx.fillStyle = rgba(120, 160, 200, 0.14);
       m.ctx.fillRect(gx, gy, gw, gh * 0.35);
-      e.ctx.fillStyle = rgba(150, 190, 235, 0.6);
+      // Lobby: cool base light with two ceiling spots and a reception desk / column silhouettes.
+      e.ctx.fillStyle = rgba(70, 92, 118, 1);
       e.ctx.fillRect(gx, gy, gw, gh);
-      e.ctx.fillStyle = rgba(0, 0, 0, 0.55);
-      e.ctx.fillRect(gx, gy + gh * 0.5, gw, gh * 0.5);
+      for (let k = 0; k < 2; k++) {
+        const sx = gx + gw * (0.28 + k * 0.44) + rng.range(-8, 8), sy = gy + gh * 0.1, sr = gh * 0.55;
+        const g = e.ctx.createRadialGradient(sx, sy, 0, sx, sy, sr);
+        g.addColorStop(0, rgba(225, 238, 255, 1));
+        g.addColorStop(0.4, rgba(170, 200, 240, 0.5));
+        g.addColorStop(1, rgba(150, 190, 235, 0));
+        e.ctx.fillStyle = g;
+        e.ctx.fillRect(sx - sr, sy - sr, sr * 2, sr * 2);
+      }
+      e.ctx.fillStyle = rgba(0, 0, 0, 0.4);
+      e.ctx.fillRect(gx, gy + gh * 0.6, gw, gh * 0.4);
+      for (let k = 0; k < 3; k++) {
+        const sw = rng.range(10, 30), sh = gh * rng.range(0.3, 0.55);
+        const sx = gx + rng.range(4, gw - sw - 4);
+        e.ctx.fillStyle = rgba(0, 0, 0, 0.65);
+        e.ctx.fillRect(sx, gy + gh - sh, sw, sh);
+      }
       for (const c of [m.ctx, e.ctx]) {
         c.fillStyle = c === m.ctx ? 'rgba(24,30,38,0.95)' : 'rgba(0,0,0,0.9)';
         for (let k = 1; k < 3; k++) c.fillRect(gx + (gw * k) / 3 - 3, gy, 6, gh);
@@ -555,7 +726,6 @@ export class TextureFactory {
     m.ctx.fillRect(0, 4, W, 5);
     m.ctx.fillStyle = '#2f333b';
     m.ctx.fillRect(0, base, W, H - base);
-    this.noise(m.ctx, W, H, rng, 900, 2, 0.08, true);
     this.grime(m.ctx, W, H, rng, H * 0.6, 0);
     const map = this.finish(key + ':map', m.canvas, true, true, true);
     const emissive = this.finish(key + ':emi', e.canvas, true, true, true);
@@ -580,6 +750,32 @@ export class TextureFactory {
     return t;
   }
 
+  /** Shared asphalt base: dark warm bitumen with a soft aggregate mottle, fine flecks softened by a 1 px blur. */
+  private asphalt(ctx: CanvasRenderingContext2D, S: number, rng: Random): void {
+    ctx.fillStyle = '#2a2826';
+    ctx.fillRect(0, 0, S, S);
+    this.mottle(ctx, S, S, rng, 40, 30, 90, 0.06, 4000, 0.1, true);
+    this.blur3(ctx, S, S);
+  }
+
+  /** Repair patch: an irregular polygon of slightly different asphalt with a soft edge (three fills, shrinking). */
+  private patch(ctx: CanvasRenderingContext2D, rng: Random, cx: number, cy: number, radius: number, dark: boolean): void {
+    const n = rng.int(6, 8);
+    const ang: number[] = [], rad: number[] = [];
+    for (let k = 0; k < n; k++) { ang.push((k / n) * Math.PI * 2 + rng.range(-0.2, 0.2)); rad.push(radius * rng.range(0.6, 1)); }
+    for (let pass = 0; pass < 3; pass++) {
+      const s = 1 - pass * 0.07;
+      ctx.beginPath();
+      for (let k = 0; k < n; k++) {
+        const x = cx + Math.cos(ang[k]) * rad[k] * s, y = cy + Math.sin(ang[k]) * rad[k] * s * 0.7;
+        if (k === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.closePath();
+      ctx.fillStyle = dark ? rgba(0, 0, 0, 0.06) : rgba(255, 250, 240, 0.035);
+      ctx.fill();
+    }
+  }
+
   /** Asphalt tile (ROAD_TILE_M x ROAD_TILE_M m): dashed white lane separators at +-3.5 m, double yellow center, patches and wear. u = across, v = along. */
   road(): THREE.CanvasTexture {
     const key = 'road';
@@ -588,43 +784,39 @@ export class TextureFactory {
     const S = 512;
     const { canvas, ctx } = this.canvas(S, S);
     const rng = new Random(11);
-    ctx.fillStyle = '#3a3c40';
-    ctx.fillRect(0, 0, S, S);
-    this.noise(ctx, S, S, rng, 5000, 2, 0.35, false);
-    this.noise(ctx, S, S, rng, 2500, 2, 0.2, true);
-    // Repair patches (slightly different asphalt) and tar seams.
-    for (let i = 0; i < 5; i++) {
-      const px = rng.range(0, S), py = rng.range(0, S), pw = rng.range(40, 150), ph = rng.range(30, 120);
-      ctx.fillStyle = rgba(0, 0, 0, 0.1 + rng.next() * 0.1);
-      ctx.fillRect(px, py, pw, ph);
-      ctx.strokeStyle = rgba(20, 20, 22, 0.55);
-      ctx.lineWidth = 3;
-      ctx.strokeRect(px, py, pw, ph);
-    }
-    ctx.strokeStyle = rgba(24, 24, 26, 0.5);
+    this.asphalt(ctx, S, rng);
+    // Two repair patches (kept away from the edges so the tile still wraps) and a few tar seams.
+    this.patch(ctx, rng, rng.range(130, 220), rng.range(120, 390), rng.range(50, 90), true);
+    this.patch(ctx, rng, rng.range(300, 390), rng.range(120, 390), rng.range(40, 80), rng.chance(0.5));
+    ctx.strokeStyle = rgba(18, 16, 14, 0.4);
     ctx.lineWidth = 2;
-    for (let i = 0; i < 10; i++) {
-      const x = rng.range(0, S), y = rng.range(0, S);
+    for (let i = 0; i < 7; i++) {
+      const x = rng.range(60, S - 60), y = rng.range(60, S - 60);
       ctx.beginPath();
       ctx.moveTo(x, y);
-      ctx.lineTo(x + rng.range(-70, 70), y + rng.range(-70, 70));
+      ctx.lineTo(x + rng.range(-60, 60), y + rng.range(-60, 60));
       ctx.stroke();
     }
     const px = S / ROAD_TILE_M;
     const cx = S / 2;
-    // Darker tyre tracks in the wheel paths.
-    ctx.fillStyle = rgba(0, 0, 0, 0.12);
+    // Darker tyre tracks in the wheel paths, plus faint full-height streaks so the surface reads as driven along.
+    ctx.fillStyle = rgba(0, 0, 0, 0.1);
     for (const off of [-5.4, -1.9, 1.9, 5.4]) ctx.fillRect(cx + off * px - 0.5 * px, 0, 1.0 * px, S);
+    for (let i = 0; i < 26; i++) {
+      const light = rng.chance(0.4), v = light ? 255 : 0;
+      ctx.fillStyle = rgba(v, v, v, rng.range(0.02, 0.05));
+      ctx.fillRect(rng.range(0, S), 0, rng.range(1, 4), S);
+    }
     ctx.fillStyle = '#c9ab3c';
     ctx.fillRect(cx - 0.35 * px, 0, 0.15 * px, S);
     ctx.fillRect(cx + 0.2 * px, 0, 0.15 * px, S);
-    ctx.fillStyle = '#c2c2bd';
+    ctx.fillStyle = '#c8c8c2';
     for (let side = -1; side <= 1; side += 2) {
       const x = cx + side * 3.5 * px - 0.08 * px;
       for (let y = 0; y < S; y += 3 * px) ctx.fillRect(x, y, 0.16 * px, 1.5 * px);
     }
     // Faded paint: scratch the markings a little.
-    this.noise(ctx, S, S, rng, 1800, 2, 0.16, false);
+    this.noise(ctx, S, S, rng, 450, 8, 0.08, false);
     return this.finish(key, canvas, true);
   }
 
@@ -636,15 +828,12 @@ export class TextureFactory {
     const S = 512;
     const { canvas, ctx } = this.canvas(S, S);
     const rng = new Random(23);
-    ctx.fillStyle = '#3a3c40';
-    ctx.fillRect(0, 0, S, S);
-    this.noise(ctx, S, S, rng, 5000, 2, 0.35, false);
-    this.noise(ctx, S, S, rng, 2500, 2, 0.2, true);
-    ctx.fillStyle = rgba(0, 0, 0, 0.12);
-    for (let i = 0; i < 4; i++) ctx.fillRect(rng.range(0, S), rng.range(0, S), rng.range(40, 120), rng.range(40, 120));
+    this.asphalt(ctx, S, rng);
+    this.patch(ctx, rng, rng.range(150, 360), rng.range(150, 360), rng.range(50, 90), true);
+    this.patch(ctx, rng, rng.range(150, 360), rng.range(150, 360), rng.range(40, 70), false);
     const px = S / ROAD_TILE_M;
     const band = 2.4 * px, m = 0.6 * px, stripe = 0.6 * px, gap = 0.5 * px;
-    ctx.fillStyle = '#bdbdb7';
+    ctx.fillStyle = '#c4c4bc';
     for (let x = 1.4 * px; x < S - 1.4 * px; x += stripe + gap) {
       ctx.fillRect(x, m, stripe, band);
       ctx.fillRect(x, S - m - band, stripe, band);
@@ -653,12 +842,12 @@ export class TextureFactory {
     }
     // Stop bars just inside the zebra on the approach halves.
     const sb = 0.45 * px, sy = m + band + 0.35 * px;
-    ctx.fillStyle = '#b6b6ae';
+    ctx.fillStyle = '#bcbcb4';
     ctx.fillRect(S / 2 + 0.2 * px, sy, S / 2 - 1.4 * px, sb);
     ctx.fillRect(1.4 * px, S - sy - sb, S / 2 - 1.6 * px, sb);
     ctx.fillRect(sy, 1.4 * px, sb, S / 2 - 1.6 * px);
     ctx.fillRect(S - sy - sb, S / 2 + 0.2 * px, sb, S / 2 - 1.4 * px);
-    this.noise(ctx, S, S, rng, 1500, 2, 0.14, false);
+    this.noise(ctx, S, S, rng, 375, 8, 0.07, false);
     return this.finish(key, canvas, true);
   }
 
@@ -706,40 +895,99 @@ export class TextureFactory {
     return t;
   }
 
-  /** Concrete paving tile (4 m) with slab joints and wear. */
+  /**
+   * Concrete paving tile (8 m): running-bond 2 m x 1 m slabs with a single dark joint, a few special slabs (granite,
+   * drain grate, tactile strip) and grime. The bottom 2% of the rows (v 0..0.02) is a kerb-stone band: CityRenderer's
+   * curb boxes map exactly that strip onto the kerb sides, so kerb and pavement share one texture and one grid.
+   */
   sidewalk(): THREE.CanvasTexture {
     const key = 'sidewalk';
     const c = this.cache.get(key) as THREE.CanvasTexture | undefined;
     if (c) return c;
-    const S = 256;
+    const S = 512, PM = S / 8; // 64 px per metre
     const { canvas, ctx } = this.canvas(S, S);
     const rng = new Random(31);
-    ctx.fillStyle = '#9b978f';
+    ctx.fillStyle = '#b8b1a4';
     ctx.fillRect(0, 0, S, S);
-    // Per-slab shade variation (4 x 4 slabs of 1 m).
-    for (let j = 0; j < 4; j++) {
-      for (let i = 0; i < 4; i++) {
-        const k = rng.range(-0.05, 0.06);
+    this.mottle(ctx, S, S, rng, 36, 24, 70, 0.05, 3000, 0.03, true);
+    const SW = 2 * PM, SH = PM, rows = 8, cols = 4;
+    // Special slabs: (row, col, kind) - kept off the kerb row.
+    const special: { r: number; c: number; kind: number }[] = [];
+    for (let k = 0; k < 4; k++) special.push({ r: rng.int(0, rows - 2), c: rng.int(0, cols - 1), kind: k });
+    for (let j = 0; j < rows; j++) {
+      const off = (j % 2) * (SW / 2);
+      const y = j * SH;
+      for (let i = -1; i < cols; i++) {
+        const x = i * SW + off;
+        // Per-slab tonal jitter.
+        const k = rng.range(-0.02, 0.02);
         ctx.fillStyle = k > 0 ? rgba(255, 255, 255, k * 2) : rgba(0, 0, 0, -k * 2);
-        ctx.fillRect(i * 64, j * 64, 64, 64);
+        ctx.fillRect(x, y, SW, SH);
+        const sp = special.find((s) => s.r === j && s.c === ((i + cols) % cols));
+        if (sp && i >= 0) {
+          if (sp.kind === 0 || sp.kind === 3) {
+            // Darker granite slab with a light sparkle.
+            ctx.fillStyle = rgba(60, 58, 60, 0.45);
+            ctx.fillRect(x, y, SW, SH);
+            for (let g = 0; g < 60; g++) { ctx.fillStyle = rgba(255, 255, 255, rng.range(0.05, 0.18)); ctx.fillRect(x + rng.range(0, SW), y + rng.range(0, SH), 1, 1); }
+          } else if (sp.kind === 1) {
+            // Drain grate: a dark recess with slots.
+            const gw = 0.6 * PM, gh = 0.36 * PM, gx = x + SW / 2 - gw / 2, gy = y + SH / 2 - gh / 2;
+            ctx.fillStyle = '#3a3835';
+            ctx.fillRect(gx - 2, gy - 2, gw + 4, gh + 4);
+            ctx.fillStyle = '#15130f';
+            for (let s = 3; s < gw - 3; s += 6) ctx.fillRect(gx + s, gy + 2, 3, gh - 4);
+          } else {
+            // Tactile strip: rows of raised domes, light on top with a shadow below.
+            for (let yy = y + 6; yy < y + SH - 4; yy += 8) {
+              for (let xx = x + 6; xx < x + SW - 4; xx += 8) {
+                ctx.fillStyle = rgba(0, 0, 0, 0.28);
+                ctx.fillRect(xx, yy + 1, 4, 3);
+                ctx.fillStyle = rgba(255, 250, 240, 0.4);
+                ctx.fillRect(xx, yy, 4, 2);
+              }
+            }
+          }
+        }
+        // Vertical joint at the slab's left edge (single dark line, no light lip).
+        ctx.fillStyle = rgba(0, 0, 0, 0.26);
+        ctx.fillRect(x, y, 2, SH);
       }
+      // Horizontal joint.
+      ctx.fillStyle = rgba(0, 0, 0, 0.26);
+      ctx.fillRect(0, y, S, 2);
     }
-    this.noise(ctx, S, S, rng, 2500, 2, 0.16, false);
-    this.noise(ctx, S, S, rng, 1500, 2, 0.14, true);
-    ctx.fillStyle = rgba(0, 0, 0, 0.3);
-    for (let i = 0; i < 4; i++) { ctx.fillRect(0, i * 64, S, 2); ctx.fillRect(i * 64, 0, 2, S); }
-    ctx.fillStyle = rgba(255, 255, 255, 0.16);
-    for (let i = 0; i < 4; i++) { ctx.fillRect(0, i * 64 + 2, S, 1); ctx.fillRect(i * 64 + 2, 0, 1, S); }
-    // Stains and cracks.
-    ctx.strokeStyle = rgba(0, 0, 0, 0.22);
-    ctx.lineWidth = 1.5;
-    for (let i = 0; i < 6; i++) {
-      const x = rng.range(0, S), y = rng.range(0, S);
+    // Hairline cracks across a few slabs.
+    ctx.strokeStyle = rgba(0, 0, 0, 0.18);
+    ctx.lineWidth = 1;
+    for (let i = 0; i < 5; i++) {
+      let x = rng.range(40, S - 40), y = rng.range(40, S - 60);
       ctx.beginPath();
       ctx.moveTo(x, y);
-      ctx.lineTo(x + rng.range(-30, 30), y + rng.range(-30, 30));
+      for (let k = 0; k < 4; k++) { x += rng.range(-14, 14); y += rng.range(-14, 14); ctx.lineTo(x, y); }
       ctx.stroke();
     }
+    // Grime blotches (damp, gum, rust) kept off the edges so the tile still wraps.
+    for (let i = 0; i < 12; i++) {
+      const r = rng.range(14, 50), x = rng.range(r, S - r), y = rng.range(r, S - r - 12);
+      const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+      const warm = rng.chance(0.4);
+      g.addColorStop(0, warm ? rgba(96, 74, 46, 0.06 + rng.next() * 0.06) : rgba(30, 32, 36, 0.05 + rng.next() * 0.06));
+      g.addColorStop(1, rgba(0, 0, 0, 0));
+      ctx.fillStyle = g;
+      ctx.fillRect(x - r, y - r, r * 2, r * 2);
+    }
+    // Kerb-stone band: v 0..0.02 -> the bottom 2% of rows. Lighter grey stone, dark chamfer line along its top,
+    // a joint every metre.
+    const kb = Math.round(S * 0.02);
+    ctx.fillStyle = '#b9b7b1';
+    ctx.fillRect(0, S - kb, S, kb);
+    ctx.fillStyle = rgba(0, 0, 0, 0.35);
+    ctx.fillRect(0, S - kb, S, 1);
+    ctx.fillStyle = rgba(255, 255, 255, 0.18);
+    ctx.fillRect(0, S - kb + 1, S, 1);
+    ctx.fillStyle = rgba(0, 0, 0, 0.3);
+    for (let x = 0; x < S; x += PM) ctx.fillRect(x, S - kb, 1, kb);
     return this.finish(key, canvas, true);
   }
 
@@ -752,8 +1000,9 @@ export class TextureFactory {
     const rng = new Random(41);
     ctx.fillStyle = '#dcc48e';
     ctx.fillRect(0, 0, S, S);
-    this.noise(ctx, S, S, rng, 3000, 2, 0.1, false);
-    this.noise(ctx, S, S, rng, 3000, 2, 0.18, true);
+    this.mottle(ctx, S, S, rng, 30, 16, 60, 0.06, 1500, 0.04, true);
+    this.noise(ctx, S, S, rng, 750, 6, 0.06, false);
+    this.noise(ctx, S, S, rng, 750, 6, 0.08, true);
     ctx.strokeStyle = rgba(160, 130, 80, 0.18);
     ctx.lineWidth = 2;
     for (let i = 0; i < 8; i++) {
@@ -783,7 +1032,7 @@ export class TextureFactory {
       ctx.quadraticCurveTo(x + len / 2, y + rng.range(-4, 4), x + len, y);
       ctx.stroke();
     }
-    this.noise(ctx, S, S, rng, 1200, 2, 0.12, true);
+    this.noise(ctx, S, S, rng, 300, 6, 0.08, true);
     return this.finish(key, canvas, true);
   }
 
@@ -958,8 +1207,7 @@ export class TextureFactory {
         ctx.fillRect(i * CELL, j * CELL, CELL, CELL);
       }
     }
-    this.noise(ctx, S, S, rng, 2600, 2, 0.13, false);
-    this.noise(ctx, S, S, rng, 1400, 2, 0.11, true);
+    this.mottle(ctx, S, S, rng, 24, 12, 40, 0.05, 1500, 0.03, true);
     // Joints: a dark line with a light lip on the far side, so the slabs read as laid rather than painted.
     for (let i = 0; i < 4; i++) {
       ctx.fillStyle = rgba(0, 0, 0, 0.28);
@@ -1028,7 +1276,7 @@ export class TextureFactory {
     return { texture, rects };
   }
 
-  /** Palm frond with alpha: a tapered leaf with feathered strips, tip toward +v. */
+  /** Palm frond with alpha: a tapered leaf with feathered leaflets, tip toward +v. Leaflets darken toward the rachis, some tips have dried. */
   palmFrond(): THREE.CanvasTexture {
     const key = 'frond';
     const c = this.cache.get(key) as THREE.CanvasTexture | undefined;
@@ -1046,22 +1294,36 @@ export class TextureFactory {
       const len = (1 - t * 0.8) * 54 + 8;
       const drop = 24 + t * 8;
       const wid = 9 - t * 3.5;
-      // Bright leaflets on purpose: around midday the sun is nearly overhead, so a near-vertical frond only gets sky
-      // fill and a dark green albedo would come out black.
-      const g = 156 + rng.int(0, 46);
-      ctx.fillStyle = rgba(74 + rng.int(0, 30), g, 72 + rng.int(0, 22), 1);
+      const j = rng.int(-8, 8);
       for (const dir of [-1, 1]) {
+        const dry = rng.chance(0.2);
         const ex = cx + dir * len, ey = y - drop;
+        // Rachis-to-tip gradient: shaded olive at the stem, lighter green at the tip; a fifth of the tips are dry.
+        const g = ctx.createLinearGradient(cx, y, ex, ey);
+        g.addColorStop(0, rgba(58 + j, 96 + j, 52, 1));
+        g.addColorStop(dry ? 0.55 : 1, rgba(110 + j, 150 + j, 70, 1));
+        if (dry) g.addColorStop(1, rgba(152, 118, 58, 1));
+        ctx.fillStyle = g;
         ctx.beginPath();
         ctx.moveTo(cx, y + wid * 0.5);
         ctx.quadraticCurveTo(cx + dir * len * 0.55, y - drop * 0.15, ex, ey);
         ctx.quadraticCurveTo(cx + dir * len * 0.5, y - drop * 0.5 + wid, cx, y - wid * 0.5);
         ctx.closePath();
         ctx.fill();
+        // 1 px vein down the middle of the leaflet.
+        ctx.strokeStyle = rgba(40, 70, 36, 0.55);
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(cx, y);
+        ctx.quadraticCurveTo(cx + dir * len * 0.52, y - drop * 0.32 + wid * 0.5, ex, ey);
+        ctx.stroke();
       }
     }
     // Rachis, tapering to the tip.
-    ctx.fillStyle = '#87a955';
+    const rg = ctx.createLinearGradient(0, H, 0, 0);
+    rg.addColorStop(0, '#6f8a44');
+    rg.addColorStop(1, '#93b05c');
+    ctx.fillStyle = rg;
     ctx.beginPath();
     ctx.moveTo(cx - 5, H);
     ctx.lineTo(cx + 5, H);
@@ -1073,14 +1335,72 @@ export class TextureFactory {
     return this.finish(key, canvas, true, false);
   }
 
+  /** Palm trunk bark (64 x 256, tiles both ways): fibrous brown with chevron leaf-scar bands, a light ridge over a dark shadow. */
+  palmBark(): THREE.CanvasTexture {
+    const key = 'bark';
+    const c = this.cache.get(key) as THREE.CanvasTexture | undefined;
+    if (c) return c;
+    const W = 64, H = 256;
+    const { canvas, ctx } = this.canvas(W, H);
+    const rng = new Random(83);
+    ctx.fillStyle = '#8a6a44';
+    ctx.fillRect(0, 0, W, H);
+    this.mottle(ctx, W, H, rng, 14, 8, 24, 0.08, 500, 0.05, true);
+    // Vertical fibres.
+    for (let i = 0; i < 40; i++) {
+      const v = rng.chance(0.5) ? 255 : 0;
+      ctx.fillStyle = rgba(v, v * 0.9, v * 0.75, rng.range(0.03, 0.08));
+      ctx.fillRect(rng.range(0, W), 0, rng.range(1, 2), H);
+    }
+    // Leaf scars: chevrons (so the band meets itself across the u seam), alternating direction per band.
+    const bandH = 16;
+    for (let k = 0; k < H / bandH; k++) {
+      const y0 = k * bandH + rng.range(-2, 2);
+      const rise = (k % 2 === 0 ? 1 : -1) * rng.range(3, 6);
+      const chevron = (y: number, h: number): void => {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(W / 2, y + rise);
+        ctx.lineTo(W, y);
+        ctx.lineTo(W, y + h);
+        ctx.lineTo(W / 2, y + rise + h);
+        ctx.lineTo(0, y + h);
+        ctx.closePath();
+        ctx.fill();
+      };
+      ctx.fillStyle = rgba(232, 204, 156, 0.32);
+      chevron(y0, 2);
+      ctx.fillStyle = rgba(40, 24, 12, 0.45);
+      chevron(y0 + 2, 4);
+      ctx.fillStyle = rgba(40, 24, 12, 0.18);
+      chevron(y0 + 6, 3);
+    }
+    return this.finish(key, canvas, true);
+  }
+
   /** Roughness for the asphalt: the painted markings are smoother than the aggregate around them. */
   roadRough(): THREE.CanvasTexture {
-    const key = 'road:rgh';
+    return this.groundRough('road', 0.62, 1);
+  }
+
+  /** Tangent-space relief derived from a ground albedo: slab joints, the kerb chamfer, lane-paint edges. */
+  groundNormal(name: 'sidewalk' | 'plaza' | 'road', strength: number): THREE.CanvasTexture {
+    const key = name + ':nrm';
     const hit = this.cache.get(key) as THREE.CanvasTexture | undefined;
     if (hit) return hit;
-    const src = this.road().image as HTMLCanvasElement | undefined;
+    const src = this[name]().image as HTMLCanvasElement | undefined;
     if (!src || !src.width) return this.finish(key, this.canvas(4, 4).canvas, false);
-    return this.roughFromLuminance(key, src, 0.62, 1);
+    return this.normalFromLuminance(key, src, strength);
+  }
+
+  /** Roughness derived from a ground albedo's luminance, remapped into lo..hi. */
+  groundRough(name: 'sidewalk' | 'plaza' | 'road', lo: number, hi: number): THREE.CanvasTexture {
+    const key = name + ':rgh';
+    const hit = this.cache.get(key) as THREE.CanvasTexture | undefined;
+    if (hit) return hit;
+    const src = this[name]().image as HTMLCanvasElement | undefined;
+    if (!src || !src.width) return this.finish(key, this.canvas(4, 4).canvas, false);
+    return this.roughFromLuminance(key, src, lo, hi);
   }
 
   /** Soft radial white glow (sprites, light pools, particles, neon bloom). */

@@ -27,6 +27,12 @@ test('DayNight: sun direction is a unit vector, high at noon, below the horizon 
   approx(Math.sqrt(d.x * d.x + d.y * d.y + d.z * d.z), 1, 1e-6, 'unit length');
   expect(d.y > 0.7, `sun high at 12:45 (y ${d.y})`);
   expect(dn.nightFactor() === 0, 'no night at noon');
+  // South lean: the noon sun sits at ~49 deg (not overhead) so facades and lamp posts throw readable shadows.
+  dn.setHour(12);
+  const noonDeg = (dn.sunElevation() * 180) / Math.PI;
+  expect(noonDeg > 40 && noonDeg < 55, `noon elevation between 40 and 55 deg (got ${noonDeg.toFixed(1)})`);
+  dn.sunDir(d);
+  expect(d.z > 0.4, `noon sun leans south (+Z) (z ${d.z})`);
   dn.setHour(6.75);
   dn.sunDir(d);
   expect(d.x > 0.9 && Math.abs(d.y) < 0.05, 'sun rises in the east (+X)');
@@ -110,9 +116,17 @@ test('BuildingGeometry: every landmark kind yields parts; the ferris wheel has a
   expect(total - glowParts <= 12 && glowParts <= 7, `landmark meshes ${total - glowParts} <= 12 plus ${glowParts} glow parts (<= 7)`);
 });
 
-test('SkySystem: SKY_KEYS ascend in hour and hit the sunset palette at 19:00', () => {
+test('SkySystem: SKY_KEYS ascend in hour, carry fill/ground/fogDensity and hit the sunset palette at 19:00', () => {
   for (let i = 1; i < SKY_KEYS.length; i++) expect(SKY_KEYS[i].hour > SKY_KEYS[i - 1].hour, 'keys ascend');
   const k = SKY_KEYS.find((s) => s.hour === 19);
   expect(k !== undefined && k.horizon === 0xff7a3d && k.top === 0x6a2c8f, 'sunset horizon #ff7a3d / top #6a2c8f');
-  for (const s of SKY_KEYS) expect(s.fogNear < s.fogFar && s.fogFar <= 620, 'fog ranges sane');
+  expect(k !== undefined && k.fill === 0x554a8c && k.sun === 0xff8a48, 'sunset: orange key against a violet fill');
+  for (const s of SKY_KEYS) {
+    expect(s.fogDensity >= 0.001 && s.fogDensity <= 0.006, `fog density sane at ${s.hour} (${s.fogDensity})`);
+    expect(s.fill !== s.ground, `fill and ground differ at ${s.hour}`);
+  }
+  const noon = SKY_KEYS.find((s) => s.hour === 12);
+  const night = SKY_KEYS.find((s) => s.hour === 22);
+  expect(noon !== undefined && night !== undefined && noon.fogDensity < night.fogDensity, 'night fog denser than noon');
+  expect(noon !== undefined && noon.sunI > 0 && noon.ambI > 0 && noon.sunI * 1.3 > noon.ambI * 0.5 * 2, 'key stronger than fill at noon');
 });

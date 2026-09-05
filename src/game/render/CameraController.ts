@@ -14,14 +14,20 @@ import { LANDMARK_BLOCKS, PITCH, ROAD_W, BLOCK } from '../city/CityConfig';
 
 export type CameraMode = 'orbit' | 'chase' | 'cinematic';
 
+/**
+ * Cinematic framing: a longer lens (56 deg base), a lower eye that sits just above the roof line and looks slightly
+ * down at a raised target, so the horizon lands around 40 % of the frame and the car sits a little low in it.
+ */
 export const CAMERA_TUNING = {
-  orbitDist: 5.5, orbitHeight: 1.6, pitchMin: -0.35, pitchMax: 1.1, pitchDefault: 0.22, mouseSens: 0.0022, keyYawSpeed: 2.4,
-  chaseDists: [7.5, 11, 3.2], chaseHeight: 2.8, chaseLookAhead: 3, posLambda: 6, yawLambda: 4,
+  orbitDist: 6.2, orbitHeight: 1.45, pitchMin: -0.35, pitchMax: 1.1, pitchDefault: 0.13, mouseSens: 0.0022, keyYawSpeed: 2.4,
+  chaseDists: [9, 12.5, 4], chaseHeight: 2.15, chaseLookAhead: 3, posLambda: 6, yawLambda: 4,
   autoAlignDelay: 1.0, autoAlignRate: 2.5, reverseDelay: 0.5,
-  fovBase: 65, fovMax: 80, fovSpeedRef: 45, fovLambda: 4,
+  fovBase: 56, fovMax: 68, fovSpeedRef: 24, fovLambda: 4,
   shakeDecay: 1.6, shakeMaxPos: 0.45, shakeMaxRot: 0.03, occlusionPad: 0.4, occlusionMin: 0.12,
   cinematicRadius: 140, cinematicHeight: 55, cinematicRate: 0.06,
-  chaseTargetHeight: 1.0, minEyeY: 0.5, pullInLambda: 14, releaseLambda: 3,
+  chaseTargetHeight: 1.4, minEyeY: 0.5, pullInLambda: 14, releaseLambda: 3,
+  // Chase: the look target runs further ahead with speed, slides into the turn and the frame rolls a touch with it.
+  lookAheadPerMps: 0.3, lookAheadSpeedMax: 30, lateralMax: 0.8, lateralSpeedRef: 20, steerRoll: 0.03, riseWithLookAhead: 0.1,
 };
 
 const TOWER_X = ROAD_W + LANDMARK_BLOCKS.tower[0] * PITCH + BLOCK / 2;
@@ -150,6 +156,7 @@ export class CameraController implements CameraLike {
 
     let dist: number;
     let tx = target.x, ty: number, tz = target.z;
+    let steerRoll = 0, extraHeight = 0;
     // Pivot the eye orbits around (vehicle/player centre); the look target may be offset ahead of it.
     const px = target.x, pz = target.z;
     if (pv) {
@@ -172,10 +179,17 @@ export class CameraController implements CameraLike {
       this.baseYaw = dampAngle(this.baseYaw, heading, T.yawLambda, dt);
       this.yaw = wrapAngle(this.baseYaw + this.offsetYaw);
       dist = T.chaseDists[this.chaseIndex % T.chaseDists.length];
-      const ahead = this.reversing ? -T.chaseLookAhead : T.chaseLookAhead;
-      tx += Math.sin(target.yaw) * ahead;
-      tz += Math.cos(target.yaw) * ahead;
+      const absSpeed = Math.abs(pv.speed);
+      const lookAhead = T.chaseLookAhead + clamp(absSpeed, 0, T.lookAheadSpeedMax) * T.lookAheadPerMps;
+      const ahead = this.reversing ? -lookAhead : lookAhead;
+      // right(yaw) = (-cos yaw, sin yaw); the target slides into the turn so the road ahead stays in frame.
+      const lateral = pv.controls.steer * (Math.min(absSpeed, T.lateralSpeedRef) / T.lateralSpeedRef) * T.lateralMax;
+      tx += Math.sin(target.yaw) * ahead - Math.cos(target.yaw) * lateral;
+      tz += Math.cos(target.yaw) * ahead + Math.sin(target.yaw) * lateral;
       ty = target.y + T.chaseTargetHeight;
+      // The eye rises a little as the target runs ahead so the look-down angle (horizon ~40 % up) holds at speed.
+      extraHeight = (lookAhead - T.chaseLookAhead) * T.riseWithLookAhead;
+      steerRoll = -pv.controls.steer * clamp(absSpeed / T.fovSpeedRef, 0, 1) * T.steerRoll;
     } else {
       this.yaw = wrapAngle(this.yaw + dyaw);
       this.pitch += dpitch;
@@ -188,7 +202,7 @@ export class CameraController implements CameraLike {
     const cp = Math.cos(this.pitch), sp = Math.sin(this.pitch);
     let ex = px - fx * dist * cp;
     let ez = pz - fz * dist * cp;
-    let ey = pv ? ty + T.chaseHeight - T.chaseTargetHeight + dist * sp * 0.5 : ty + dist * sp;
+    let ey = pv ? ty + T.chaseHeight - T.chaseTargetHeight + extraHeight + dist * sp * 0.5 : ty + dist * sp;
     if (ey < T.minEyeY) ey = T.minEyeY;
 
     // Occlusion pull-in against buildings/landmarks between the target and the eye.
@@ -205,20 +219,20 @@ export class CameraController implements CameraLike {
     this.fov = damp(this.fov, lerp(T.fovBase, T.fovMax, speed01), T.fovLambda, dt);
     this.setFov(this.fov);
 
-    // Trauma shake (position jitter + roll)
-    let roll = 0;
+    // Trauma shake (position jitter + roll), combined with the steering roll.
+    let roll = steerRoll;
     if (this.trauma > 0) {
       this.shakeSeed += dt * 40;
       const a = this.trauma * this.trauma;
       ex += Math.sin(this.shakeSeed * 1.3) * a * T.shakeMaxPos;
       ey += Math.sin(this.shakeSeed * 1.7 + 1) * a * T.shakeMaxPos;
       ez += Math.cos(this.shakeSeed * 1.1 + 2) * a * T.shakeMaxPos;
-      roll = Math.sin(this.shakeSeed * 2.3 + 0.5) * a * T.shakeMaxRot;
+      roll += Math.sin(this.shakeSeed * 2.3 + 0.5) * a * T.shakeMaxRot;
       this.trauma = Math.max(0, this.trauma - T.shakeDecay * dt);
     }
     cam.position.set(ex, ey, ez);
     cam.lookAt(tx, ty, tz);
-    if (roll !== 0) cam.rotateZ(roll);
+    if (Math.abs(roll) > 1e-5) cam.rotateZ(roll);
     this.setForwardFrom(tx, tz);
   }
 

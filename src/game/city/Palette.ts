@@ -4,9 +4,11 @@ import type { Building, BuildingStyle, District } from './CityData';
 
 export const PASTELS: number[] = [0xf7c8d8, 0xbfe3f2, 0xfde9b8, 0xc9f0d4, 0xe6d3f5, 0xffd9c4, 0xd6f0f7, 0xf5e1ee];
 export const NEONS: number[] = [0xff2d95, 0x00e5ff, 0xff7a00, 0xb14bff, 0x39ff14, 0xfff03b, 0xff3b3b, 0x00ffb3];
-export const DOWNTOWN_COLORS: number[] = [0x3b4a5c, 0x5a6b80, 0x6f7f94, 0x2c3a4a, 0x8a96a8, 0x4d5d70, 0x9aa8b8, 0x2f4256];
-export const SUBURB_COLORS: number[] = [0xd9c8a8, 0xc7b79a, 0xe0d6c0, 0xb8a888, 0xd4c0a0, 0xcbbfa4, 0xe8dcc4, 0xa89878];
-export const SHIRTS: number[] = [0xff7a00, 0x00e5ff, 0xff2d95, 0xffffff, 0x2b2b2b, 0x39ff14, 0xfff03b, 0x3b6bff, 0xb14bff, 0xf7c8d8];
+// Downtown alternates warm stone and cool glass so the skyline reads as two materials, not one grey mass.
+export const DOWNTOWN_COLORS: number[] = [0x8c7f6c, 0x4c5a6e, 0xb59c86, 0x3e4a5e, 0xa6957f, 0x6b5648, 0x9aa4ae, 0x5c6b78];
+export const SUBURB_COLORS: number[] = [0xd9c8a8, 0xc7b79a, 0xe0d6c0, 0xb8a888, 0xd4c0a0, 0xcbbfa4, 0xe8dcc4, 0xa89878, 0xc98a6a, 0x9fa27a];
+// Neon-plate shirts pulled ~15% toward grey (same hues) so crowds stop looking like traffic cones.
+export const SHIRTS: number[] = [0xee7d15, 0x1bdef4, 0xe7358d, 0xffffff, 0x2b2b2b, 0x4ef62e, 0xfbef55, 0x426be9, 0xa750e9, 0xf2cad7];
 export const PANTS: number[] = [0x2b3a67, 0x1f1f1f, 0x5a4634, 0x3c3c50, 0x6b6b6b, 0x274060];
 export const SKINS: number[] = [0xf1c27d, 0xe0ac69, 0xc68642, 0x8d5524, 0xffdbac, 0xa5673f];
 export const SIGN_WORDS: string[] = ['TURUNCU', 'MAVİ', 'CLUB', 'OTEL', 'KAHVE', 'PLAJ', 'MALİBU', 'NEON', 'DİSKO', 'KEBAP', 'CASINO', 'BAR'];

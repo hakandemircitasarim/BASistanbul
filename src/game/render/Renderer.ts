@@ -1,4 +1,4 @@
-// Three.js WebGL renderer wrapper: scene, camera, resize observer, quality settings, fog, draw stats. Track P0.
+// Three.js WebGL renderer wrapper: scene, camera, resize observer, quality settings, post chain, draw stats. Track P0.
 import * as THREE from 'three';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
@@ -9,17 +9,25 @@ import { FXAAShader } from 'three/examples/jsm/shaders/FXAAShader.js';
 import type { Settings } from '../state/GameStore';
 
 export const SHADOW_MAP_SIZE = 2048;
-export const CAMERA_FOV = 65;
+/** Narrower than the old 65: a longer lens flattens the perspective and reads more cinematic than a wide-angle. */
+export const CAMERA_FOV = 56;
 export const CAMERA_NEAR = 0.3;
 export const CAMERA_FAR = 900;
 
-/** Bloom over the neon/emissive parts, then a filmic grade + vignette; MSAA replaces the old FXAA pass. */
-export const POSTFX = { bloomStrength: 0.9, bloomRadius: 0.6, bloomThreshold: 0.9, bloomThresholdDay: 1.25, dayScale: 0.35, vignette: 0.9, saturation: 1.12, contrast: 1.1, msaaSamples: 4,
-  // Split tone: cool shadows, warm highlights. A flat, ungraded frame is half of what makes a render look dated.
-  shadowTint: [0.86, 0.94, 1.1] as const, highlightTint: [1.05, 1.0, 0.93] as const, tintAmount: 0.16 } as const;
+/**
+ * Bloom over the HDR emissives (neon, lit windows, the sun disc) only, then a restrained grade + vignette; MSAA replaces
+ * the old FXAA pass. Thresholds are in linear HDR (bloom samples the scene before tone mapping): sunlit white paint sits
+ * around 1.5-2.5, so by day only the sun disc (>= 4) clears 3.0; at night the emissives (2.0-2.6) clear 1.4.
+ */
+export const POSTFX = { bloomStrength: 0.9, bloomRadius: 0.45, bloomThreshold: 1.4, bloomThresholdDay: 3.0, dayScale: 0.12, vignette: 0.9, saturation: 0.92, contrast: 1.0, msaaSamples: 4,
+  // Split tone: cool blue-violet shadows, warm highlights. Almost off by day (0.06); strongest around dusk (0.32).
+  shadowTint: [0.80, 0.86, 1.15] as const, highlightTint: [1.05, 1.0, 0.93] as const, tintDay: 0.06, tintDusk: 0.32,
+  grain: 0.03 } as const;
 
-
-/** Cheap grade: lifts saturation/contrast a touch and darkens the corners so the frame reads less flat. */
+/**
+ * Restrained grade: slightly desaturated primaries, desaturated highlights, a lifted toe (no crushed blacks), a split
+ * tone whose amount is driven per frame (dusk/night), an optional fine grain and a vignette.
+ */
 const GradeShader = {
   uniforms: {
     tDiffuse: { value: null as THREE.Texture | null },
@@ -28,7 +36,11 @@ const GradeShader = {
     uContrast: { value: POSTFX.contrast },
     uShadowTint: { value: new THREE.Vector3(...POSTFX.shadowTint) },
     uHighlightTint: { value: new THREE.Vector3(...POSTFX.highlightTint) },
-    uTint: { value: POSTFX.tintAmount },
+    uTint: { value: POSTFX.tintDay },
+    uNight: { value: 0 },
+    uGrain: { value: POSTFX.grain },
+    uTime: { value: 0 },
+    uResolution: { value: new THREE.Vector2(1280, 720) },
   },
   vertexShader: `
     varying vec2 vUv;
@@ -42,16 +54,30 @@ const GradeShader = {
     uniform vec3 uShadowTint;
     uniform vec3 uHighlightTint;
     uniform float uTint;
+    uniform float uNight;
+    uniform float uGrain;
+    uniform float uTime;
+    uniform vec2 uResolution;
     varying vec2 vUv;
+    float hash( vec2 p ) { return fract( sin( dot( p, vec2( 12.9898, 78.233 ) ) ) * 43758.5453 ); }
     void main() {
       vec4 c = texture2D( tDiffuse, vUv );
       vec3 col = c.rgb;
       float l = dot( col, vec3( 0.2126, 0.7152, 0.0722 ) );
       col = mix( vec3( l ), col, uSaturation );
+      // Highlights drift toward white instead of staying saturated (film-like roll-off).
+      col = mix( col, vec3( l ), smoothstep( 0.75, 1.0, l ) * 0.3 );
+      // Lifted toe: blacks never hit zero, which reads softer and less "video".
+      col = col * 0.97 + 0.025;
       col = ( col - 0.5 ) * uContrast + 0.5;
       float lum = clamp( dot( col, vec3( 0.2126, 0.7152, 0.0722 ) ), 0.0, 1.0 );
       vec3 tint = mix( uShadowTint, uHighlightTint, smoothstep( 0.15, 0.85, lum ) );
       col = mix( col, col * tint, uTint );
+      // Night pedestal: a faint milky lift so the dark frame keeps some air.
+      col = mix( col, col * 0.96 + 0.015, uNight );
+      // Fine grain, stronger in the darks, invisible in the lights.
+      float g = hash( vUv * uResolution + fract( uTime ) * 61.0 ) - 0.5;
+      col += g * uGrain * ( 1.0 - lum );
       vec2 d = vUv - 0.5;
       float v = smoothstep( 0.85, 0.28, dot( d, d ) * uVignette * 2.4 );
       col *= mix( 0.78, 1.0, v );
@@ -71,7 +97,6 @@ export class Renderer {
   readonly camera: THREE.PerspectiveCamera;
   readonly gl: THREE.WebGLRenderer;
   private readonly canvas: HTMLCanvasElement;
-  private readonly fog: THREE.Fog;
   private observer: ResizeObserver | null = null;
   private _drawCalls = 0;
   private _triangles = 0;
@@ -82,6 +107,7 @@ export class Renderer {
   private warmup = 0;
   private composer: EffectComposer | null = null;
   private bloom: UnrealBloomPass | null = null;
+  private grade: ShaderPass | null = null;
   private fxaa: ShaderPass | null = null;
   private postEnabled = false;
   /** Off for screenshots/benchmarks (?noadapt=1) so the buffer size stays predictable. */
@@ -93,13 +119,16 @@ export class Renderer {
     this.gl = new THREE.WebGLRenderer({ canvas, antialias: settings.quality === 'high', powerPreference: 'high-performance' });
     this.gl.outputColorSpace = THREE.SRGBColorSpace;
     this.gl.toneMapping = THREE.ACESFilmicToneMapping;
+    // Exposure stays at 1: overall brightness is owned by the sky/light intensities, not by the tone mapper.
     this.gl.toneMappingExposure = 1.0;
+    // Soft-filtered shadow map. In three r185 PCFShadowMap *is* the soft filter (hardware PCF x 5 rotated Vogel-disk
+    // taps; PCFSoftShadowMap is deprecated and falls back to it with a warning); the penumbra width is the light's
+    // shadow.radius in texels, set by SkySystem.
     this.gl.shadowMap.type = THREE.PCFShadowMap;
     // The composer issues several render() calls per frame; count them all instead of just the last pass.
     this.gl.info.autoReset = false;
     this.camera = new THREE.PerspectiveCamera(CAMERA_FOV, 1, CAMERA_NEAR, CAMERA_FAR);
-    this.fog = new THREE.Fog(0x000000, 160, 620);
-    this.scene.fog = this.fog;
+    // Fog belongs to SkySystem (its colour and range follow the sky keys); the renderer installs none.
     this.applySettings(settings);
     this.resize();
     if (typeof ResizeObserver !== 'undefined') {
@@ -128,7 +157,9 @@ export class Renderer {
       const r = this.gl.getPixelRatio();
       this.composer.setPixelRatio(r);
       this.composer.setSize(w, h);
-      if (this.fxaa) (this.fxaa.material.uniforms.resolution.value as THREE.Vector2).set(1 / (w * r), 1 / (h * r));
+      const pw = Math.max(1, Math.floor(w * r)), ph = Math.max(1, Math.floor(h * r));
+      if (this.fxaa) (this.fxaa.material.uniforms.resolution.value as THREE.Vector2).set(1 / pw, 1 / ph);
+      if (this.grade) (this.grade.material.uniforms.uResolution.value as THREE.Vector2).set(pw, ph);
     }
   }
 
@@ -146,19 +177,19 @@ export class Renderer {
     const size = new THREE.Vector2(1, 1);
     this.gl.getSize(size);
     const r = this.gl.getPixelRatio();
+    const pw = Math.max(1, Math.floor(size.x * r)), ph = Math.max(1, Math.floor(size.y * r));
     // The composer's own target has no multisampling by default, which is what made thin geometry - cornices, window
     // mullions, lamp posts, roof masts - crawl and break into dashes at distance. Ask for MSAA on it; FXAA then only
     // has to clean up what the resolve misses, so it can stay off while the hardware does the work.
-    const rt = new THREE.WebGLRenderTarget(Math.max(1, Math.floor(size.x * r)), Math.max(1, Math.floor(size.y * r)), {
-      type: THREE.HalfFloatType, samples: POSTFX.msaaSamples,
-    });
+    const rt = new THREE.WebGLRenderTarget(pw, ph, { type: THREE.HalfFloatType, samples: POSTFX.msaaSamples });
     rt.texture.name = 'EffectComposer.rt1';
     const composer = new EffectComposer(this.gl, rt);
     composer.addPass(new RenderPass(this.scene, this.camera));
     this.bloom = new UnrealBloomPass(size, POSTFX.bloomStrength, POSTFX.bloomRadius, POSTFX.bloomThreshold);
     composer.addPass(this.bloom);
     composer.addPass(new OutputPass());
-    composer.addPass(new ShaderPass(GradeShader));
+    this.grade = new ShaderPass(GradeShader);
+    composer.addPass(this.grade);
     if (POSTFX.msaaSamples <= 0) {
       this.fxaa = new ShaderPass(FXAAShader);
       composer.addPass(this.fxaa);
@@ -169,15 +200,26 @@ export class Renderer {
 
   /**
    * Daylight barely blooms (white facades would blow out); at night the neon, lit windows and headlights carry it.
-   * The threshold stays high so only genuinely bright pixels glow.
+   * Bloom samples the linear HDR frame before the OutputPass tone-maps it, so the thresholds are HDR values: by day it
+   * must clear sunlit white paint (~1.5-2.5 linear) and catch only the sun disc; at night it drops to the emissives.
    */
   setBloomForNight(nightFactor: number): void {
     if (!this.bloom) return;
     const k = POSTFX.dayScale + (1 - POSTFX.dayScale) * nightFactor;
     this.bloom.strength = POSTFX.bloomStrength * k;
-    // Sunlit white paint and render sit just under 1 after tone mapping; by day the threshold has to clear them or
-    // road markings glow like neon.
     this.bloom.threshold = POSTFX.bloomThresholdDay + (POSTFX.bloomThreshold - POSTFX.bloomThresholdDay) * nightFactor;
+  }
+
+  /**
+   * Time-of-day grade: the split tone is almost off by day and peaks at dusk (the sun just above/below the horizon);
+   * at night a small pedestal lifts the blacks. `time` feeds the grain so it does not freeze into a fixed pattern.
+   */
+  setGrade(nightFactor: number, duskFactor: number, time: number): void {
+    if (!this.grade) return;
+    const u = this.grade.material.uniforms;
+    u.uTint.value = POSTFX.tintDay + (POSTFX.tintDusk - POSTFX.tintDay) * duskFactor;
+    u.uNight.value = nightFactor;
+    u.uTime.value = time;
   }
 
   /** Pixel ratio and shadow toggling; antialias is fixed at construction. */
@@ -222,12 +264,6 @@ export class Renderer {
     if (this.scale !== before) this.applyPixelRatio();
   }
 
-  setFog(color: number, near: number, far: number): void {
-    this.fog.color.setHex(color);
-    this.fog.near = near;
-    this.fog.far = far;
-  }
-
   get drawCalls(): number { return this._drawCalls; }
   get triangles(): number { return this._triangles; }
 
@@ -236,6 +272,7 @@ export class Renderer {
     this.composer.dispose();
     this.composer = null;
     this.bloom = null;
+    this.grade = null;
     this.fxaa = null;
   }
 

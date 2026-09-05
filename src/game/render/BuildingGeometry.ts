@@ -17,8 +17,12 @@ const BASE_Y = -0.2;
  */
 const AO_HEIGHT = 6;
 const AO_FLOOR = 0.5;
-const ROOF_DARKEN = 0.62;
-const WALL_LIGHTEN = 0.35;
+const ROOF_DARKEN = 0.75;
+const WALL_LIGHTEN = 0.2;
+const FLOOR_H = 3.5;
+/** Downtown podium height under a chamfered shaft or an offset tower (three floors on the -0.2 base). */
+const PODIUM_H = 3 * FLOOR_H + 0.2;
+const OCT = Math.PI / 8;
 const tmpColor = new THREE.Color();
 
 /** Accumulates indexed quads/triangles with position, normal, uv and color attributes. Build-time only. */
@@ -129,13 +133,13 @@ export class GeoBuilder {
   }
 
   /** Four vertical faces of a street-level band: u repeats every `tileW` meters along the face, v spans 0..1 over the band height. */
-  bandBox(x0: number, y0: number, z0: number, x1: number, y1: number, z1: number, tileW: number, color: number): void {
+  bandBox(x0: number, y0: number, z0: number, x1: number, y1: number, z1: number, tileW: number, color: number, uOff = 0): void {
     const ux = (x1 - x0) / tileW, uz = (z1 - z0) / tileW;
     this.setColor(color);
-    this.quad(x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1, 0, 0, 1, 0, 0, ux, 0, ux, 1, 0, 1);
-    this.quad(x1, y0, z0, x0, y0, z0, x0, y1, z0, x1, y1, z0, 0, 0, -1, 0, 0, ux, 0, ux, 1, 0, 1);
-    this.quad(x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, 1, 0, 0, 0, 0, uz, 0, uz, 1, 0, 1);
-    this.quad(x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, -1, 0, 0, 0, 0, uz, 0, uz, 1, 0, 1);
+    this.quad(x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1, 0, 0, 1, uOff, 0, uOff + ux, 0, uOff + ux, 1, uOff, 1);
+    this.quad(x1, y0, z0, x0, y0, z0, x0, y1, z0, x1, y1, z0, 0, 0, -1, uOff + 0.25, 0, uOff + 0.25 + ux, 0, uOff + 0.25 + ux, 1, uOff + 0.25, 1);
+    this.quad(x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, 1, 0, 0, uOff + 0.5, 0, uOff + 0.5 + uz, 0, uOff + 0.5 + uz, 1, uOff + 0.5, 1);
+    this.quad(x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, -1, 0, 0, uOff + 0.75, 0, uOff + 0.75 + uz, 0, uOff + 0.75 + uz, 1, uOff + 0.75, 1);
   }
 
   /** Four-sided pyramid over the rectangle x0..x1 / z0..z1 from y0 to apexY. */
@@ -149,12 +153,12 @@ export class GeoBuilder {
   }
 
   /** Elliptical cylinder (rx along X, rz along Z); sides with meter UVs (windows) or plain, optional top cap. */
-  cylinder(cx: number, cz: number, rx: number, rz: number, y0: number, y1: number, segments: number, color: number, windows: boolean, top: number | null, glow: number = GLOW_U.none): void {
+  cylinder(cx: number, cz: number, rx: number, rz: number, y0: number, y1: number, segments: number, color: number, windows: boolean, top: number | null, glow: number = GLOW_U.none, phase = 0): void {
     const { b, u, v } = this.plainTarget(glow);
     const circ = Math.PI * (rx + rz);
     b.setColor(color);
     for (let i = 0; i < segments; i++) {
-      const a0 = (i / segments) * Math.PI * 2, a1 = ((i + 1) / segments) * Math.PI * 2;
+      const a0 = phase + (i / segments) * Math.PI * 2, a1 = phase + ((i + 1) / segments) * Math.PI * 2;
       const ax = cx + Math.cos(a0) * rx, az = cz + Math.sin(a0) * rz, bx = cx + Math.cos(a1) * rx, bz = cz + Math.sin(a1) * rz;
       const am = (a0 + a1) / 2;
       let nx = Math.cos(am) / rx, nz = Math.sin(am) / rz;
@@ -167,7 +171,7 @@ export class GeoBuilder {
     if (top !== null) {
       b.setColor(top);
       for (let i = 0; i < segments; i++) {
-        const a0 = (i / segments) * Math.PI * 2, a1 = ((i + 1) / segments) * Math.PI * 2;
+        const a0 = phase + (i / segments) * Math.PI * 2, a1 = phase + ((i + 1) / segments) * Math.PI * 2;
         b.tri(cx, y1, cz, cx + Math.cos(a0) * rx, y1, cz + Math.sin(a0) * rz, cx + Math.cos(a1) * rx, y1, cz + Math.sin(a1) * rz, u, v);
       }
     }
@@ -236,14 +240,93 @@ function lighten(color: number, k: number): number {
   return tmpColor.getHex();
 }
 
-/** Appends the building to a builder (box / stepped tiers / box + spire) at world coordinates. */
+/**
+ * Massing of one building, decided from its id so the render is deterministic and the same plan feeds the base
+ * geometry (appendBuilding) and the dressing (appendBuildingDetail). Downtown towers cycle four silhouettes; low
+ * buildings vary their roofline; stepped roofs alternate concentric tiers and a one-sided setback.
+ */
+export interface Massing {
+  kind: 'box' | 'tiers' | 'setback' | 'octagon' | 'podium' | 'twin';
+  /** Topmost box tier (roof clutter, parapet band and crown live here); the octagon's top rect is its bounding box. */
+  tx0: number; tz0: number; tx1: number; tz1: number; top: number;
+  /** Height up to which the full-footprint walls stand: facade dressing (ledges, fins, sign panels) must stay below. */
+  wallTop: number;
+  /** Height of the intermediate roof (setback terrace / podium top), 0 when there is none. */
+  stepY: number;
+  /** Low-building roofline variant: 0 plain, 1 raised street-side wing, 2 penthouse box. */
+  roofVariant: number;
+}
+const massingOut: Massing = { kind: 'box', tx0: 0, tz0: 0, tx1: 0, tz1: 0, top: 0, wallTop: 0, stepY: 0, roofVariant: 0 };
+
+/** Fills `massingOut` for the building (shared scratch: copy the fields you need before calling it again). */
+export function massingOf(b: Building): Massing {
+  const m = massingOut;
+  const x0 = b.x - b.w / 2, x1 = b.x + b.w / 2, z0 = b.z - b.d / 2, z1 = b.z + b.d / 2;
+  m.tx0 = x0; m.tz0 = z0; m.tx1 = x1; m.tz1 = z1; m.top = b.h; m.wallTop = b.h; m.stepY = 0; m.roofVariant = 0;
+  const tower = b.district === 'downtown' && b.h > 40 && b.roofKind === 'flat';
+  if (b.roofKind === 'stepped' && b.h > 9) {
+    if (b.id % 2 === 1) {
+      m.kind = 'setback';
+      let yS = Math.round((0.75 * b.h) / FLOOR_H) * FLOOR_H + 0.2;
+      if (yS > b.h - 3.4) yS -= FLOOR_H;
+      m.stepY = yS; m.wallTop = yS;
+      const back = Math.max(3, (b.facing === 0 || b.facing === 2 ? b.d : b.w) * 0.28);
+      if (b.facing === 0) m.tz1 = z1 - back; else if (b.facing === 2) m.tz0 = z0 + back; else if (b.facing === 1) m.tx1 = x1 - back; else m.tx0 = x0 + back;
+    } else {
+      m.kind = 'tiers';
+      const tiers = b.h > 40 ? 3 : 2;
+      const inset = Math.min(b.w, b.d) * 0.14 * (tiers - 1);
+      m.tx0 = x0 + inset; m.tx1 = x1 - inset; m.tz0 = z0 + inset; m.tz1 = z1 - inset;
+    }
+    return m;
+  }
+  if (tower) {
+    const tv = b.id % 4;
+    if (tv === 1) { m.kind = 'octagon'; m.stepY = PODIUM_H; m.wallTop = PODIUM_H; return m; }
+    if (tv === 2) {
+      m.kind = 'podium'; m.stepY = PODIUM_H; m.wallTop = PODIUM_H;
+      const alongX = b.facing === 0 || b.facing === 2;
+      const along = alongX ? b.w : b.d;
+      const tw = Math.max(8, Math.round((along * 0.65) / 4) * 4);
+      const left = (b.id >> 2) % 2 === 0;
+      if (alongX) { if (left) m.tx1 = x0 + tw; else m.tx0 = x1 - tw; } else if (left) m.tz1 = z0 + tw; else m.tz0 = z1 - tw;
+      return m;
+    }
+    if (tv === 3) {
+      // Twin street-side setbacks stacked above the box: two extra tiers, each pulled back from the street.
+      m.kind = 'twin'; m.top = b.h + 2 * FLOOR_H * 2; m.stepY = b.h;
+      twinRect(b, 2, m);
+      return m;
+    }
+    m.kind = 'box';
+    return m;
+  }
+  m.kind = 'box';
+  if (b.roofKind === 'flat') {
+    const v = (b.id * 7) % 5;
+    m.roofVariant = v < 2 ? 1 : v === 2 ? 2 : 0;
+  }
+  return m;
+}
+
+/** Rect of twin-setback tier `n` (1 or 2) written into m.tx0..tz1: recessed from the street and both sides. */
+function twinRect(b: Building, n: number, m: Massing): void {
+  const x0 = b.x - b.w / 2, x1 = b.x + b.w / 2, z0 = b.z - b.d / 2, z1 = b.z + b.d / 2;
+  const back = (b.facing === 0 || b.facing === 2 ? b.d : b.w) * 0.22 * n;
+  const side = (b.facing === 0 || b.facing === 2 ? b.w : b.d) * 0.09 * n;
+  if (b.facing === 0 || b.facing === 2) { m.tx0 = x0 + side; m.tx1 = x1 - side; m.tz0 = z0; m.tz1 = z1; if (b.facing === 0) m.tz1 = z1 - back; else m.tz0 = z0 + back; }
+  else { m.tz0 = z0 + side; m.tz1 = z1 - side; m.tx0 = x0; m.tx1 = x1; if (b.facing === 1) m.tx1 = x1 - back; else m.tx0 = x0 + back; }
+}
+
+/** Appends the building to a builder (box / stepped tiers / one-sided setback / podium variants / box + spire) at world coordinates. */
 export function appendBuilding(gb: GeoBuilder, b: Building): void {
   const roof = darken(b.color, ROOF_DARKEN);
   const wall = lighten(b.color, WALL_LIGHTEN);
   // Per-building whole-window UV offsets so buildings sharing a style texture do not share the lit pattern.
   const uOff = ((b.id * 7) % 4) / 4, vOff = ((b.id * 13) % 8) / 8;
   const x0 = b.x - b.w / 2, x1 = b.x + b.w / 2, z0 = b.z - b.d / 2, z1 = b.z + b.d / 2;
-  if (b.roofKind === 'stepped' && b.h > 9) {
+  const m = massingOf(b);
+  if (m.kind === 'tiers') {
     const tiers = b.h > 40 ? 3 : 2;
     const fr = tiers === 3 ? [0.55, 0.3, 0.15] : [0.65, 0.35];
     let y = BASE_Y;
@@ -255,6 +338,20 @@ export function appendBuilding(gb: GeoBuilder, b: Building): void {
       y = y1;
       inset += Math.min(b.w, b.d) * 0.14;
     }
+  } else if (m.kind === 'setback') {
+    gb.boxWindows(x0, BASE_Y, z0, x1, m.stepY, z1, wall, roof, uOff, vOff);
+    gb.boxWindows(m.tx0, m.stepY, m.tz0, m.tx1, b.h, m.tz1, wall, roof, uOff, vOff);
+    if (b.style === 'artdeco') {
+      gb.boxPlain(x0 - 0.4, m.stepY - 0.5, z0 - 0.4, x1 + 0.4, m.stepY, z1 + 0.4, roof);
+      gb.boxPlain(m.tx0 - 0.4, b.h - 0.5, m.tz0 - 0.4, m.tx1 + 0.4, b.h, m.tz1 + 0.4, roof);
+    }
+  } else if (m.kind === 'octagon') {
+    gb.boxWindows(x0, BASE_Y, z0, x1, PODIUM_H, z1, wall, roof, uOff, vOff);
+    const rx = (b.w / 2 - 0.4) / Math.cos(OCT), rz = (b.d / 2 - 0.4) / Math.cos(OCT);
+    gb.cylinder(b.x, b.z, rx, rz, PODIUM_H, b.h, 8, wall, true, roof, GLOW_U.none, OCT);
+  } else if (m.kind === 'podium') {
+    gb.boxWindows(x0, BASE_Y, z0, x1, PODIUM_H, z1, wall, roof, uOff, vOff);
+    gb.boxWindows(m.tx0, PODIUM_H, m.tz0, m.tx1, b.h, m.tz1, wall, roof, uOff, vOff);
   } else {
     gb.boxWindows(x0, BASE_Y, z0, x1, b.h, z1, wall, roof, uOff, vOff);
     if (b.style === 'artdeco') gb.boxPlain(x0 - 0.4, b.h - 0.5, z0 - 0.4, x1 + 0.4, b.h, z1 + 0.4, roof);
@@ -446,66 +543,151 @@ export function appendStreetLevel(styleGb: GeoBuilder, bandGb: GeoBuilder, b: Bu
   }
 }
 
+/** Coping band around a roof edge: 0.3 m overhang, 0.6 m deep, a shade darker than the wall so the roofline reads as a solid edge. */
+function parapetBand(gb: GeoBuilder, x0: number, z0: number, x1: number, z1: number, top: number, wall: number): void {
+  gb.boxPlain(x0 - 0.3, top - 0.6, z0 - 0.3, x1 + 0.3, top - 0.02, z1 + 0.3, darken(wall, 0.85));
+}
+
+/** Low parapet walls standing on the coping (skipped on tiny roofs). */
+function parapetWalls(gb: GeoBuilder, x0: number, z0: number, x1: number, z1: number, top: number, ph: number, cap: number): void {
+  if (x1 - x0 <= 4 || z1 - z0 <= 4) return;
+  const t = 0.4;
+  gb.boxPlain(x0 - 0.25, top - 0.15, z0 - 0.25, x1 + 0.25, top + ph, z0 + t, cap);
+  gb.boxPlain(x0 - 0.25, top - 0.15, z1 - t, x1 + 0.25, top + ph, z1 + 0.25, cap);
+  gb.boxPlain(x0 - 0.25, top - 0.15, z0 + t, x0 + t, top + ph, z1 - t, cap);
+  gb.boxPlain(x1 - t, top - 0.15, z0 + t, x1 + 0.25, top + ph, z1 - t, cap);
+}
+
+/** Plant room / AC enclosure with a louvre screen (two dark slats around it). */
+function plantBox(gb: GeoBuilder, x0: number, y0: number, z0: number, x1: number, y1: number, z1: number, color: number): void {
+  gb.boxPlain(x0, y0, z0, x1, y1, z1, color);
+  const slat = darken(color, 0.55), o = 0.06;
+  const ya = y0 + (y1 - y0) * 0.35, yb = y0 + (y1 - y0) * 0.65;
+  gb.boxPlain(x0 - o, ya - 0.08, z0 - o, x1 + o, ya + 0.08, z1 + o, slat);
+  gb.boxPlain(x0 - o, yb - 0.08, z0 - o, x1 + o, yb + 0.08, z1 + o, slat);
+}
+
 /** Roof clutter, parapets, pilasters, ledges, crowns and blank-wall sign panels for one building (all plain-strip geometry). */
 export function appendBuildingDetail(gb: GeoBuilder, b: Building, rng: Random, signs: WallSign[]): void {
   const x0 = b.x - b.w / 2, x1 = b.x + b.w / 2, z0 = b.z - b.d / 2, z1 = b.z + b.d / 2;
   const roof = darken(b.color, ROOF_DARKEN);
+  const wall = lighten(b.color, WALL_LIGHTEN);
   const h = b.h;
   const downtown = b.district === 'downtown';
-  const stepped = b.roofKind === 'stepped' && h > 9;
-  const tiers = stepped ? (h > 40 ? 3 : 2) : 1;
-  const inset = stepped ? Math.min(b.w, b.d) * 0.14 * (tiers - 1) : 0;
-  const rx0 = x0 + inset, rx1 = x1 - inset, rz0 = z0 + inset, rz1 = z1 - inset;
-  const rw = rx1 - rx0, rd = rz1 - rz0;
+  const mm = massingOf(b);
+  const kind = mm.kind, wallTop = mm.wallTop, stepY = mm.stepY, roofVariant = mm.roofVariant;
+  let rx0 = mm.tx0, rx1 = mm.tx1, rz0 = mm.tz0, rz1 = mm.tz1;
+  const top = mm.top;
+  const uOff = ((b.id * 7) % 4) / 4, vOff = ((b.id * 13) % 8) / 8;
+  const alongX = b.facing === 0 || b.facing === 2;
+  const cap = lighten(b.color, 0.28);
+  const ph = downtown ? 1.05 : 0.8;
 
-  // --- Roof: parapet wall + clutter -------------------------------------------------------------
-  if (b.roofKind !== 'spire' && rw > 4 && rd > 4) {
-    const t = 0.4, ph = downtown ? 1.05 : 0.8, cap = lighten(b.color, 0.28);
-    gb.boxPlain(rx0 - 0.25, h - 0.15, rz0 - 0.25, rx1 + 0.25, h + ph, rz0 + t, cap);
-    gb.boxPlain(rx0 - 0.25, h - 0.15, rz1 - t, rx1 + 0.25, h + ph, rz1 + 0.25, cap);
-    gb.boxPlain(rx0 - 0.25, h - 0.15, rz0 + t, rx0 + t, h + ph, rz1 - t, cap);
-    gb.boxPlain(rx1 - t, h - 0.15, rz0 + t, rx1 + 0.25, h + ph, rz1 - t, cap);
+  // --- Massing extras stacked on the base box --------------------------------------------------
+  if (kind === 'twin') {
+    // Two more tiers, each pulled back from the street and the sides; the crown then sits on the top one.
+    const t1 = h + 2 * FLOOR_H;
+    parapetBand(gb, x0, z0, x1, z1, h, wall);
+    twinRect(b, 1, mm);
+    gb.boxWindows(mm.tx0, h, mm.tz0, mm.tx1, t1, mm.tz1, wall, roof, uOff, vOff);
+    parapetBand(gb, mm.tx0, mm.tz0, mm.tx1, mm.tz1, t1, wall);
+    twinRect(b, 2, mm);
+    gb.boxWindows(mm.tx0, t1, mm.tz0, mm.tx1, top, mm.tz1, wall, roof, uOff, vOff);
+    rx0 = mm.tx0; rx1 = mm.tx1; rz0 = mm.tz0; rz1 = mm.tz1;
+  } else if (kind === 'box' && roofVariant === 1 && b.w > 10 && b.d > 10 && b.roofKind === 'flat') {
+    // Raised street-side wing: 55% of the frontage x 45% of the depth climbs two more floors, so the plan reads as an L.
+    const wingH = h + 2 * FLOOR_H;
+    const along = alongX ? b.w : b.d, depth = alongX ? b.d : b.w;
+    const aw = Math.max(8, Math.round((along * 0.55) / 4) * 4), dw = Math.max(6, depth * 0.45);
+    const left = (b.id >> 1) % 2 === 0;
+    let wx0 = x0, wx1 = x1, wz0 = z0, wz1 = z1;
+    if (alongX) { if (left) wx1 = x0 + aw; else wx0 = x1 - aw; if (b.facing === 0) wz0 = z1 - dw; else wz1 = z0 + dw; }
+    else { if (left) wz1 = z0 + aw; else wz0 = z1 - aw; if (b.facing === 1) wx0 = x1 - dw; else wx1 = x0 + dw; }
+    parapetBand(gb, x0, z0, x1, z1, h, wall);
+    parapetWalls(gb, x0, z0, x1, z1, h, ph, cap);
+    gb.boxWindows(wx0, h, wz0, wx1, wingH, wz1, wall, roof, uOff, vOff);
+    parapetBand(gb, wx0, wz0, wx1, wz1, wingH, wall);
+    parapetWalls(gb, wx0, wz0, wx1, wz1, wingH, ph, cap);
+    // Clutter goes on the lower roof, away from the wing.
+    if (alongX) { if (b.facing === 0) rz1 = wz0; else rz0 = wz1; } else if (b.facing === 1) rx1 = wx0; else rx0 = wx1;
+  } else if (kind === 'box' && roofVariant === 2 && b.w > 12 && b.d > 12 && b.roofKind === 'flat') {
+    // Penthouse box on 35% of the footprint, pushed to the back of the roof.
+    const pw = Math.max(6, b.w * 0.6), pd = Math.max(5, b.d * 0.58);
+    let px0 = b.x - pw / 2, pz0 = b.z - pd / 2;
+    if (b.facing === 0) pz0 = z0 + 1.2; else if (b.facing === 2) pz0 = z1 - 1.2 - pd; else if (b.facing === 1) px0 = x0 + 1.2; else px0 = x1 - 1.2 - pw;
+    gb.boxWindows(px0, h, pz0, px0 + pw, h + FLOOR_H, pz0 + pd, wall, roof, uOff, vOff);
+    parapetBand(gb, px0, pz0, px0 + pw, pz0 + pd, h + FLOOR_H, wall);
+    parapetBand(gb, x0, z0, x1, z1, h, wall);
+    parapetWalls(gb, x0, z0, x1, z1, h, ph, cap);
+    if (b.facing === 0) rz0 = pz0 + pd; else if (b.facing === 2) rz1 = pz0; else if (b.facing === 1) rx0 = px0 + pw; else rx1 = px0;
+  } else if (kind === 'octagon') {
+    // Chamfered shaft: a coping ring on the podium edge and on the shaft top.
+    parapetBand(gb, x0, z0, x1, z1, PODIUM_H, wall);
+    const rx = (b.w / 2 - 0.4) / Math.cos(OCT), rz = (b.d / 2 - 0.4) / Math.cos(OCT);
+    gb.cylinder(b.x, b.z, rx + 0.3, rz + 0.3, h - 0.6, h - 0.02, 8, darken(wall, 0.85), false, darken(wall, 0.85), GLOW_U.none, OCT);
+    const k = 0.62;
+    rx0 = b.x - (b.w / 2) * k; rx1 = b.x + (b.w / 2) * k; rz0 = b.z - (b.d / 2) * k; rz1 = b.z + (b.d / 2) * k;
+  } else if (kind === 'podium') {
+    parapetBand(gb, x0, z0, x1, z1, PODIUM_H, wall);
+    parapetWalls(gb, x0, z0, x1, z1, PODIUM_H, ph, cap);
+    parapetBand(gb, rx0, rz0, rx1, rz1, h, wall);
+  } else if (kind === 'setback') {
+    parapetBand(gb, x0, z0, x1, z1, stepY, wall);
+    parapetBand(gb, rx0, rz0, rx1, rz1, h, wall);
+    parapetWalls(gb, rx0, rz0, rx1, rz1, h, ph, cap);
+  } else if (b.roofKind !== 'spire') {
+    parapetBand(gb, rx0, rz0, rx1, rz1, top, wall);
+    parapetWalls(gb, rx0, rz0, rx1, rz1, top, ph, cap);
   }
-  if (b.roofKind !== 'spire' && rw > 9 && rd > 9) {
+  const rw = rx1 - rx0, rd = rz1 - rz0;
+  const crown = top > 42 && b.roofKind !== 'spire';
+
+  // --- Roof clutter -----------------------------------------------------------------------------
+  if (b.roofKind !== 'spire' && rw > 9 && rd > 9 && !crown) {
     const n = rng.int(2, 4);
     for (let i = 0; i < n; i++) {
       const cx = rng.range(rx0 + 2.2, rx1 - 2.2), cz = rng.range(rz0 + 2.2, rz1 - 2.2);
-      const kind = rng.int(0, 3);
-      if (kind === 0) {
+      const kindR = rng.int(0, 3);
+      if (kindR === 0) {
         // Water tank on a short cradle.
-        gb.boxPlain(cx - 1.15, h, cz - 1.15, cx + 1.15, h + 0.65, cz + 1.15, 0x5f5a55);
-        gb.cylinder(cx, cz, 1.2, 1.2, h + 0.65, h + 3.1, 8, 0x8a6742, false, 0x6d5238);
-      } else if (kind === 1) {
+        gb.boxPlain(cx - 1.15, top, cz - 1.15, cx + 1.15, top + 0.65, cz + 1.15, 0x5f5a55);
+        gb.cylinder(cx, cz, 1.2, 1.2, top + 0.65, top + 3.1, 8, 0x8a6742, false, 0x6d5238);
+      } else if (kindR === 1) {
         const m = rng.int(1, 2);
         for (let k = 0; k < m; k++) {
           const ox = cx + k * 2.2;
           if (ox + 0.95 > rx1) break;
-          gb.boxPlain(ox - 0.95, h, cz - 0.65, ox + 0.95, h + 0.95, cz + 0.65, 0xacb2b8);
-          gb.boxPlain(ox - 0.7, h + 0.95, cz - 0.45, ox + 0.7, h + 1.05, cz + 0.45, 0x8b9198);
+          gb.boxPlain(ox - 0.95, top, cz - 0.65, ox + 0.95, top + 0.95, cz + 0.65, 0xacb2b8);
+          gb.boxPlain(ox - 0.7, top + 0.95, cz - 0.45, ox + 0.7, top + 1.05, cz + 0.45, 0x8b9198);
         }
-      } else if (kind === 2) {
+      } else if (kindR === 2) {
         // Roof access box with a door.
-        gb.boxPlain(cx - 1.5, h, cz - 1.25, cx + 1.5, h + 2.5, cz + 1.25, lighten(roof, 0.3));
-        gb.boxPlain(cx - 0.55, h, cz + 1.25, cx + 0.55, h + 1.8, cz + 1.4, 0x39332c);
+        gb.boxPlain(cx - 1.5, top, cz - 1.25, cx + 1.5, top + 2.5, cz + 1.25, lighten(roof, 0.3));
+        gb.boxPlain(cx - 0.55, top, cz + 1.25, cx + 0.55, top + 1.8, cz + 1.4, 0x39332c);
       } else {
-        gb.cylinder(cx, cz, 0.36, 0.36, h, h + 1.5, 6, 0x9aa0a6, false, 0x767c82);
-        gb.cylinder(cx + 1.3, cz + 0.9, 0.28, 0.28, h, h + 1.05, 6, 0x9aa0a6, false, 0x767c82);
+        gb.cylinder(cx, cz, 0.36, 0.36, top, top + 1.5, 6, 0x9aa0a6, false, 0x767c82);
+        gb.cylinder(cx + 1.3, cz + 0.9, 0.28, 0.28, top, top + 1.05, 6, 0x9aa0a6, false, 0x767c82);
       }
     }
   }
-  if (h > 26 && b.roofKind !== 'spire' && rng.chance(0.5)) {
-    const ax = b.x + rng.range(-rw * 0.22, rw * 0.22), az = b.z + rng.range(-rd * 0.22, rd * 0.22);
-    const top = h + rng.range(5, 13);
-    gb.bar(ax, h, az, ax, top, az, 0.34, 0xb0b4ba);
+  // Plant / AC enclosure on one roof in three.
+  if (b.roofKind !== 'spire' && rw > 8 && rd > 8 && !crown && rng.chance(1 / 3)) {
+    const cx = rng.range(rx0 + 2.5, rx1 - 2.5), cz = rng.range(rz0 + 2.2, rz1 - 2.2);
+    plantBox(gb, cx - 1.5, top, cz - 1.25, cx + 1.5, top + 2, cz + 1.25, 0x9a948c);
+  }
+  if (top > 26 && top <= 42 && b.roofKind !== 'spire' && rng.chance(0.5)) {
+    const ax = (rx0 + rx1) / 2 + rng.range(-rw * 0.22, rw * 0.22), az = (rz0 + rz1) / 2 + rng.range(-rd * 0.22, rd * 0.22);
+    const mastTop = top + rng.range(5, 13);
+    gb.bar(ax, top, az, ax, mastTop, az, 0.34, 0xb0b4ba);
     for (let k = 0; k < 3; k++) {
-      const y = h + (top - h) * (0.42 + k * 0.18);
+      const y = top + (mastTop - top) * (0.42 + k * 0.18);
       gb.bar(ax - 1.2, y, az, ax + 1.2, y, az, 0.2, 0xb0b4ba);
     }
-    gb.boxPlain(ax - 0.2, top, az - 0.2, ax + 0.2, top + 0.55, az + 0.2, 0xff2418, false, GLOW_U.red);
+    gb.boxPlain(ax - 0.2, mastTop, az - 0.2, ax + 0.2, mastTop + 0.55, az + 0.2, 0xff2418, false, GLOW_U.red);
   }
 
   // --- Facade dressing --------------------------------------------------------------------------
-  if (downtown && b.roofKind === 'flat' && h >= 26) {
+  if (downtown && kind === 'box' && b.roofKind === 'flat' && h >= 26) {
     // Vertical pilaster strips running the full shaft.
     const yb = BAND.plinthH + 0.3, yt = h - 1.4, t = 0.3, hw = 0.6, col = lighten(b.color, 0.5);
     if (yt > yb + 4) {
@@ -523,20 +705,34 @@ export function appendBuildingDetail(gb: GeoBuilder, b: Building, rng: Random, s
       }
     }
   }
-  if (h > 42) {
-    // Crown: a light cornice plus a night-glowing accent band.
-    // Deep enough to survive a few hundred metres of perspective, and only mildly lighter than the wall: a bright
-    // 0.8 m band around a dark shaft read as a floating wire once it fell under a pixel.
-    gb.boxPlain(x0 - 0.4, h - 4.8, z0 - 0.4, x1 + 0.4, h - 3.6, z1 + 0.4, lighten(b.color, 0.32));
-    gb.boxPlain(x0 - 0.55, h - 3.4, z0 - 0.55, x1 + 0.55, h - 2.95, z1 + 0.55, b.accent, false, glowCellFor(b.accent));
+  if (crown) {
+    // Crown: a 1.2 m overhanging slab under the roof edge, a deep accent band that glows at night, a mechanical
+    // penthouse with a louvre screen on the roof, and a spire on one tower in four.
+    const slab = lighten(b.color, 0.32), accent = darken(b.accent, 0.72), glow = glowCellFor(b.accent);
+    if (kind === 'octagon') {
+      const rx = (b.w / 2 - 0.4) / Math.cos(OCT), rz = (b.d / 2 - 0.4) / Math.cos(OCT);
+      gb.cylinder(b.x, b.z, rx + 1.2, rz + 1.2, top - 1.1, top - 0.02, 8, slab, false, slab, GLOW_U.none, OCT);
+      gb.cylinder(b.x, b.z, rx + 0.5, rz + 0.5, top - 3.6, top - 1.1, 8, accent, false, null, glow, OCT);
+    } else {
+      gb.boxPlain(rx0 - 1.2, top - 1.1, rz0 - 1.2, rx1 + 1.2, top - 0.02, rz1 + 1.2, slab);
+      gb.boxPlain(rx0 - 0.5, top - 3.6, rz0 - 0.5, rx1 + 0.5, top - 1.1, rz1 + 0.5, accent, false, glow);
+    }
+    const mw = rw * 0.4, md = rd * 0.4, mx = (rx0 + rx1) / 2, mz = (rz0 + rz1) / 2;
+    if (mw > 3 && md > 3) plantBox(gb, mx - mw / 2, top, mz - md / 2, mx + mw / 2, top + 4, mz + md / 2, darken(b.color, 0.7));
+    if (b.id % 4 === 2) {
+      const sh = Math.max(10, top * 0.14);
+      gb.bar(mx, top + 4, mz, mx, top + 4 + sh, mz, 0.7, 0xb0b4ba);
+      gb.bar(mx, top + 4 + sh, mz, mx, top + 4 + sh + 3, mz, 0.3, 0xd0d4da);
+      gb.boxPlain(mx - 0.25, top + 6.9 + sh, mz - 0.25, mx + 0.25, top + 7.5 + sh, mz + 0.25, 0xff2418, false, GLOW_U.red);
+    }
   }
   if (b.style === 'artdeco' && !downtown) {
     // Balcony ledges every couple of floors, with a rail on the street side.
     const led = lighten(b.color, 0.5);
     const dir = FACE_DIR[b.facing];
-    const front = (b.facing === 0 || b.facing === 2 ? b.d : b.w) / 2;
+    const front = (alongX ? b.d : b.w) / 2;
     let band = 0;
-    for (let y = 7; y < h - 3.5; y += 6.5) {
+    for (let y = 7; y < wallTop - 3.5; y += 6.5) {
       gb.boxPlain(x0 - 0.5, y, z0 - 0.5, x1 + 0.5, y + 0.34, z1 + 0.5, led);
       if (band < 3) {
         const o = front + 0.5, oi = front + 0.14;
@@ -546,30 +742,30 @@ export function appendBuildingDetail(gb: GeoBuilder, b: Building, rng: Random, s
       band++;
     }
   }
-  if (b.style === 'neon' && h > 12) {
+  if (b.style === 'neon' && wallTop > 12) {
     // Vertical neon fin down the street-facing corner.
     const dir = FACE_DIR[b.facing];
-    const off = (b.facing === 0 || b.facing === 2 ? b.d : b.w) / 2 + 0.2;
+    const off = (alongX ? b.d : b.w) / 2 + 0.2;
     const fx = b.x + dir[0] * off, fz = b.z + dir[1] * off;
     const ex = dir[0] !== 0 ? 0.45 : (b.w / 2) * 0.55;
     const ez = dir[1] !== 0 ? 0.45 : (b.d / 2) * 0.55;
-    gb.boxPlain(fx - Math.max(0.3, ex * 0.12), BAND.shopH + 1, fz - Math.max(0.3, ez * 0.12), fx + Math.max(0.3, ex * 0.12), h - 1, fz + Math.max(0.3, ez * 0.12), b.neonColor, false, glowCellFor(b.neonColor));
+    gb.boxPlain(fx - Math.max(0.3, ex * 0.12), BAND.shopH + 1, fz - Math.max(0.3, ez * 0.12), fx + Math.max(0.3, ex * 0.12), wallTop - 1, fz + Math.max(0.3, ez * 0.12), b.neonColor, false, glowCellFor(b.neonColor));
   }
   if (b.style === 'residential' || b.style === 'concrete') {
     // A string course splitting the facade, plus a chimney-ish vent block.
-    if (h > 13) gb.boxPlain(x0 - 0.35, h * 0.5, z0 - 0.35, x1 + 0.35, h * 0.5 + 0.3, z1 + 0.35, lighten(b.color, 0.45));
+    if (wallTop > 13) gb.boxPlain(x0 - 0.35, wallTop * 0.5, z0 - 0.35, x1 + 0.35, wallTop * 0.5 + 0.3, z1 + 0.35, lighten(b.color, 0.45));
   }
 
   // --- Blank side wall with a big painted sign ---------------------------------------------------
-  if (!b.hasNeonSign && h >= 16 && rng.chance(0.24)) {
+  if (!b.hasNeonSign && wallTop >= 16 && rng.chance(0.24)) {
     const face = ((b.facing + (rng.chance(0.5) ? 1 : 3)) % 4) as 0 | 1 | 2 | 3;
     const fw = face === 0 || face === 2 ? b.w : b.d;
     const w = Math.min(fw - 2.5, 15);
-    const sh = Math.min(w * 0.4, h - 11);
+    const sh = Math.min(w * 0.4, wallTop - 11);
     if (w >= 6 && sh >= 3) {
       const dir = FACE_DIR[face];
       const off = (face === 0 || face === 2 ? b.d : b.w) / 2;
-      const cy = rng.range(9 + sh / 2, h - 2.5 - sh / 2);
+      const cy = rng.range(9 + sh / 2, wallTop - 2.5 - sh / 2);
       const panel = darken(b.color, 0.45);
       if (dir[0] === 0) {
         const zf = b.z + dir[1] * off;

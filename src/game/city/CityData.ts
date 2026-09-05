@@ -14,5 +14,7 @@ export interface NamedPoint { x: number; z: number; yaw: number }
 export interface CityData {
   seed: number; buildings: Building[]; blocks: Block[]; props: Prop[]; landmarks: Landmark[]; parkedSpots: ParkedSpot[];
   staticColliders: StaticCollider[]; neonSigns: NeonSign[]; bounds: AABB;
+  /** Empty lot cells used as off-street parking (kerb ring, bays and wheel stops are drawn from these). */
+  lots?: Lot[];
   points: { playerSpawn: NamedPoint; hospital: NamedPoint; policeStation: NamedPoint; pier: NamedPoint; missionStarts: NamedPoint[]; garage: NamedPoint; beachDelivery: NamedPoint };
 }

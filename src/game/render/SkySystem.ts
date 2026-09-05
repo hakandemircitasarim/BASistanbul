@@ -1,29 +1,40 @@
-// Sky: gradient dome shader, sun/moon sprites, stars, sun/moon directional light with a following shadow box, hemisphere light, fog keys. Track B.
+// Sky: HDR gradient dome shader, sun/moon sprites, stars, sun/moon directional light with a following shadow box, hemisphere
+// fill/bounce light, exponential fog and a structured HDR reflection probe (sun blob, horizon line, skyline). Track B.
 import * as THREE from 'three';
 import type { Vec3 } from '../core/Types';
 import { clamp, lerp } from '../core/math';
 import type { TextureFactory } from './TextureFactory';
 
-export interface SkyKey { hour: number; top: number; horizon: number; sun: number; fog: number; sunI: number; ambI: number; fogNear: number; fogFar: number }
+/**
+ * One sky keyframe. `sun` is the key light colour, `fill` the hemisphere sky colour (authored as the complement of the
+ * sun: warm key / cool fill at every hour), `ground` the bounce colour under the hemisphere, `fog` the haze dye that
+ * gets blended toward the horizon in update(), `fogDensity` the FogExp2 density at high quality.
+ */
+export interface SkyKey { hour: number; top: number; horizon: number; sun: number; fill: number; ground: number; fog: number; sunI: number; ambI: number; fogDensity: number }
 
 /** Keyframes by hour (wrap at 24). Sunset 18:30-19:15 reads as Vice City: horizon #ff7a3d, top #6a2c8f. */
 export const SKY_KEYS: SkyKey[] = [
-  { hour: 0, top: 0x05061c, horizon: 0x141a3a, sun: 0x000000, fog: 0x0c1028, sunI: 0, ambI: 0.28, fogNear: 60, fogFar: 380 },
-  { hour: 4.5, top: 0x0a0c2a, horizon: 0x2a2148, sun: 0x000000, fog: 0x1a1634, sunI: 0, ambI: 0.3, fogNear: 60, fogFar: 380 },
-  { hour: 6, top: 0x3a3a7a, horizon: 0xff9a5a, sun: 0xffb070, fog: 0xd08a70, sunI: 0.45, ambI: 0.55, fogNear: 140, fogFar: 520 },
-  { hour: 7.5, top: 0x4f8ad8, horizon: 0xffd0a0, sun: 0xfff0d0, fog: 0xc8d0e0, sunI: 0.9, ambI: 0.85, fogNear: 160, fogFar: 620 },
-  { hour: 12, top: 0x3a86e6, horizon: 0xb8dcf8, sun: 0xffffff, fog: 0xbcd6f0, sunI: 1.15, ambI: 1.0, fogNear: 160, fogFar: 620 },
-  { hour: 16.5, top: 0x3f7fd0, horizon: 0xf0c8a0, sun: 0xfff0c8, fog: 0xd8c0b0, sunI: 1.0, ambI: 0.9, fogNear: 160, fogFar: 620 },
-  { hour: 18, top: 0x6a3f9a, horizon: 0xff8a48, sun: 0xffc060, fog: 0xe07a58, sunI: 0.8, ambI: 0.7, fogNear: 140, fogFar: 520 },
-  { hour: 19, top: 0x6a2c8f, horizon: 0xff7a3d, sun: 0xff8040, fog: 0xc85a58, sunI: 0.5, ambI: 0.5, fogNear: 140, fogFar: 520 },
-  { hour: 20.5, top: 0x1c1440, horizon: 0x5a2a6a, sun: 0x000000, fog: 0x2a1c44, sunI: 0.05, ambI: 0.34, fogNear: 60, fogFar: 380 },
-  { hour: 22, top: 0x07081f, horizon: 0x1e1c44, sun: 0x000000, fog: 0x0e1030, sunI: 0, ambI: 0.28, fogNear: 60, fogFar: 380 },
+  { hour: 0, top: 0x05061c, horizon: 0x3a2a4e, sun: 0x000000, fill: 0x2c3a6e, ground: 0x3a2c22, fog: 0x1a1e44, sunI: 0, ambI: 0.5, fogDensity: 0.0036 },
+  { hour: 4.5, top: 0x0a0c2a, horizon: 0x3a2a54, sun: 0x000000, fill: 0x2c3a6e, ground: 0x3a2c22, fog: 0x22204a, sunI: 0, ambI: 0.5, fogDensity: 0.0036 },
+  { hour: 6, top: 0x3a3a7a, horizon: 0xff9a5a, sun: 0xffc890, fill: 0x6a70b8, ground: 0x4a3a30, fog: 0xd8b0a0, sunI: 0.45, ambI: 0.65, fogDensity: 0.0028 },
+  { hour: 7.5, top: 0x3f7fd8, horizon: 0xc0d8f0, sun: 0xfff0d0, fill: 0x88a8e0, ground: 0x8a7a68, fog: 0xb4cbe6, sunI: 0.9, ambI: 0.85, fogDensity: 0.002 },
+  { hour: 12, top: 0x2a63d4, horizon: 0xa9cdef, sun: 0xfff1dc, fill: 0x8fb4e8, ground: 0x9a8a78, fog: 0xb4cbe6, sunI: 1.15, ambI: 1.0, fogDensity: 0.0018 },
+  { hour: 16.5, top: 0x3670c8, horizon: 0xe8c8a8, sun: 0xffe2b0, fill: 0x7f98d0, ground: 0x8a7a68, fog: 0xe6d2c2, sunI: 1.0, ambI: 0.9, fogDensity: 0.002 },
+  { hour: 17.5, top: 0x3454a8, horizon: 0xf8b880, sun: 0xffd090, fill: 0x7480c0, ground: 0x7a6860, fog: 0xecc8b0, sunI: 1.05, ambI: 0.85, fogDensity: 0.0021 },
+  { hour: 18, top: 0x6a3f9a, horizon: 0xff8a48, sun: 0xffb070, fill: 0x70629e, ground: 0x6a5048, fog: 0xf0b898, sunI: 1.1, ambI: 0.9, fogDensity: 0.002 },
+  { hour: 19, top: 0x6a2c8f, horizon: 0xff7a3d, sun: 0xff8a48, fill: 0x554a8c, ground: 0x50403a, fog: 0xd7a08e, sunI: 0.8, ambI: 0.9, fogDensity: 0.0024 },
+  { hour: 20.5, top: 0x141238, horizon: 0x4a2c66, sun: 0x000000, fill: 0x34407a, ground: 0x3a2c22, fog: 0x2a2448, sunI: 0.05, ambI: 0.6, fogDensity: 0.0032 },
+  { hour: 22, top: 0x07081f, horizon: 0x3a2a4e, sun: 0x000000, fill: 0x2c3a6e, ground: 0x3a2c22, fog: 0x1a1e44, sunI: 0, ambI: 0.5, fogDensity: 0.0036 },
 ];
 
 export const SKY_TUNING = {
-  domeRadius: 850, sunDist: 700, sunScale: 130, moonScale: 55, starCount: 1400, shadowBox: 120, shadowMap: 2048, lightUnits: 3.0,
+  domeRadius: 850, sunDist: 700, sunScale: 34, moonScale: 55, starCount: 1400, shadowBox: 120, shadowMap: 2048, lightUnits: 3.0,
   // Clouds: uv scale of the flat-plane projection, density cut/softness, day and night coverage, drift per game hour.
-  cloudScale: 0.6, cloudCut: 0.16, cloudSoft: 0.5, cloudDay: 0.78, cloudNight: 0.4, cloudDrift: 0.018,
+  cloudScale: 0.6, cloudCut: 0.28, cloudSoft: 0.3, cloudDay: 0.45, cloudNight: 0.22, cloudDrift: 0.018,
+  // Dome radiance multiplier (linear HDR): a bright day sky that ACES rolls off, unity at night so the stars keep their size.
+  exposureDay: 1.8, exposureNight: 1.0,
+  // Reflection probe resolution (equirect) and refresh cadence in game hours.
+  probeW: 128, probeH: 64, probeRefreshHours: 0.3,
 } as const;
 
 const VERT = `
@@ -34,6 +45,11 @@ void main() {
   gl_Position = projectionMatrix * mv;
 }`;
 
+/**
+ * HDR dome. Output is linear radiance (the sun disc sits well above 4.0 so bloom catches it by day). On the direct-to-screen
+ * path (low quality, no composer) three defines TONE_MAPPING, so the trailing includes tone-map and encode the dome
+ * exactly like every lit material; in a render target they compile to no-ops and the composer receives linear HDR.
+ */
 const FRAG = `
 precision highp float;
 #define CLOUD_SCALE ${SKY_TUNING.cloudScale.toFixed(4)}
@@ -41,34 +57,54 @@ precision highp float;
 #define CLOUD_SOFT ${SKY_TUNING.cloudSoft.toFixed(3)}
 uniform vec3 uTop; uniform vec3 uHorizon; uniform vec3 uSunDir; uniform vec3 uSunColor; uniform float uStars; uniform sampler2D uStarTex;
 uniform sampler2D uCloudTex; uniform vec3 uCloudLit; uniform vec3 uCloudDark; uniform float uCloudAmt; uniform vec2 uCloudDrift;
+uniform float uExposure; uniform float uSunLow;
 varying vec3 vDir;
 void main() {
   vec3 d = normalize(vDir);
   float y = clamp(d.y, -1.0, 1.0);
-  float t = pow(max(y, 0.0), 0.55);
-  vec3 col = mix(uHorizon, uTop, t);
-  if (y < 0.0) col = mix(uHorizon, uHorizon * 0.35, clamp(-y * 3.0, 0.0, 1.0));
+  float yy = max(y, 0.0);
+  // The warm horizon key belongs to the sun's side of the sky; away from it the haze stays a cool, sky-tinted grey.
+  vec2 hd = normalize(vec2(d.x, d.z) + vec2(1e-4, 0.0));
+  vec2 sd = normalize(vec2(uSunDir.x, uSunDir.z) + vec2(1e-4, 0.0));
+  float sunSide = 0.4 + 0.6 * pow(0.5 + 0.5 * dot(hd, sd), 2.0);
+  vec3 hor = mix(mix(uHorizon, uTop, 0.4) * 1.1, uHorizon, sunSide);
+  // Three-stop gradient: bright horizon band, a mid tone at ~17 deg elevation, then a slow curve into the deep zenith.
+  // With a low sun the band narrows (mid pulled toward the top) so the sunset glow stays a rim, not a whole-sky wash.
+  vec3 mid = mix(mix(hor, uTop, 0.72), uTop, uSunLow * 0.3) * 0.8;
+  vec3 col = yy < 0.3 ? mix(hor, mid, pow(yy / 0.3, 0.7)) : mix(mid, uTop, pow((yy - 0.3) / 0.7, 0.45));
+  if (y < 0.0) col = mix(hor, hor * 0.35, clamp(-y * 3.0, 0.0, 1.0));
   float s = max(dot(d, uSunDir), 0.0);
-  col += uSunColor * (pow(s, 12.0) * 0.35 + pow(s, 200.0) * 0.8) * step(-0.08, uSunDir.y);
+  float sunUp = step(-0.08, uSunDir.y);
+  // Sun-side brightening of the haze, a corona that widens when the sun is low, and a small hard disc (>= 4 linear).
+  col += uHorizon * pow(s, 3.0) * 0.12 * sunUp;
+  vec3 sunTerm = uSunColor * (pow(s, 12.0) * mix(0.15, 0.6, uSunLow) + pow(s, 200.0) * 0.5 + smoothstep(0.9990, 0.9996, s) * 3.0) * sunUp;
   vec2 uv = vec2(atan(d.z, d.x) / 6.2831853 + 0.5, asin(y) / 3.14159265 + 0.5);
   vec3 stars = texture2D(uStarTex, uv).rgb;
   col += stars * uStars * clamp(y * 2.5, 0.0, 1.0);
+  // The exposure lift is a horizon effect (bright haze that the fog can match); the upper sky keeps its deep blue.
+  float ex = uExposure * mix(1.0, 0.6, smoothstep(0.0, 0.5, yy));
+  col = col * ex + sunTerm * uExposure;
   // Clouds: a tiling density field projected onto a flat plane above the camera, so the sheet stretches towards the
   // horizon like a real cloud deck instead of pinching at the zenith. Two octaves, the second drifting the other way.
   if (uCloudAmt > 0.001) {
     vec2 base = d.xz / max(y, 0.05) * CLOUD_SCALE;
     float a = texture2D(uCloudTex, base + uCloudDrift).r;
-    float b = texture2D(uCloudTex, base * 2.17 + vec2(0.37, 0.11) - uCloudDrift * 1.6).r;
+    float b = texture2D(uCloudTex, base * 3.7 + vec2(0.61, 0.29) - uCloudDrift * 1.6).r;
     float dens = smoothstep(CLOUD_CUT, CLOUD_CUT + CLOUD_SOFT, a * 0.85 + b * 0.55);
     // Fade into the horizon haze, and thin out overhead where the deck is seen edge-on the least.
     dens *= smoothstep(0.008, 0.13, y) * uCloudAmt;
     // Silver lining: the side facing the sun keeps the sun colour, the rest falls to the shaded underside tone.
     float lit = pow(max(dot(d, uSunDir), 0.0), 3.0);
     vec3 cloud = mix(uCloudDark, uCloudLit, clamp(lit * 0.85 + 0.25, 0.0, 1.0));
-    col = mix(col, cloud, dens);
+    col = mix(col, cloud * ex, dens);
   }
   gl_FragColor = vec4(col, 1.0);
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
 }`;
+
+/** Skyline silhouette rectangle in the reflection probe: azimuth centre / half width (rad), top and bottom in sin(elevation). */
+interface Silhouette { az: number; halfW: number; top: number; bottom: number }
 
 export class SkySystem {
   readonly sun: THREE.DirectionalLight;
@@ -81,25 +117,33 @@ export class SkySystem {
   private readonly moonSprite: THREE.Sprite;
   private readonly stars: THREE.Points;
   private readonly starMat: THREE.PointsMaterial;
-  private readonly fog: THREE.Fog;
+  /** Owned by the sky: colour and density follow the keys, scene.fog is assigned unconditionally. */
+  private readonly fog: THREE.FogExp2;
   private readonly cTop = new THREE.Color();
   private readonly cHor = new THREE.Color();
   private readonly cSun = new THREE.Color();
+  private readonly cFill = new THREE.Color();
+  private readonly cGround = new THREE.Color();
   private readonly cFog = new THREE.Color();
   private readonly cA = new THREE.Color();
   private readonly cB = new THREE.Color();
+  private readonly cC = new THREE.Color();
+  private readonly cD = new THREE.Color();
+  private readonly cE = new THREE.Color();
+  private readonly cF = new THREE.Color();
   private readonly white = new THREE.Color(0xffffff);
-  // Reflection probe: a tiny equirect gradient of the current sky, PMREM-filtered into scene.environment.
+  // Reflection probe: a small equirect HDR image of the current sky (gradient + sun blob + horizon + skyline),
+  // PMREM-filtered into scene.environment.
   private readonly targetScene: THREE.Scene;
   private gl: THREE.WebGLRenderer | null = null;
   private pmrem: THREE.PMREMGenerator | null = null;
-  private envCanvas: HTMLCanvasElement | null = null;
-  private envTex: THREE.CanvasTexture | null = null;
+  private envData: Float32Array | null = null;
+  private envTex: THREE.DataTexture | null = null;
   private envRT: THREE.WebGLRenderTarget | null = null;
   private lastEnvHour = -99;
-  private readonly moonColor = new THREE.Color(0x8fa0ff);
-  private readonly nightAmbient = new THREE.Color(0x4a5a8a);
-  private readonly sunLightColor = new THREE.Color();
+  private readonly silhouettes: Silhouette[] = [];
+  private readonly moonColor = new THREE.Color(0xb8c4e8);
+  private readonly nightAmbient = new THREE.Color(0x38405a);
   private readonly background = new THREE.Color();
   private readonly geometries: THREE.BufferGeometry[] = [];
   private readonly materials: THREE.Material[] = [];
@@ -113,12 +157,13 @@ export class SkySystem {
     const domeGeo = new THREE.SphereGeometry(SKY_TUNING.domeRadius, 32, 16);
     this.domeMat = new THREE.ShaderMaterial({
       uniforms: {
-        uTop: { value: new THREE.Color(0x2f7fe0) }, uHorizon: { value: new THREE.Color(0xb8dcf8) },
+        uTop: { value: new THREE.Color(0x2a63d4) }, uHorizon: { value: new THREE.Color(0xa9cdef) },
         uSunDir: { value: new THREE.Vector3(0, 1, 0) }, uSunColor: { value: new THREE.Color(0xffffff) },
         uStars: { value: 0 }, uStarTex: { value: tex.starField() },
         uCloudTex: { value: tex.clouds() }, uCloudLit: { value: new THREE.Color(0xffffff) },
         uCloudDark: { value: new THREE.Color(0x8fa4bc) }, uCloudAmt: { value: SKY_TUNING.cloudDay },
         uCloudDrift: { value: new THREE.Vector2() },
+        uExposure: { value: SKY_TUNING.exposureDay }, uSunLow: { value: 0 },
       },
       vertexShader: VERT, fragmentShader: FRAG, side: THREE.BackSide, depthWrite: false, fog: false,
     });
@@ -127,7 +172,7 @@ export class SkySystem {
     this.dome.renderOrder = -10;
     scene.add(this.dome);
     const glow = tex.radialGlow();
-    const sunMat = new THREE.SpriteMaterial({ map: glow, color: 0xffe0a0, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, fog: false, toneMapped: false });
+    const sunMat = new THREE.SpriteMaterial({ map: glow, color: 0xffe0a0, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, fog: false, toneMapped: true });
     this.sunSprite = new THREE.Sprite(sunMat);
     this.sunSprite.scale.set(SKY_TUNING.sunScale, SKY_TUNING.sunScale, 1);
     scene.add(this.sunSprite);
@@ -146,6 +191,10 @@ export class SkySystem {
       pos[i * 3 + 1] = Math.sin(e) * r;
       pos[i * 3 + 2] = Math.sin(a) * Math.cos(e) * r;
     }
+    // Skyline silhouettes for the probe: 12 seeded towers of varying width/height straddling the horizon.
+    for (let i = 0; i < 12; i++) {
+      this.silhouettes.push({ az: rnd() * Math.PI * 2, halfW: 0.06 + rnd() * 0.2, top: 0.02 + rnd() * 0.08, bottom: -0.03 });
+    }
     const starGeo = new THREE.BufferGeometry();
     starGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
     this.starMat = new THREE.PointsMaterial({ color: 0xffffff, size: 2.2, sizeAttenuation: false, transparent: true, opacity: 0, depthWrite: false, fog: false, toneMapped: false, blending: THREE.AdditiveBlending });
@@ -156,22 +205,23 @@ export class SkySystem {
     this.sun.shadow.mapSize.set(SKY_TUNING.shadowMap, SKY_TUNING.shadowMap);
     const half = SKY_TUNING.shadowBox / 2;
     const sc = this.sun.shadow.camera;
-    sc.left = -half; sc.right = half; sc.top = half; sc.bottom = -half; sc.near = 10; sc.far = 500;
-    this.sun.shadow.bias = -0.0008;
-    this.sun.shadow.normalBias = 0.6;
+    // The light sits 220 m from the box centre: a tight near/far keeps depth precision for contact-hugging shadows.
+    sc.left = -half; sc.right = half; sc.top = half; sc.bottom = -half; sc.near = 60; sc.far = 420;
+    this.sun.shadow.bias = -0.0003;
+    this.sun.shadow.normalBias = 0.05;
     scene.add(this.sun);
     scene.add(this.sun.target);
-    this.hemi = new THREE.HemisphereLight(0xbfd8ff, 0x3a2a30, 1);
+    this.hemi = new THREE.HemisphereLight(0x8fb4e8, 0x9a8a78, 1);
     scene.add(this.hemi);
-    if (scene.fog instanceof THREE.Fog) this.fog = scene.fog;
-    else { this.fog = new THREE.Fog(0xbcd6f0, 160, 620); scene.fog = this.fog; }
+    this.fog = new THREE.FogExp2(0xb4cbe6, 0.0018);
+    scene.fog = this.fog;
     scene.background = this.background;
     this.geometries.push(domeGeo, starGeo);
     this.materials.push(this.domeMat, sunMat, moonMat, this.starMat);
   }
 
   /** Interpolates SKY_KEYS at the given hour into the color scratch fields; returns interpolated scalars via the out object. */
-  private sample(hour: number, out: { sunI: number; ambI: number; fogNear: number; fogFar: number }): void {
+  private sample(hour: number, out: { sunI: number; ambI: number; fogDensity: number }): void {
     const keys = SKY_KEYS;
     const h = ((hour % 24) + 24) % 24;
     let i = keys.length - 1;
@@ -182,48 +232,94 @@ export class SkySystem {
     this.cTop.lerpColors(this.cA.setHex(a.top), this.cB.setHex(b.top), t);
     this.cHor.lerpColors(this.cA.setHex(a.horizon), this.cB.setHex(b.horizon), t);
     this.cSun.lerpColors(this.cA.setHex(a.sun), this.cB.setHex(b.sun), t);
+    this.cFill.lerpColors(this.cA.setHex(a.fill), this.cB.setHex(b.fill), t);
+    this.cGround.lerpColors(this.cA.setHex(a.ground), this.cB.setHex(b.ground), t);
     this.cFog.lerpColors(this.cA.setHex(a.fog), this.cB.setHex(b.fog), t);
     out.sunI = lerp(a.sunI, b.sunI, t);
     out.ambI = lerp(a.ambI, b.ambI, t);
-    out.fogNear = lerp(a.fogNear, b.fogNear, t);
-    out.fogFar = lerp(a.fogFar, b.fogFar, t);
+    out.fogDensity = lerp(a.fogDensity, b.fogDensity, t);
   }
 
-  private readonly scalars = { sunI: 0, ambI: 0, fogNear: 160, fogFar: 620 };
-  /** Multiplies the fog distances (Engine sets < 1 on low quality to hide the far city sooner). */
+  private readonly scalars = { sunI: 0, ambI: 0, fogDensity: 0.0018 };
+  /** Divides into the fog density (Engine sets < 1 on low quality: denser fog hides the far city sooner). */
   fogScale = 1;
 
   /** Enables the reflection probe (needs a WebGL renderer for PMREM filtering). */
   attachRenderer(gl: THREE.WebGLRenderer): void {
-    if (this.gl || typeof document === 'undefined') return;
+    if (this.gl) return;
     this.gl = gl;
     this.pmrem = new THREE.PMREMGenerator(gl);
     this.pmrem.compileEquirectangularShader();
-    const c = document.createElement('canvas');
-    c.width = 64; c.height = 32;
-    this.envCanvas = c;
-    this.envTex = new THREE.CanvasTexture(c);
-    this.envTex.mapping = THREE.EquirectangularReflectionMapping;
-    this.envTex.colorSpace = THREE.SRGBColorSpace;
+    const w = SKY_TUNING.probeW, h = SKY_TUNING.probeH;
+    this.envData = new Float32Array(w * h * 4);
+    const tex = new THREE.DataTexture(this.envData, w, h, THREE.RGBAFormat, THREE.FloatType);
+    tex.mapping = THREE.EquirectangularReflectionMapping;
+    tex.colorSpace = THREE.LinearSRGBColorSpace;
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.generateMipmaps = false;
+    this.envTex = tex;
     this.lastEnvHour = -99;
   }
 
   /**
-   * Repaints the sky gradient into the probe texture and refilters it. Cheap (64x32 source) and only runs when the
-   * sky has actually moved on, so car paint and glass keep reflecting the right sky through the day.
+   * Paints the probe (sky gradient x exposure, a Gaussian sun blob, a hard horizon over a dark ground half with a
+   * brighter band just above it, and the skyline silhouettes) and refilters it. Cheap (128x64 source) and only runs when
+   * the sky has moved on, so car paint and glass show a horizon crease and a sun glint that track the day.
    */
-  private refreshEnvironment(hour: number): void {
-    const c = this.envCanvas, tex = this.envTex, pm = this.pmrem;
-    if (!c || !tex || !pm) return;
-    const ctx = c.getContext('2d');
-    if (!ctx) return;
-    const g = ctx.createLinearGradient(0, 0, 0, c.height);
-    g.addColorStop(0, '#' + this.cTop.getHexString());
-    g.addColorStop(0.48, '#' + this.cHor.getHexString());
-    g.addColorStop(0.52, '#' + this.cFog.getHexString());
-    g.addColorStop(1, '#' + this.cFog.clone().multiplyScalar(0.45).getHexString());
-    ctx.fillStyle = g;
-    ctx.fillRect(0, 0, c.width, c.height);
+  private refreshEnvironment(sunDir: Vec3, exposure: number, sunLow: number): void {
+    const data = this.envData, tex = this.envTex, pm = this.pmrem;
+    if (!data || !tex || !pm) return;
+    const W = SKY_TUNING.probeW, H = SKY_TUNING.probeH;
+    const top = this.cTop, warmHor = this.cHor, sun = this.cSun;
+    const coolHor = this.cA.copy(warmHor).lerp(top, 0.4).multiplyScalar(1.1);
+    const ground = this.cB.copy(this.cFog).multiplyScalar(0.35);
+    const sil = this.cD.copy(this.cFog).multiplyScalar(0.16);
+    const px = this.cE, hor = this.cC, mid = this.cF;
+    const sunUp = sunDir.y > -0.08;
+    const sl = Math.hypot(sunDir.x, sunDir.z) || 1;
+    const sdx = sunDir.x / sl, sdz = sunDir.z / sl;
+    const sil0 = this.silhouettes;
+    const TWO_PI = Math.PI * 2;
+    for (let j = 0; j < H; j++) {
+      const v = (j + 0.5) / H;
+      const el = (v - 0.5) * Math.PI;
+      const y = Math.sin(el), ce = Math.cos(el);
+      for (let i = 0; i < W; i++) {
+        const u = (i + 0.5) / W;
+        const phi = (u - 0.5) * TWO_PI;
+        const x = Math.cos(phi) * ce, z = Math.sin(phi) * ce;
+        const ss = 0.5 + 0.5 * (Math.cos(phi) * sdx + Math.sin(phi) * sdz);
+        hor.lerpColors(coolHor, warmHor, 0.4 + 0.6 * ss * ss);
+        mid.lerpColors(hor, top, 0.72).lerp(top, sunLow * 0.3).multiplyScalar(0.8);
+        if (y >= 0) {
+          if (y < 0.035) px.copy(hor).multiplyScalar(1.12);
+          else if (y < 0.3) px.lerpColors(hor, mid, Math.pow(y / 0.3, 0.7));
+          else px.lerpColors(mid, top, Math.pow((y - 0.3) / 0.7, 0.45));
+        } else {
+          px.copy(ground);
+        }
+        for (let k = 0; k < sil0.length; k++) {
+          const s = sil0[k];
+          if (y > s.top || y < s.bottom) continue;
+          let da = phi - s.az;
+          da -= Math.round(da / TWO_PI) * TWO_PI;
+          if (Math.abs(da) < s.halfW) { px.copy(sil); break; }
+        }
+        const yy = Math.max(y, 0);
+        const sm = yy >= 0.5 ? 1 : (yy / 0.5) * (yy / 0.5) * (3 - 2 * (yy / 0.5));
+        const ex = exposure * (1 - 0.4 * sm);
+        px.multiplyScalar(ex);
+        if (sunUp && y > -0.02) {
+          const d = clamp(x * sunDir.x + y * sunDir.y + z * sunDir.z, -1, 1);
+          const ang = Math.acos(d);
+          const r = (6 * Math.exp(-(ang * ang) / (2 * 0.07 * 0.07)) + 0.35 * Math.exp(-(ang * ang) / (2 * 0.35 * 0.35))) * exposure;
+          px.r += sun.r * r; px.g += sun.g * r; px.b += sun.b * r;
+        }
+        const o = (j * W + i) * 4;
+        data[o] = px.r; data[o + 1] = px.g; data[o + 2] = px.b; data[o + 3] = 1;
+      }
+    }
     tex.needsUpdate = true;
     const rt = pm.fromEquirectangular(tex);
     if (this.envRT) this.envRT.dispose();
@@ -234,18 +330,22 @@ export class SkySystem {
   update(hour: number, sunDir: Vec3, nightFactor: number, playerX: number, playerZ: number, shadows: boolean): void {
     const s = this.scalars;
     this.sample(hour, s);
-    if (this.pmrem && Math.abs(hour - this.lastEnvHour) > 0.3) {
+    const exposure = lerp(SKY_TUNING.exposureDay, SKY_TUNING.exposureNight, nightFactor);
+    const sunLow = clamp(1 - sunDir.y * 3, 0, 1);
+    if (this.pmrem && Math.abs(hour - this.lastEnvHour) > SKY_TUNING.probeRefreshHours) {
       this.lastEnvHour = hour;
-      this.refreshEnvironment(hour);
+      this.refreshEnvironment(sunDir, exposure, sunLow);
     }
     const u = this.domeMat.uniforms;
     (u.uTop.value as THREE.Color).copy(this.cTop);
     (u.uHorizon.value as THREE.Color).copy(this.cHor);
     (u.uSunDir.value as THREE.Vector3).set(sunDir.x, sunDir.y, sunDir.z);
     (u.uSunColor.value as THREE.Color).copy(this.cSun);
+    u.uExposure.value = exposure;
+    u.uSunLow.value = sunLow;
     // Cloud tones ride the sky keys: pale near-white by day, orange-lined at sunset, near-black overcast at night.
-    (u.uCloudLit.value as THREE.Color).copy(this.cHor).lerp(this.white, 0.5 - nightFactor * 0.42);
-    (u.uCloudDark.value as THREE.Color).copy(this.cTop).lerp(this.cHor, 0.35).multiplyScalar(0.78);
+    (u.uCloudLit.value as THREE.Color).copy(this.cHor).lerp(this.white, 0.5 - nightFactor * 0.42).multiplyScalar(1 - nightFactor * 0.55);
+    (u.uCloudDark.value as THREE.Color).copy(this.cTop).lerp(this.cHor, 0.2).multiplyScalar(0.6 * (1 - nightFactor * 0.55));
     u.uCloudAmt.value = lerp(SKY_TUNING.cloudDay, SKY_TUNING.cloudNight, nightFactor);
     (u.uCloudDrift.value as THREE.Vector2).set(hour * SKY_TUNING.cloudDrift, hour * SKY_TUNING.cloudDrift * 0.4);
     const starK = nightFactor * nightFactor * nightFactor;
@@ -257,33 +357,39 @@ export class SkySystem {
     const D = SKY_TUNING.sunDist;
     this.sunSprite.position.set(cam.x + sunDir.x * D, cam.y + sunDir.y * D, cam.z + sunDir.z * D);
     this.sunSprite.visible = sunDir.y > -0.12;
-    (this.sunSprite.material as THREE.SpriteMaterial).color.copy(this.cSun).lerp(this.cHor, 0.3);
+    const sunMat = this.sunSprite.material as THREE.SpriteMaterial;
+    sunMat.color.copy(this.cSun).lerp(this.cHor, 0.3);
+    // The glow sprite is a low-sun effect: a high sun is carried by the dome's hard disc and bloom.
+    sunMat.opacity = 0.35 + 0.65 * clamp(1 - sunDir.y * 2.5, 0, 1);
     this.moonSprite.position.set(cam.x - sunDir.x * D, cam.y - sunDir.y * D, cam.z - sunDir.z * D);
     this.moonSprite.visible = -sunDir.y > -0.05;
     (this.moonSprite.material as THREE.SpriteMaterial).opacity = nightFactor;
-    // Fog + background follow the horizon/fog keys.
-    this.fog.color.copy(this.cFog);
-    this.fog.near = s.fogNear * this.fogScale;
-    this.fog.far = s.fogFar * this.fogScale;
-    this.background.copy(this.cHor);
-    // Lights (physical units: scale by lightUnits).
+    // Fog is derived from the sky rather than a raw dye: pulled toward the horizon tone, lifted toward white by day so
+    // the far city dissolves into haze instead of a coloured wall. Density follows the keys (denser on low quality).
+    this.fog.color.copy(this.cFog).lerp(this.cHor, 0.2).lerp(this.white, 0.2 * (1 - nightFactor));
+    this.fog.density = s.fogDensity / this.fogScale;
+    this.background.copy(this.cHor).multiplyScalar(exposure);
+    // Lights (physical units: scale by lightUnits). Key well above fill: ~4.5 vs ~1.5 at noon, so a sunlit white wall
+    // sits around 1.4 linear against ~0.35 in shadow before ACES.
     const L = SKY_TUNING.lightUnits;
     const moon = nightFactor > 0.9;
     const lx = moon ? -sunDir.x : sunDir.x, ly = moon ? -sunDir.y : sunDir.y, lz = moon ? -sunDir.z : sunDir.z;
-    const ey = Math.max(ly, 0.15);
+    // A low sun keeps at least ~16 deg of elevation so the ground still catches a warm key at dusk.
+    const ey = Math.max(ly, 0.28);
     if (moon) {
       this.sun.color.copy(this.moonColor);
-      this.sun.intensity = 0.15 * L;
+      this.sun.intensity = 0.5 * L;
     } else {
-      this.sunLightColor.copy(this.cSun);
-      this.sun.color.copy(this.sunLightColor);
-      this.sun.intensity = s.sunI * L * Math.max(0, 1 - nightFactor * 0.8);
+      this.sun.color.copy(this.cSun);
+      this.sun.intensity = s.sunI * L * 1.3 * Math.max(0, 1 - nightFactor * 0.8);
     }
-    this.hemi.color.copy(this.cTop).lerp(this.cHor, 0.4).lerp(this.nightAmbient, nightFactor * 0.85);
-    this.hemi.groundColor.setHex(moon ? 0x181a26 : 0x4a3a34);
-    // Sky fill carries every vertical surface around midday (the sun is nearly overhead then, so facades, tree trunks
-    // and lamp posts get almost no direct light); it is dialled back after dusk so the neon still reads.
-    this.hemi.intensity = s.ambI * L * (0.9 + 0.65 * (1 - nightFactor)) + nightFactor * 0.35;
+    // Hemisphere = authored sky fill / ground bounce complements of the key; at night the fill drifts toward a
+    // desaturated navy so the neon still reads against it.
+    this.hemi.color.copy(this.cFill).lerp(this.nightAmbient, nightFactor * 0.25);
+    this.hemi.groundColor.copy(this.cGround);
+    // ~1.5 at noon. The dusk/night fills are authored as dark violets and navies (hue, not brightness), so the gain rises
+    // with sunLow and a large night term lifts the floor to a readable navy (~0.01 linear) instead of black.
+    this.hemi.intensity = s.ambI * L * (0.35 + 0.15 * (1 - nightFactor)) * (1 + sunLow) + nightFactor * 3.2;
     // Shadow box follows the player, snapped to shadow-map texels to avoid swimming.
     const texel = SKY_TUNING.shadowBox / SKY_TUNING.shadowMap;
     const tx = Math.round(playerX / texel) * texel, tz = Math.round(playerZ / texel) * texel;
@@ -291,15 +397,19 @@ export class SkySystem {
     this.sun.position.set(tx + lx * dist, ey * dist, tz + lz * dist);
     this.sun.target.position.set(tx, 0, tz);
     this.sun.target.updateMatrixWorld();
-    const wantShadow = shadows && !moon && sunDir.y > 0.05;
+    // Sun shadows while the disc is up (the light elevation is clamped, so the just-set sun still throws long shadows
+    // that keep the sunlit floor orange and the shadowed floor violet), moon shadows at full night, a short gap between.
+    const wantShadow = shadows && (moon || sunDir.y > -0.06);
     if (this.sun.castShadow !== wantShadow) this.sun.castShadow = wantShadow;
   }
 
   dispose(): void {
     if (this.envRT) { this.envRT.dispose(); this.envRT = null; }
     if (this.envTex) { this.envTex.dispose(); this.envTex = null; }
+    this.envData = null;
     if (this.pmrem) { this.pmrem.dispose(); this.pmrem = null; }
     this.targetScene.environment = null;
+    if (this.scene.fog === this.fog) this.scene.fog = null;
     this.scene.remove(this.dome, this.sunSprite, this.moonSprite, this.stars, this.sun, this.sun.target, this.hemi);
     for (let i = 0; i < this.geometries.length; i++) this.geometries[i].dispose();
     for (let i = 0; i < this.materials.length; i++) this.materials[i].dispose();

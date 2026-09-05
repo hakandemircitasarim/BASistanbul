@@ -1,11 +1,12 @@
-// Instanced street props for CityRenderer: palms (trunk + fronds), lamps (pole + head + light pool), benches, hydrants. Track B.
+// Instanced street props for CityRenderer: palms (two seeded variants: trunk + fronds), lamps (pole + head + light pool + facade spill), benches, hydrants. Track B.
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import type { Prop } from '../city/CityData';
 import { CURB_H } from '../city/CityConfig';
+import { Random } from '../core/Random';
 import type { Materials } from './Materials';
 
-export const PROP_DIMS = { palmTrunkH: 6.4, palmFrondLen: 4.4, palmFrondW: 3.0, lampH: 6.5, lampArm: 1.4, poolRadius: 6 } as const;
+export const PROP_DIMS = { palmTrunkH: 6.4, palmFrondLen: 4.4, palmFrondW: 3.0, lampH: 6.5, lampArm: 1.4, poolRadius: 9 } as const;
 
 /** Street furniture colours; each part is baked into the vertex colours so one material covers all four kinds. */
 const FURN = {
@@ -90,25 +91,44 @@ function bollardGeometry(): THREE.BufferGeometry {
 const dummy = new THREE.Object3D();
 const mat = new THREE.Matrix4();
 
-function trunkGeometry(): THREE.BufferGeometry {
-  const parts: THREE.BufferGeometry[] = [];
-  const segH = PROP_DIMS.palmTrunkH / 3;
-  let x = 0, y = 0;
-  for (let i = 0; i < 3; i++) {
-    const r0 = 0.24 - i * 0.04, r1 = 0.2 - i * 0.04;
-    const g = new THREE.CylinderGeometry(r1, r0, segH, 7, 1);
-    const tilt = 0.06 + i * 0.05;
-    g.translate(0, segH / 2, 0);
-    g.rotateZ(-tilt);
-    g.translate(x, y, 0);
-    x += Math.sin(tilt) * segH;
-    y += Math.cos(tilt) * segH;
-    parts.push(g);
+/** Bakes an RGB tint into a part's vertex colours. */
+function tintRGB(g: THREE.BufferGeometry, r: number, gg: number, b: number): THREE.BufferGeometry {
+  const n = g.attributes.position.count;
+  const c = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) { c[i * 3] = r; c[i * 3 + 1] = gg; c[i * 3 + 2] = b; }
+  g.setAttribute('color', new THREE.BufferAttribute(c, 3));
+  return g;
+}
+
+/**
+ * Trunk: six ringed segments (each flares at its base so the joints read as leaf-scar rings) following an S-curve,
+ * with a crown bulb on top. The bark texture's v runs 0..1 over the whole trunk, so the material's repeat sets the
+ * ring density. Seeded so the two palm variants lean differently.
+ */
+function trunkGeometry(seed: number): THREE.BufferGeometry {
+  const rng = new Random(seed);
+  const N = 6, H = PROP_DIMS.palmTrunkH;
+  const lean = rng.range(0.05, 0.1), wob = rng.range(0.05, 0.08) * (rng.chance(0.5) ? 1 : -1);
+  // One cylinder, two height segments per ring: every other ring row bulges (leaf scars) and the whole column is
+  // bent along an S by displacing each ring in x. UV v already runs 0..1 over the height.
+  const g = new THREE.CylinderGeometry(0.15, 0.27, H, 6, N * 2);
+  g.translate(0, H / 2, 0);
+  const pos = g.attributes.position;
+  const bend = (t: number): number => lean * t * t * H * 0.9 + wob * Math.sin(t * Math.PI * 2) * 0.35;
+  for (let k = 0; k < pos.count; k++) {
+    const y = pos.getY(k), t = y / H;
+    const ring = Math.round(t * N * 2);
+    const bulge = ring % 2 === 1 && ring < N * 2 ? 1.12 : 1;
+    pos.setX(k, pos.getX(k) * bulge + bend(t));
+    pos.setZ(k, pos.getZ(k) * bulge);
   }
-  const merged = mergeGeometries(parts, false);
-  for (let i = 0; i < parts.length; i++) parts[i].dispose();
-  merged.userData.topX = x;
-  merged.userData.topY = y;
+  g.computeVertexNormals();
+  const bulb = new THREE.SphereGeometry(0.4, 6, 4);
+  bulb.scale(1, 0.8, 1);
+  bulb.translate(bend(1), H + 0.1, 0);
+  const merged = fuse([g, bulb]);
+  merged.userData.topX = bend(1);
+  merged.userData.topY = H;
   return merged;
 }
 
@@ -131,29 +151,52 @@ function withBackFaces(g: THREE.BufferGeometry): THREE.BufferGeometry {
   return merged;
 }
 
-function frondsGeometry(topX: number, topY: number): THREE.BufferGeometry {
+/**
+ * One frond: a 2 x 3 segment plane whose centre column is lifted (the midrib crease, so the leaf is a V and shades
+ * on both halves), drooping toward the tip. `pitch` is the angle from straight up: 0 = vertical, PI/2 = horizontal,
+ * beyond that the frond hangs.
+ */
+function frond(len: number, width: number, pitch: number, yaw: number, droop: number, crease: number, cols = 2, rows = 3): THREE.BufferGeometry {
+  const g = new THREE.PlaneGeometry(width, len, cols, rows);
+  g.translate(0, len / 2, 0);
+  const pos = g.attributes.position;
+  for (let k = 0; k < pos.count; k++) {
+    const y = pos.getY(k), t = y / len;
+    pos.setY(k, y - t * t * droop);
+    if (Math.abs(pos.getX(k)) < 1e-4) pos.setZ(k, crease * (0.4 + 0.6 * (1 - t)));
+  }
+  g.computeVertexNormals();
+  g.rotateX(-pitch);
+  g.rotateY(yaw);
+  return g;
+}
+
+/** Crown: 11 live fronds with seeded jitter plus a skirt of 4 short dead fronds hanging below them. */
+function frondsGeometry(topX: number, topY: number, seed: number): THREE.BufferGeometry {
+  const rng = new Random(seed);
   const parts: THREE.BufferGeometry[] = [];
   const L = PROP_DIMS.palmFrondLen, W = PROP_DIMS.palmFrondW;
-  for (let i = 0; i < 7; i++) {
-    const g = new THREE.PlaneGeometry(W, L, 1, 2);
-    // Plane spans y -L/2..L/2 with the tip at +v (top): move the base to the origin, droop, and spin around Y.
-    g.translate(0, L / 2, 0);
-    const pos = g.attributes.position;
-    for (let k = 0; k < pos.count; k++) {
-      const y = pos.getY(k);
-      const t = y / L;
-      pos.setY(k, y - t * t * 1.6);
-    }
-    g.rotateX(-Math.PI / 2 + 0.55 + (i % 2) * 0.25);
-    g.rotateY((i / 7) * Math.PI * 2);
+  const n = 11;
+  for (let i = 0; i < n; i++) {
+    const len = L * rng.range(0.8, 1.1);
+    const g = frond(len, W, rng.range(0.35, 0.95), (i / n) * Math.PI * 2 + rng.range(-0.25, 0.25), 1.6 * (len / L), 0.18);
     g.translate(topX, topY, 0);
+    const v = rng.range(0.82, 1);
+    tintRGB(g, v, v, v * 0.96);
     const both = withBackFaces(g);
     g.dispose();
     parts.push(both);
   }
-  const merged = mergeGeometries(parts, false);
-  for (let i = 0; i < parts.length; i++) parts[i].dispose();
-  return merged;
+  for (let i = 0; i < 4; i++) {
+    const len = L * rng.range(0.5, 0.7);
+    const g = frond(len, W * 0.7, rng.range(1.6, 1.9), (i / 4) * Math.PI * 2 + rng.range(-0.4, 0.4), 0.5, 0, 1, 2);
+    g.translate(topX, topY - 0.15, 0);
+    tintRGB(g, 0.5, 0.4, 0.26);
+    const both = withBackFaces(g);
+    g.dispose();
+    parts.push(both);
+  }
+  return fuse(parts);
 }
 
 function poleGeometry(): THREE.BufferGeometry {
@@ -193,7 +236,10 @@ function hydrantGeometry(): THREE.BufferGeometry {
 }
 
 /** Draw radius per prop kind: past this the prop is a couple of pixels, so it is left out of the instance buffer. */
-export const PROP_RANGE = { palm: 300, lamp: 240, bench: 170, hydrant: 140, bin: 130, sign: 175, shelter: 210, bollard: 120, repackMove: 15 } as const;
+export const PROP_RANGE = { palm: 200, lamp: 240, bench: 170, hydrant: 140, bin: 130, sign: 175, shelter: 210, bollard: 120, repackMove: 15 } as const;
+
+/** Seeds of the two palm variants; palms alternate between them by index. */
+const PALM_SEEDS = [1201, 2417] as const;
 
 interface PropGroup {
   /** Source placements: x, z, yaw, scale per prop (never mutated). */
@@ -204,12 +250,12 @@ interface PropGroup {
 }
 
 /**
- * Builds and adds the instanced prop meshes; 11 draw calls total.
+ * Builds and adds the instanced prop meshes; 14 draw calls total (two palm variants, four lamp parts).
  *
  * The city holds ~1300 lamps and ~500 palms — drawing them all costs ~125k triangles per frame even when
  * they are half a kilometre behind the camera. Instead the source placements are kept on the CPU and only the
  * ones inside PROP_RANGE are written into the instance buffers, repacked whenever the camera has moved
- * `repackMove` metres. Draw calls stay at 7; the triangle count drops by roughly 6x.
+ * `repackMove` metres. Draw calls stay fixed; the triangle count drops by roughly 6x.
  */
 export class PropRenderer {
   private readonly meshes: THREE.InstancedMesh[] = [];
@@ -221,21 +267,22 @@ export class PropRenderer {
   constructor(scene: THREE.Scene, props: Prop[], materials: Materials) {
     const counts: Record<Prop['kind'], number> = { palm: 0, lamp: 0, bench: 0, hydrant: 0, bin: 0, sign: 0, shelter: 0, bollard: 0 };
     for (let i = 0; i < props.length; i++) counts[props[i].kind]++;
-    const trunk = trunkGeometry();
-    const fronds = frondsGeometry(trunk.userData.topX as number, trunk.userData.topY as number);
     const pole = poleGeometry();
     const head = new THREE.BoxGeometry(0.5, 0.22, 0.9);
     head.translate(0, PROP_DIMS.lampH - 0.2, PROP_DIMS.lampArm - 0.3);
     const pool = new THREE.PlaneGeometry(PROP_DIMS.poolRadius * 2, PROP_DIMS.poolRadius * 2);
     pool.rotateX(-Math.PI / 2);
     pool.translate(0, 0.06, PROP_DIMS.lampArm - 0.3);
+    // Facade spill: a vertical glow behind the pole (the kerb side is -Z; the arm points +Z over the road).
+    const spill = new THREE.PlaneGeometry(2.5, 4.5);
+    spill.translate(0, 2.25, -0.9);
     const bench = benchGeometry();
     const hydrant = hydrantGeometry();
     const bin = binGeometry();
     const sign = signGeometry();
     const shelter = shelterGeometry();
     const bollard = bollardGeometry();
-    this.geometries.push(trunk, fronds, pole, head, pool, bench, hydrant, bin, sign, shelter, bollard);
+    this.geometries.push(pole, head, pool, spill, bench, hydrant, bin, sign, shelter, bollard);
     const mk = (g: THREE.BufferGeometry, m: THREE.Material, n: number, shadow: boolean): THREE.InstancedMesh => {
       const im = new THREE.InstancedMesh(g, m, Math.max(1, n));
       im.count = 0;
@@ -246,32 +293,43 @@ export class PropRenderer {
       scene.add(im);
       return im;
     };
-    const trunkM = mk(trunk, materials.palmTrunk, counts.palm, true);
-    const frondM = mk(fronds, materials.palmFrond, counts.palm, true);
+    const palmMeshes: THREE.InstancedMesh[][] = [];
+    for (let v = 0; v < PALM_SEEDS.length; v++) {
+      const trunk = trunkGeometry(PALM_SEEDS[v]);
+      const fronds = frondsGeometry(trunk.userData.topX as number, trunk.userData.topY as number, PALM_SEEDS[v] + 7);
+      this.geometries.push(trunk, fronds);
+      const n = Math.ceil(counts.palm / PALM_SEEDS.length);
+      palmMeshes.push([mk(trunk, materials.palmTrunk, n, true), mk(fronds, materials.palmFrond, n, true)]);
+    }
     const poleM = mk(pole, materials.lampPole, counts.lamp, true);
     const headM = mk(head, materials.lampHead(), counts.lamp, false);
     const poolM = mk(pool, materials.lightPool(), counts.lamp, false);
     poolM.renderOrder = 2;
+    const spillM = mk(spill, materials.lampSpill(), counts.lamp, false);
+    spillM.renderOrder = 2;
     const benchM = mk(bench, materials.bench, counts.bench, true);
     const hydrantM = mk(hydrant, materials.hydrant, counts.hydrant, false);
     const binM = mk(bin, materials.furniture, counts.bin, true);
     const signM = mk(sign, materials.furniture, counts.sign, true);
     const shelterM = mk(shelter, materials.furniture, counts.shelter, true);
     const bollardM = mk(bollard, materials.furniture, counts.bollard, false);
-    const group = (kind: Prop['kind'], n: number, range: number, meshes: THREE.InstancedMesh[]): PropGroup => {
+    // `parity`/`mod` split one kind over several groups (palm variants) by its index within the kind.
+    const group = (kind: Prop['kind'], n: number, range: number, meshes: THREE.InstancedMesh[], parity = 0, mod = 1): PropGroup => {
       const g: PropGroup = { data: new Float32Array(Math.max(1, n) * 4), count: 0, range2: range * range, meshes };
       this.groups.push(g);
+      let idx = 0;
       for (let i = 0; i < props.length; i++) {
         const p = props[i];
         if (p.kind !== kind) continue;
+        if (idx++ % mod !== parity) continue;
         const o = g.count * 4;
         g.data[o] = p.x; g.data[o + 1] = p.z; g.data[o + 2] = p.yaw; g.data[o + 3] = p.scale;
         g.count++;
       }
       return g;
     };
-    group('palm', counts.palm, PROP_RANGE.palm, [trunkM, frondM]);
-    group('lamp', counts.lamp, PROP_RANGE.lamp, [poleM, headM, poolM]);
+    for (let v = 0; v < PALM_SEEDS.length; v++) group('palm', Math.ceil(counts.palm / PALM_SEEDS.length), PROP_RANGE.palm, palmMeshes[v], v, PALM_SEEDS.length);
+    group('lamp', counts.lamp, PROP_RANGE.lamp, [poleM, headM, poolM, spillM]);
     group('bench', counts.bench, PROP_RANGE.bench, [benchM]);
     group('hydrant', counts.hydrant, PROP_RANGE.hydrant, [hydrantM]);
     group('bin', counts.bin, PROP_RANGE.bin, [binM]);
