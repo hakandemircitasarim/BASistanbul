@@ -9,6 +9,31 @@ import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { FXAAShader } from 'three/examples/jsm/shaders/FXAAShader.js';
 import type { Settings } from '../state/GameStore';
 
+/**
+ * GTAOPass whose normal/depth prepass also skips alpha-cut and transparent meshes (palm fronds, glazing, road-mark
+ * decals): the pass draws the scene with one override material that has no alpha test, so a cut-out frond would
+ * otherwise occlude as a solid black quad. Hidden objects take the occlusion of whatever is behind them, which reads fine.
+ */
+class FoliageAwareGTAOPass extends GTAOPass {
+  private hiddenObjects: THREE.Object3D[] = [];
+  _overrideVisibility(): void {
+    const cache = this.hiddenObjects;
+    this.scene.traverse((o) => {
+      if (!o.visible) return;
+      const anyObj = o as THREE.Object3D & { isPoints?: boolean; isLine?: boolean; isLine2?: boolean; material?: THREE.Material | THREE.Material[] };
+      let skip = !!(anyObj.isPoints || anyObj.isLine || anyObj.isLine2);
+      const m = anyObj.material;
+      if (!skip && m && !Array.isArray(m)) skip = m.transparent || m.alphaTest > 0 || m.alphaToCoverage;
+      if (skip) { o.visible = false; cache.push(o); }
+    });
+  }
+  _restoreVisibility(): void {
+    const cache = this.hiddenObjects;
+    for (let i = 0; i < cache.length; i++) cache[i].visible = true;
+    cache.length = 0;
+  }
+}
+
 export const SHADOW_MAP_SIZE = 2048;
 /** Narrower than the old 65: a longer lens flattens the perspective and reads more cinematic than a wide-angle. */
 export const CAMERA_FOV = 56;
@@ -197,7 +222,7 @@ export class Renderer {
     // under cars, inside window reveals. It renders its own normal/depth pass over the scene, so it is the one post
     // effect with a real geometry cost (+~35 draw calls, 2x triangles), so it is opt-in (Settings.ao). The pass must
     // be built at the drawing-buffer size and resized with the composer or its depth reads are meaningless.
-    const gtao = new GTAOPass(this.scene, this.camera, pw, ph);
+    const gtao = new FoliageAwareGTAOPass(this.scene, this.camera, pw, ph);
     gtao.output = GTAOPass.OUTPUT.Default;
     gtao.blendIntensity = POSTFX.aoIntensity;
     gtao.updateGtaoMaterial({ radius: POSTFX.aoRadius, distanceExponent: 1, thickness: POSTFX.aoThickness, scale: 1, samples: POSTFX.aoSamples, screenSpaceRadius: false });

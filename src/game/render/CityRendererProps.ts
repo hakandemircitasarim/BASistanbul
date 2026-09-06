@@ -1,18 +1,25 @@
-// Instanced street props for CityRenderer: palms (two seeded variants: trunk + fronds), lamps (pole + head + light pool + facade spill), benches, hydrants. Track B.
+// Instanced street props for CityRenderer: palms (two seeded variants: trunk + fronds), lamps (pole + head + glow), benches,
+// hydrants, bins, signs, shelters (frame + glazing), bollards. Track B.
+//
+// Everything is sculpted from lathes, swept tubes and rounded slabs rather than raw boxes: a gooseneck lamp arm, a
+// chamfered bollard, a slatted bench with cast-iron ends, a glazed shelter with a rounded roof, fronds that arch from
+// their base with a V midrib and a fibrous crown. Each part is still one InstancedMesh, so the draw-call count is fixed.
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
+import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
 import type { Prop } from '../city/CityData';
 import { CURB_H } from '../city/CityConfig';
 import { Random } from '../core/Random';
 import type { Materials } from './Materials';
+import { surface, tube, type Ring } from './PlayerRenderer';
 
-export const PROP_DIMS = { palmTrunkH: 6.4, palmFrondLen: 4.4, palmFrondW: 3.0, lampH: 6.5, lampArm: 1.4, poolRadius: 9 } as const;
+export const PROP_DIMS = { palmTrunkH: 6.4, palmFrondLen: 4.4, palmFrondW: 2.3, lampH: 6.5, lampArm: 1.4, poolRadius: 9 } as const;
 
-/** Street furniture colours; each part is baked into the vertex colours so one material covers all four kinds. */
+/** Street furniture colours; each part is baked into the vertex colours so one material covers every kind. */
 const FURN = {
-  binBody: 0x33513f, binLid: 0x1d3025, pole: 0x8b9298, blade: 0x1d6a49,
-  post: 0x3a4046, roof: 0x2f353b, panel: 0x8fb4cc, seat: 0x8a6a44,
-  bollard: 0x3c4147, bollardCap: 0xc3c8cd,
+  binBody: 0x33513f, binLid: 0x1d3025, binBand: 0x9aa4a8, pole: 0x8b9298, blade: 0x1d6a49,
+  post: 0x4a5058, roof: 0x2f353b, fascia: 0xb8702c, frame: 0x30353a, seat: 0x9a6a3c, iron: 0x2b2f33,
+  bollard: 0x3c4147, bollardCap: 0xc3c8cd, hydrant: 0xd8302a, hydrantDark: 0x8e1f1a,
 } as const;
 
 const scratchColor = new THREE.Color();
@@ -20,76 +27,8 @@ const scratchColor = new THREE.Color();
 /** Bakes one colour into a part's vertex colours, so merged multi-colour furniture needs a single material. */
 function paint(g: THREE.BufferGeometry, hex: number): THREE.BufferGeometry {
   scratchColor.setHex(hex);
-  const n = g.attributes.position.count;
-  const c = new Float32Array(n * 3);
-  for (let i = 0; i < n; i++) { c[i * 3] = scratchColor.r; c[i * 3 + 1] = scratchColor.g; c[i * 3 + 2] = scratchColor.b; }
-  g.setAttribute('color', new THREE.BufferAttribute(c, 3));
-  return g;
+  return tintRGB(g, scratchColor.r, scratchColor.g, scratchColor.b);
 }
-
-function fuse(parts: THREE.BufferGeometry[]): THREE.BufferGeometry {
-  const merged = mergeGeometries(parts, false);
-  for (let i = 0; i < parts.length; i++) parts[i].dispose();
-  return merged;
-}
-
-/** Litter bin: a slightly conical body with a heavier lid. */
-function binGeometry(): THREE.BufferGeometry {
-  const body = new THREE.CylinderGeometry(0.27, 0.22, 0.72, 10, 1);
-  body.translate(0, 0.36, 0);
-  const lid = new THREE.CylinderGeometry(0.3, 0.3, 0.07, 10, 1);
-  lid.translate(0, 0.755, 0);
-  return fuse([paint(body, FURN.binBody), paint(lid, FURN.binLid)]);
-}
-
-/** Street-name sign: a pole with two blades crossing near the top so both streets are labelled. */
-function signGeometry(): THREE.BufferGeometry {
-  const pole = new THREE.CylinderGeometry(0.045, 0.055, 2.5, 6, 1);
-  pole.translate(0, 1.25, 0);
-  const a = new THREE.BoxGeometry(0.95, 0.17, 0.035);
-  a.translate(0.36, 2.3, 0);
-  const b = new THREE.BoxGeometry(0.035, 0.17, 0.95);
-  b.translate(0, 2.08, 0.36);
-  return fuse([paint(pole, FURN.pole), paint(a, FURN.blade), paint(b, FURN.blade)]);
-}
-
-/** Bus shelter: four posts, a flat roof, a glazed back panel and a bench. Faces -Z (the road) at yaw 0. */
-function shelterGeometry(): THREE.BufferGeometry {
-  const parts: THREE.BufferGeometry[] = [];
-  for (let i = 0; i < 4; i++) {
-    const px = i < 2 ? -1.72 : 1.72, pz = i % 2 === 0 ? -0.62 : 0.62;
-    const post = new THREE.BoxGeometry(0.09, 2.4, 0.09);
-    post.translate(px, 1.2, pz);
-    parts.push(paint(post, FURN.post));
-  }
-  const roof = new THREE.BoxGeometry(3.75, 0.12, 1.55);
-  roof.translate(0, 2.46, 0);
-  parts.push(paint(roof, FURN.roof));
-  const back = new THREE.BoxGeometry(3.5, 1.6, 0.06);
-  back.translate(0, 1.24, 0.7);
-  parts.push(paint(back, FURN.panel));
-  const seat = new THREE.BoxGeometry(3.0, 0.08, 0.42);
-  seat.translate(0, 0.46, 0.44);
-  parts.push(paint(seat, FURN.seat));
-  for (let i = 0; i < 2; i++) {
-    const leg = new THREE.BoxGeometry(0.07, 0.46, 0.4);
-    leg.translate(i === 0 ? -1.25 : 1.25, 0.23, 0.44);
-    parts.push(paint(leg, FURN.post));
-  }
-  return fuse(parts);
-}
-
-/** Promenade bollard: a short post with a light cap. */
-function bollardGeometry(): THREE.BufferGeometry {
-  const post = new THREE.CylinderGeometry(0.09, 0.11, 0.82, 8, 1);
-  post.translate(0, 0.41, 0);
-  const cap = new THREE.SphereGeometry(0.095, 8, 5);
-  cap.translate(0, 0.84, 0);
-  return fuse([paint(post, FURN.bollard), paint(cap, FURN.bollardCap)]);
-}
-
-const dummy = new THREE.Object3D();
-const mat = new THREE.Matrix4();
 
 /** Bakes an RGB tint into a part's vertex colours. */
 function tintRGB(g: THREE.BufferGeometry, r: number, gg: number, b: number): THREE.BufferGeometry {
@@ -101,34 +40,222 @@ function tintRGB(g: THREE.BufferGeometry, r: number, gg: number, b: number): THR
 }
 
 /**
- * Trunk: six ringed segments (each flares at its base so the joints read as leaf-scar rings) following an S-curve,
- * with a crown bulb on top. The bark texture's v runs 0..1 over the whole trunk, so the material's repeat sets the
- * ring density. Seeded so the two palm variants lean differently.
+ * Strips a three.js primitive down to the attribute set the sculpting helpers emit (non-indexed position + normal),
+ * so boxes, rounded slabs and lathes can be merged into one geometry.
  */
-function trunkGeometry(seed: number): THREE.BufferGeometry {
+function bare(g: THREE.BufferGeometry): THREE.BufferGeometry {
+  const out = g.index ? g.toNonIndexed() : g;
+  if (out !== g) g.dispose();
+  out.deleteAttribute('uv');
+  return out;
+}
+
+function fuse(parts: THREE.BufferGeometry[]): THREE.BufferGeometry {
+  const merged = mergeGeometries(parts, false);
+  for (let i = 0; i < parts.length; i++) parts[i].dispose();
+  return merged;
+}
+
+const R = (y: number, r: number, x = 0, z = 0): Ring => ({ y, rx: r, rz: r, x, z });
+
+/** Painted lathe: rings bottom to top, `radial` sides. */
+function lathe(rings: Ring[], radial: number, hex: number, capTop = false, capBot = false): THREE.BufferGeometry {
+  return paint(tube(rings, radial, capTop, capBot), hex);
+}
+
+/** Painted box / rounded slab centred at (x, y, z). */
+function slab(w: number, h: number, d: number, x: number, y: number, z: number, hex: number, r = 0, segs = 1): THREE.BufferGeometry {
+  const g = bare(r > 0 ? new RoundedBoxGeometry(w, h, d, segs, r) : new THREE.BoxGeometry(w, h, d));
+  g.translate(x, y, z);
+  return paint(g, hex);
+}
+
+const sT = new THREE.Vector3(), sN = new THREE.Vector3(), sB = new THREE.Vector3();
+
+/**
+ * Tube swept along a polyline of stations (a gooseneck arm, a cast-iron scroll): each station gets a circle of
+ * `radial` points in the plane normal to the local tangent; `ref` is any vector not parallel to the path, used to
+ * orient the circles consistently. `radius(i)` lets the tube taper.
+ */
+function sweep(pts: THREE.Vector3[], radius: (i: number) => number, radial: number, ref: THREE.Vector3): THREE.BufferGeometry {
+  const n = pts.length;
+  // Flipped winding: N x B here is the mirror of the lathe's sin/cos layout, so the faces would point inward.
+  return surface(n, radial, true, true, (i, j, out) => {
+    const a = pts[Math.max(0, i - 1)], b = pts[Math.min(n - 1, i + 1)];
+    sT.subVectors(b, a).normalize();
+    sN.crossVectors(sT, ref).normalize();
+    sB.crossVectors(sT, sN);
+    const ang = (j / radial) * Math.PI * 2, r = radius(i);
+    out.copy(pts[i]).addScaledVector(sN, Math.sin(ang) * r).addScaledVector(sB, Math.cos(ang) * r);
+  });
+}
+
+/** Litter bin: a chamfered, slightly conical body with a steel band and a heavier domed lid. */
+function binGeometry(): THREE.BufferGeometry {
+  const body = lathe([R(0, 0.205), R(0.05, 0.235), R(0.62, 0.27), R(0.66, 0.285)], 12, FURN.binBody, false, true);
+  const band = lathe([R(0.66, 0.285), R(0.71, 0.295), R(0.73, 0.285)], 12, FURN.binBand);
+  const lid = lathe([R(0.73, 0.285), R(0.77, 0.31), R(0.82, 0.29), R(0.85, 0.2)], 12, FURN.binLid, true);
+  return fuse([body, band, lid]);
+}
+
+/** Street-name sign: a tapered pole on a small collar with two rounded blades crossing near the top. */
+function signGeometry(): THREE.BufferGeometry {
+  const pole = lathe([R(0, 0.07), R(0.08, 0.07), R(0.12, 0.05), R(2.5, 0.04)], 8, FURN.pole, true);
+  const a = slab(0.95, 0.17, 0.035, 0.36, 2.3, 0, FURN.blade, 0.015);
+  const b = slab(0.035, 0.17, 0.95, 0, 2.08, 0.36, FURN.blade, 0.015);
+  return fuse([pole, a, b]);
+}
+
+/**
+ * Bus shelter frame: four round posts, a rounded roof slab with a coloured fascia lip, thin rails framing the back
+ * and left glazing, and a slatted seat on round legs. The panes themselves are `shelterGlassGeometry` (transparent
+ * material, own instanced mesh). Faces -Z (the road) at yaw 0.
+ */
+function shelterGeometry(): THREE.BufferGeometry {
+  const parts: THREE.BufferGeometry[] = [];
+  for (let i = 0; i < 4; i++) {
+    const px = i < 2 ? -1.72 : 1.72, pz = i % 2 === 0 ? -0.62 : 0.62;
+    parts.push(lathe([R(0, 0.05, px, pz), R(0.06, 0.05, px, pz), R(0.09, 0.042, px, pz), R(2.48, 0.042, px, pz)], 8, FURN.post));
+  }
+  parts.push(slab(3.75, 0.1, 1.55, 0, 2.5, 0, FURN.roof, 0.05, 2));
+  // Fascia lip hanging 0.15 m below the roof edge, all four sides.
+  parts.push(slab(3.75, 0.15, 0.035, 0, 2.42, -0.775, FURN.fascia));
+  parts.push(slab(3.75, 0.15, 0.035, 0, 2.42, 0.775, FURN.fascia));
+  parts.push(slab(0.035, 0.15, 1.55, -1.875, 2.42, 0, FURN.fascia));
+  parts.push(slab(0.035, 0.15, 1.55, 1.875, 2.42, 0, FURN.fascia));
+  // Back glazing rails (top, bottom, centre mullion) and the left end rails.
+  parts.push(slab(3.5, 0.05, 0.05, 0, 0.42, 0.7, FURN.frame));
+  parts.push(slab(3.5, 0.05, 0.05, 0, 2.06, 0.7, FURN.frame));
+  parts.push(slab(0.04, 1.6, 0.04, 0, 1.24, 0.7, FURN.frame));
+  parts.push(slab(0.05, 0.05, 1.25, -1.72, 0.42, 0.04, FURN.frame));
+  parts.push(slab(0.05, 0.05, 1.25, -1.72, 2.2, 0.04, FURN.frame));
+  // Slatted seat: four slats with 2 cm gaps on two brackets and round legs.
+  for (let k = 0; k < 4; k++) parts.push(slab(3.0, 0.03, 0.09, 0, 0.47, 0.44 + (k - 1.5) * 0.11, FURN.seat));
+  for (let i = 0; i < 2; i++) {
+    const x = i === 0 ? -1.25 : 1.25;
+    parts.push(slab(0.06, 0.04, 0.44, x, 0.435, 0.44, FURN.iron));
+    parts.push(lathe([R(0, 0.03, x, 0.44), R(0.43, 0.03, x, 0.44)], 6, FURN.iron));
+  }
+  return fuse(parts);
+}
+
+/** Bus shelter glazing: the back pane and the left end pane (drawn with the transparent glass material). */
+function shelterGlassGeometry(): THREE.BufferGeometry {
+  const back = new THREE.BoxGeometry(3.44, 1.6, 0.012);
+  back.translate(0, 1.24, 0.7);
+  const end = new THREE.BoxGeometry(0.012, 1.74, 1.22);
+  end.translate(-1.72, 1.31, 0.04);
+  return fuse([back, end]);
+}
+
+/** Promenade bollard: a chamfered post with a domed light cap. */
+function bollardGeometry(): THREE.BufferGeometry {
+  const post = lathe([R(0, 0.115), R(0.07, 0.115), R(0.1, 0.095), R(0.74, 0.088), R(0.79, 0.078)], 12, FURN.bollard);
+  const cap = lathe([R(0.79, 0.078), R(0.85, 0.088), R(0.93, 0.05)], 12, FURN.bollardCap, true);
+  return fuse([post, cap]);
+}
+
+/** Fire hydrant: flanged base, tapered barrel, collar and dome, two capped side nozzles. */
+function hydrantGeometry(): THREE.BufferGeometry {
+  const body = lathe([R(0, 0.19), R(0.05, 0.19), R(0.08, 0.15), R(0.52, 0.14), R(0.55, 0.165), R(0.62, 0.165), R(0.64, 0.145), R(0.72, 0.11), R(0.79, 0.045)], 10, FURN.hydrant, true);
+  const parts = [body];
+  for (let s = -1; s <= 1; s += 2) {
+    const nz = lathe([R(0, 0.06), R(0.15, 0.06), R(0.17, 0.075), R(0.22, 0.075)], 6, FURN.hydrantDark, true);
+    nz.rotateZ(-s * Math.PI / 2);
+    nz.translate(s * 0.12, 0.42, 0);
+    parts.push(nz);
+  }
+  return fuse(parts);
+}
+
+/**
+ * Park bench: five seat slats with 2 cm gaps, a back of three slats that recline progressively (a curved back in
+ * profile), and cast-iron ends: a swept scroll bar from the front foot over the armrest to the back top, plus a back leg.
+ */
+function benchGeometry(): THREE.BufferGeometry {
+  const parts: THREE.BufferGeometry[] = [];
+  for (let k = 0; k < 5; k++) parts.push(slab(1.7, 0.035, 0.085, 0, 0.45, (k - 2) * 0.105, FURN.seat));
+  for (let k = 0; k < 3; k++) {
+    const y = 0.56 + k * 0.13, z = -0.24 - k * 0.035;
+    const s = slab(1.7, 0.1, 0.03, 0, 0, 0, FURN.seat);
+    s.rotateX(-(0.12 + k * 0.1));
+    s.translate(0, y, z);
+    parts.push(s);
+  }
+  for (let side = -1; side <= 1; side += 2) {
+    const x = side * 0.8;
+    const scroll = [
+      new THREE.Vector3(x, 0, 0.25), new THREE.Vector3(x, 0.24, 0.27), new THREE.Vector3(x, 0.47, 0.25),
+      new THREE.Vector3(x, 0.62, 0.12), new THREE.Vector3(x, 0.72, -0.1), new THREE.Vector3(x, 0.85, -0.26),
+    ];
+    parts.push(paint(sweep(scroll, (i) => (i === 5 ? 0.02 : 0.028), 6, new THREE.Vector3(1, 0, 0)), FURN.iron));
+    parts.push(lathe([R(0, 0.028, x, -0.2), R(0.44, 0.028, x, -0.2)], 6, FURN.iron));
+    parts.push(slab(0.05, 0.03, 0.5, x, 0.415, 0, FURN.iron));
+  }
+  return fuse(parts);
+}
+
+/**
+ * Lamp post: a 10-sided pole with a base collar, and a gooseneck arm swept along an arc that rises from the pole top
+ * and curves out over the road (+Z). The head sits at `PROP_DIMS.lampArm`.
+ */
+function poleGeometry(): THREE.BufferGeometry {
+  const H = PROP_DIMS.lampH;
+  const pole = tube([R(0, 0.16), R(0.32, 0.16), R(0.4, 0.105), R(H - 0.3, 0.07)], 10, false, false);
+  const arc = 0.8, top = H - 0.3, pts: THREE.Vector3[] = [];
+  for (let i = 0; i < 4; i++) {
+    const a = (i / 3) * 1.85; // 0..106 deg: up, over and slightly down
+    pts.push(new THREE.Vector3(0, top + arc * Math.sin(a), arc * (1 - Math.cos(a))));
+  }
+  const arm = sweep(pts, (i) => 0.07 - i * 0.01, 6, new THREE.Vector3(1, 0, 0));
+  return fuse([pole, arm]);
+}
+
+/** Cobra-style luminaire: an elongated 6-sided ovoid hanging from the arm tip, closed to a point top and bottom. */
+function headGeometry(): THREE.BufferGeometry {
+  const y = PROP_DIMS.lampH + 0.35, z = PROP_DIMS.lampArm - 0.32;
+  return tube([{ y: y - 0.14, rx: 0.02, rz: 0.03, z }, { y, rx: 0.24, rz: 0.42, z }, { y: y + 0.1, rx: 0.16, rz: 0.3, z }, { y: y + 0.14, rx: 0.02, rz: 0.03, z }], 6, false, false);
+}
+
+const dummy = new THREE.Object3D();
+const mat = new THREE.Matrix4();
+
+/**
+ * Trunk: a 7-sided column of ringed segments (every other row flares so the joints read as leaf-scar rings) bent
+ * along an S-curve, topped by a fibrous crown: three flared collars of leaf bases stacked like scales and a cone of
+ * unopened spears. The bark texture's v runs 0..1 over the trunk, so the material's repeat sets the ring density.
+ * Seeded so the two palm variants differ in lean and height.
+ */
+export function trunkGeometry(seed: number): THREE.BufferGeometry {
   const rng = new Random(seed);
-  const N = 6, H = PROP_DIMS.palmTrunkH;
-  const lean = rng.range(0.05, 0.1), wob = rng.range(0.05, 0.08) * (rng.chance(0.5) ? 1 : -1);
-  // One cylinder, two height segments per ring: every other ring row bulges (leaf scars) and the whole column is
-  // bent along an S by displacing each ring in x. UV v already runs 0..1 over the height.
-  const g = new THREE.CylinderGeometry(0.15, 0.27, H, 6, N * 2);
+  const rows = 7, H = PROP_DIMS.palmTrunkH * rng.range(0.86, 1.06);
+  const lean = rng.range(0.04, 0.13), wob = rng.range(0.05, 0.08) * (rng.chance(0.5) ? 1 : -1);
+  const g = new THREE.CylinderGeometry(0.15, 0.27, H, 7, rows, true);
   g.translate(0, H / 2, 0);
   const pos = g.attributes.position;
   const bend = (t: number): number => lean * t * t * H * 0.9 + wob * Math.sin(t * Math.PI * 2) * 0.35;
   for (let k = 0; k < pos.count; k++) {
     const y = pos.getY(k), t = y / H;
-    const ring = Math.round(t * N * 2);
-    const bulge = ring % 2 === 1 && ring < N * 2 ? 1.12 : 1;
+    const ring = Math.round(t * rows);
+    const bulge = ring % 2 === 1 && ring < rows ? 1.12 : 1;
     pos.setX(k, pos.getX(k) * bulge + bend(t));
     pos.setZ(k, pos.getZ(k) * bulge);
   }
   g.computeVertexNormals();
-  const bulb = new THREE.SphereGeometry(0.4, 6, 4);
-  bulb.scale(1, 0.8, 1);
-  bulb.translate(bend(1), H + 0.1, 0);
-  const merged = fuse([g, bulb]);
-  merged.userData.topX = bend(1);
-  merged.userData.topY = H;
+  const parts = [g];
+  const tx = bend(1);
+  for (let k = 0; k < 3; k++) {
+    const collar = new THREE.CylinderGeometry(0.44 - k * 0.07, 0.19, 0.32, 7, 1, true);
+    collar.rotateY(k * 0.3);
+    collar.translate(tx + (k === 1 ? 0.03 : -0.02), H - 0.14 + k * 0.2, k === 2 ? 0.03 : -0.02);
+    parts.push(collar);
+  }
+  const spear = new THREE.CylinderGeometry(0, 0.25, 0.5, 7, 1, true);
+  spear.translate(tx, H + 0.62, 0);
+  parts.push(spear);
+  const merged = fuse(parts);
+  merged.userData.topX = tx;
+  merged.userData.topY = H + 0.25;
   return merged;
 }
 
@@ -158,45 +285,96 @@ function withBackFaces(g: THREE.BufferGeometry, underside = 1): THREE.BufferGeom
 }
 
 /**
- * One frond: a 2 x 3 segment plane whose centre column is lifted (the midrib crease, so the leaf is a V and shades
- * on both halves), drooping toward the tip. `pitch` is the angle from straight up: 0 = vertical, PI/2 = horizontal,
- * beyond that the frond hangs.
+ * One frond: a strip of `rows` segments whose midrib is an arc of constant curvature - it leaves the crown at `pitch`
+ * (angle from straight up) and bends down by `bend` radians over its length, so the droop starts at the base instead
+ * of only at the tip. Two columns give the leaf a V cross-section (the edges hang `crease` metres below the midrib,
+ * plus `sag` more toward the tip); a single column is a flat strip for the dead skirt. The outline widens to `width`
+ * a third of the way out and closes to a point, so the last row is two triangles meeting at the tip. UV v runs along
+ * the length so the leaflet texture keeps its base-to-tip order.
  */
-function frond(len: number, width: number, pitch: number, yaw: number, droop: number, crease: number, cols = 2, rows = 3): THREE.BufferGeometry {
-  const g = new THREE.PlaneGeometry(width, len, cols, rows);
-  g.translate(0, len / 2, 0);
-  const pos = g.attributes.position;
-  for (let k = 0; k < pos.count; k++) {
-    const y = pos.getY(k), t = y / len;
-    pos.setY(k, y - t * t * droop);
-    if (Math.abs(pos.getX(k)) < 1e-4) pos.setZ(k, crease * (0.4 + 0.6 * (1 - t)));
+export function frondGeometry(len: number, width: number, pitch: number, yaw: number, bend: number, crease: number, sag: number, rows: number, cols: 1 | 2): THREE.BufferGeometry {
+  const nx = cols + 1, nv = rows * nx + 1;
+  const pos = new Float32Array(nv * 3), uv = new Float32Array(nv * 2);
+  const cy = Math.cos(yaw), sy = Math.sin(yaw);
+  const ds = len / rows;
+  let out = 0, up = 0, k = 0;
+  const put = (x: number, y: number, o: number, u: number, v: number): void => {
+    pos[k * 3] = x * cy + o * sy; pos[k * 3 + 1] = y; pos[k * 3 + 2] = -x * sy + o * cy;
+    uv[k * 2] = u; uv[k * 2 + 1] = v;
+    k++;
+  };
+  for (let i = 0; i <= rows; i++) {
+    const t = i / rows;
+    if (i > 0) { const pm = pitch + bend * (t - 0.5 / rows); out += ds * Math.sin(pm); up += ds * Math.cos(pm); }
+    if (i === rows) { put(0, up, out, 0.5, 1); break; }
+    const phi = pitch + bend * t;
+    const w = width * Math.pow(Math.sin(Math.PI * (0.12 + 0.88 * t)), 0.7);
+    for (let c = 0; c < nx; c++) {
+      const xs = cols === 2 ? c - 1 : c * 2 - 1;
+      const drop = cols === 2 ? Math.abs(xs) * (crease + sag * t) : 0;
+      // The frond's "up" normal in the (out, up) plane is (-cos phi, sin phi); edges are pushed the other way.
+      put(xs * w * 0.5, up - drop * Math.sin(phi), out + drop * Math.cos(phi), (xs + 1) * 0.5, t);
+    }
   }
+  const idx: number[] = [];
+  for (let i = 0; i < rows - 1; i++) {
+    for (let c = 0; c < nx - 1; c++) {
+      const a = i * nx + c, b = a + 1, d = a + nx, e = d + 1;
+      idx.push(a, d, b, b, d, e);
+    }
+  }
+  const last = (rows - 1) * nx, tip = nv - 1;
+  for (let c = 0; c < nx - 1; c++) idx.push(last + c, tip, last + c + 1);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  g.setIndex(idx);
   g.computeVertexNormals();
-  g.rotateX(-pitch);
-  g.rotateY(yaw);
   return g;
 }
 
-/** Crown: 11 live fronds with seeded jitter plus a skirt of 4 short dead fronds hanging below them. */
-function frondsGeometry(topX: number, topY: number, seed: number): THREE.BufferGeometry {
+const sP = new THREE.Vector3(), sC = new THREE.Vector3();
+
+/**
+ * Foliage normal trick: blends each vertex normal `k` of the way toward the direction from a point below the crown
+ * centre, so the canopy shades like one soft volume (lit on top, darker underneath) instead of each frond going
+ * black wherever its own face happens to turn away from the sun.
+ */
+function canopyNormals(g: THREE.BufferGeometry, cy: number, k: number): void {
+  const pos = g.attributes.position, nrm = g.attributes.normal;
+  for (let i = 0; i < pos.count; i++) {
+    sP.set(pos.getX(i), pos.getY(i) - cy, pos.getZ(i)).normalize();
+    sC.set(nrm.getX(i), nrm.getY(i), nrm.getZ(i)).lerp(sP, k).normalize();
+    nrm.setXYZ(i, sC.x, sC.y, sC.z);
+  }
+}
+
+/** Crown: 14 arching live fronds with seeded jitter in yaw, pitch and bend, plus a skirt of 3 short dead fronds. */
+export function frondsGeometry(topX: number, topY: number, seed: number): THREE.BufferGeometry {
   const rng = new Random(seed);
   const parts: THREE.BufferGeometry[] = [];
   const L = PROP_DIMS.palmFrondLen, W = PROP_DIMS.palmFrondW;
-  const n = 11;
+  const n = 14;
   for (let i = 0; i < n; i++) {
     const len = L * rng.range(0.8, 1.1);
-    const g = frond(len, W, rng.range(0.35, 0.95), (i / n) * Math.PI * 2 + rng.range(-0.25, 0.25), 1.6 * (len / L), 0.18);
-    g.translate(topX, topY, 0);
+    // Alternate inner (steeper, shorter bend) and outer (flatter, arching harder) fronds around the crown.
+    const inner = i % 2 === 0;
+    const pitch = inner ? rng.range(0.25, 0.6) : rng.range(0.75, 1.15);
+    const bend = inner ? rng.range(0.9, 1.2) : rng.range(1.1, 1.5);
+    const g = frondGeometry(len, W * rng.range(0.9, 1.05), pitch, (i / n) * Math.PI * 2 + rng.range(-0.2, 0.2), bend, 0.25, 0.18, 4, 2);
+    canopyNormals(g, -30, 1);
+    g.translate(topX, topY + (inner ? 0.1 : -0.05), 0);
     const v = rng.range(0.82, 1);
     tintRGB(g, v, v, v * 0.96);
     const both = withBackFaces(g, 0.66);
     g.dispose();
     parts.push(both);
   }
-  for (let i = 0; i < 4; i++) {
-    const len = L * rng.range(0.5, 0.7);
-    const g = frond(len, W * 0.7, rng.range(1.6, 1.9), (i / 4) * Math.PI * 2 + rng.range(-0.4, 0.4), 0.5, 0, 1, 2);
-    g.translate(topX, topY - 0.15, 0);
+  for (let i = 0; i < 3; i++) {
+    const len = L * rng.range(0.4, 0.55);
+    const g = frondGeometry(len, W * 0.55, rng.range(2.5, 2.9), (i / 3) * Math.PI * 2 + rng.range(-0.5, 0.5), 0.15, 0, 0, 2, 1);
+    canopyNormals(g, -30, 1);
+    g.translate(topX, topY - 0.3, 0);
     tintRGB(g, 0.5, 0.4, 0.26);
     const both = withBackFaces(g, 0.78);
     g.dispose();
@@ -205,40 +383,17 @@ function frondsGeometry(topX: number, topY: number, seed: number): THREE.BufferG
   return fuse(parts);
 }
 
-function poleGeometry(): THREE.BufferGeometry {
-  const pole = new THREE.CylinderGeometry(0.09, 0.13, PROP_DIMS.lampH, 6, 1);
-  pole.translate(0, PROP_DIMS.lampH / 2, 0);
-  const arm = new THREE.BoxGeometry(0.12, 0.12, PROP_DIMS.lampArm);
-  arm.translate(0, PROP_DIMS.lampH - 0.1, PROP_DIMS.lampArm / 2);
-  const merged = mergeGeometries([pole, arm], false);
-  pole.dispose(); arm.dispose();
-  return merged;
-}
-
-function benchGeometry(): THREE.BufferGeometry {
-  const seat = new THREE.BoxGeometry(1.7, 0.08, 0.5);
-  seat.translate(0, 0.45, 0);
-  const back = new THREE.BoxGeometry(1.7, 0.45, 0.06);
-  back.translate(0, 0.72, -0.24);
-  const legL = new THREE.BoxGeometry(0.08, 0.45, 0.45);
-  legL.translate(-0.75, 0.22, 0);
-  const legR = new THREE.BoxGeometry(0.08, 0.45, 0.45);
-  legR.translate(0.75, 0.22, 0);
-  const merged = mergeGeometries([seat, back, legL, legR], false);
-  seat.dispose(); back.dispose(); legL.dispose(); legR.dispose();
-  return merged;
-}
-
-function hydrantGeometry(): THREE.BufferGeometry {
-  const body = new THREE.CylinderGeometry(0.16, 0.2, 0.7, 8, 1);
-  body.translate(0, 0.35, 0);
-  const cap = new THREE.SphereGeometry(0.17, 8, 6);
-  cap.translate(0, 0.72, 0);
-  const side = new THREE.BoxGeometry(0.5, 0.12, 0.14);
-  side.translate(0, 0.45, 0);
-  const merged = mergeGeometries([body, cap, side], false);
-  body.dispose(); cap.dispose(); side.dispose();
-  return merged;
+/** Lamp glow: the pavement pool and the facade spill merged into one quad pair; the spill is 40% as bright. */
+function glowGeometry(): THREE.BufferGeometry {
+  const pool = new THREE.PlaneGeometry(PROP_DIMS.poolRadius * 2, PROP_DIMS.poolRadius * 2);
+  pool.rotateX(-Math.PI / 2);
+  pool.translate(0, 0.06, PROP_DIMS.lampArm - 0.3);
+  tintRGB(pool, 1, 1, 1);
+  // Facade spill: a vertical glow behind the pole (the kerb side is -Z; the arm points +Z over the road).
+  const spill = new THREE.PlaneGeometry(2.5, 4.5);
+  spill.translate(0, 2.25, -0.9);
+  tintRGB(spill, 0.4, 0.4, 0.4);
+  return fuse([pool, spill]);
 }
 
 /** Draw radius per prop kind: past this the prop is a couple of pixels, so it is left out of the instance buffer. */
@@ -246,6 +401,9 @@ export const PROP_RANGE = { palm: 165, lamp: 240, bench: 170, hydrant: 140, bin:
 
 /** Seeds of the two palm variants; palms alternate between them by index. */
 const PALM_SEEDS = [1201, 2417] as const;
+
+/** Night opacity of the lamp glow quads (the pavement pool; the spill quad is vertex-tinted to 40% of it). */
+const GLOW_OPACITY = 0.45;
 
 interface PropGroup {
   /** Source placements: x, z, yaw, scale per prop (never mutated). */
@@ -256,7 +414,8 @@ interface PropGroup {
 }
 
 /**
- * Builds and adds the instanced prop meshes; 14 draw calls total (two palm variants, four lamp parts).
+ * Builds and adds the instanced prop meshes; 14 draw calls total (two palm variants x 2 parts, three lamp parts,
+ * bench, hydrant, bin, sign, shelter frame, shelter glass, bollard).
  *
  * The city holds ~1300 lamps and ~500 palms — drawing them all costs ~125k triangles per frame even when
  * they are half a kilometre behind the camera. Instead the source placements are kept on the CPU and only the
@@ -267,30 +426,33 @@ export class PropRenderer {
   private readonly meshes: THREE.InstancedMesh[] = [];
   private readonly geometries: THREE.BufferGeometry[] = [];
   private readonly groups: PropGroup[] = [];
+  private readonly materials: Materials;
+  private readonly glowMat: THREE.MeshBasicMaterial;
   private lastX = Infinity;
   private lastZ = Infinity;
 
   constructor(scene: THREE.Scene, props: Prop[], materials: Materials) {
+    this.materials = materials;
     const counts: Record<Prop['kind'], number> = { palm: 0, lamp: 0, bench: 0, hydrant: 0, bin: 0, sign: 0, shelter: 0, bollard: 0 };
     for (let i = 0; i < props.length; i++) counts[props[i].kind]++;
     const pole = poleGeometry();
-    const head = new THREE.BoxGeometry(0.5, 0.22, 0.9);
-    head.translate(0, PROP_DIMS.lampH - 0.2, PROP_DIMS.lampArm - 0.3);
-    const pool = new THREE.PlaneGeometry(PROP_DIMS.poolRadius * 2, PROP_DIMS.poolRadius * 2);
-    pool.rotateX(-Math.PI / 2);
-    pool.translate(0, 0.06, PROP_DIMS.lampArm - 0.3);
-    // Facade spill: a vertical glow behind the pole (the kerb side is -Z; the arm points +Z over the road).
-    const spill = new THREE.PlaneGeometry(2.5, 4.5);
-    spill.translate(0, 2.25, -0.9);
+    const head = headGeometry();
+    const glow = glowGeometry();
     const bench = benchGeometry();
     const hydrant = hydrantGeometry();
     const bin = binGeometry();
     const sign = signGeometry();
     const shelter = shelterGeometry();
+    const shelterGlass = shelterGlassGeometry();
     const bollard = bollardGeometry();
-    this.geometries.push(pole, head, pool, spill, bench, hydrant, bin, sign, shelter, bollard);
-    const mk = (g: THREE.BufferGeometry, m: THREE.Material, n: number, shadow: boolean): THREE.InstancedMesh => {
+    this.geometries.push(pole, head, glow, bench, hydrant, bin, sign, shelter, shelterGlass, bollard);
+    // Pool and spill share one additive material (same glow sprite and tint as Materials' lightPool); the spill's
+    // lower intensity is baked into its vertex colour and the night opacity is synced in update().
+    const poolSrc = materials.lightPool();
+    this.glowMat = new THREE.MeshBasicMaterial({ map: poolSrc.map, color: poolSrc.color, vertexColors: true, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, fog: false, toneMapped: false });
+    const mk = (name: string, g: THREE.BufferGeometry, m: THREE.Material, n: number, shadow: boolean): THREE.InstancedMesh => {
       const im = new THREE.InstancedMesh(g, m, Math.max(1, n));
+      im.name = 'prop:' + name;
       im.count = 0;
       im.castShadow = shadow;
       im.receiveShadow = false;
@@ -305,20 +467,19 @@ export class PropRenderer {
       const fronds = frondsGeometry(trunk.userData.topX as number, trunk.userData.topY as number, PALM_SEEDS[v] + 7);
       this.geometries.push(trunk, fronds);
       const n = Math.ceil(counts.palm / PALM_SEEDS.length);
-      palmMeshes.push([mk(trunk, materials.palmTrunk, n, true), mk(fronds, materials.palmFrond, n, true)]);
+      palmMeshes.push([mk('palmTrunk' + v, trunk, materials.palmTrunk, n, true), mk('palmFronds' + v, fronds, materials.palmFrond, n, true)]);
     }
-    const poleM = mk(pole, materials.lampPole, counts.lamp, true);
-    const headM = mk(head, materials.lampHead(), counts.lamp, false);
-    const poolM = mk(pool, materials.lightPool(), counts.lamp, false);
-    poolM.renderOrder = 2;
-    const spillM = mk(spill, materials.lampSpill(), counts.lamp, false);
-    spillM.renderOrder = 2;
-    const benchM = mk(bench, materials.bench, counts.bench, true);
-    const hydrantM = mk(hydrant, materials.hydrant, counts.hydrant, false);
-    const binM = mk(bin, materials.furniture, counts.bin, true);
-    const signM = mk(sign, materials.furniture, counts.sign, true);
-    const shelterM = mk(shelter, materials.furniture, counts.shelter, true);
-    const bollardM = mk(bollard, materials.furniture, counts.bollard, false);
+    const poleM = mk('lampPole', pole, materials.lampPole, counts.lamp, true);
+    const headM = mk('lampHead', head, materials.lampHead(), counts.lamp, false);
+    const glowM = mk('lampGlow', glow, this.glowMat, counts.lamp, false);
+    glowM.renderOrder = 2;
+    const benchM = mk('bench', bench, materials.furniture, counts.bench, true);
+    const hydrantM = mk('hydrant', hydrant, materials.furniture, counts.hydrant, false);
+    const binM = mk('bin', bin, materials.furniture, counts.bin, true);
+    const signM = mk('sign', sign, materials.furniture, counts.sign, true);
+    const shelterM = mk('shelter', shelter, materials.furniture, counts.shelter, true);
+    const shelterGlassM = mk('shelterGlass', shelterGlass, materials.glass(), counts.shelter, false);
+    const bollardM = mk('bollard', bollard, materials.furniture, counts.bollard, false);
     // `parity`/`mod` split one kind over several groups (palm variants) by its index within the kind.
     const group = (kind: Prop['kind'], n: number, range: number, meshes: THREE.InstancedMesh[], parity = 0, mod = 1): PropGroup => {
       const g: PropGroup = { data: new Float32Array(Math.max(1, n) * 4), count: 0, range2: range * range, meshes };
@@ -335,20 +496,21 @@ export class PropRenderer {
       return g;
     };
     for (let v = 0; v < PALM_SEEDS.length; v++) group('palm', Math.ceil(counts.palm / PALM_SEEDS.length), PROP_RANGE.palm, palmMeshes[v], v, PALM_SEEDS.length);
-    group('lamp', counts.lamp, PROP_RANGE.lamp, [poleM, headM, poolM, spillM]);
+    group('lamp', counts.lamp, PROP_RANGE.lamp, [poleM, headM, glowM]);
     group('bench', counts.bench, PROP_RANGE.bench, [benchM]);
     group('hydrant', counts.hydrant, PROP_RANGE.hydrant, [hydrantM]);
     group('bin', counts.bin, PROP_RANGE.bin, [binM]);
     group('sign', counts.sign, PROP_RANGE.sign, [signM]);
-    group('shelter', counts.shelter, PROP_RANGE.shelter, [shelterM]);
+    group('shelter', counts.shelter, PROP_RANGE.shelter, [shelterM, shelterGlassM]);
     group('bollard', counts.bollard, PROP_RANGE.bollard, [bollardM]);
     // Instanced meshes cannot be culled per instance, and their bounds span the whole city: pack by distance instead.
     for (let i = 0; i < this.meshes.length; i++) this.meshes[i].frustumCulled = false;
     this.repack(0, 0);
   }
 
-  /** Refills the instance buffers with the props near (camX, camZ); cheap and only runs after real movement. */
+  /** Syncs the glow opacity with the night factor, then refills the instance buffers if the camera moved enough. */
   update(camX: number, camZ: number): void {
+    this.glowMat.opacity = this.materials.nightFactor * GLOW_OPACITY;
     const dx = camX - this.lastX, dz = camZ - this.lastZ;
     if (dx * dx + dz * dz < PROP_RANGE.repackMove * PROP_RANGE.repackMove) return;
     this.repack(camX, camZ);
@@ -391,6 +553,7 @@ export class PropRenderer {
       m.dispose();
     }
     for (let i = 0; i < this.geometries.length; i++) this.geometries[i].dispose();
+    this.glowMat.dispose();
     this.meshes.length = 0;
     this.geometries.length = 0;
   }
