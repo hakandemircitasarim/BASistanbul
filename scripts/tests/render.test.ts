@@ -1,7 +1,7 @@
 // Track B tests: DayNightSystem clock/sun/night factor/AI lights, building UVs in meters, landmark parts, sky keys. Track B.
 import { test, expect, approx, createHeadless } from './harness';
 import { DayNightSystem, DAY_TUNING } from '../../src/game/systems/DayNightSystem';
-import { BAND, GeoBuilder, appendBuildingDetail, appendStreetLevel, buildingGeometry, landmarkGeometries, massingOf } from '../../src/game/render/BuildingGeometry';
+import { ARCADE, BAND, GeoBuilder, appendBuilding, appendBuildingDetail, appendStreetLevel, bandHeight, buildingGeometry, hasCrown, landmarkGeometries, massingOf } from '../../src/game/render/BuildingGeometry';
 import { Random } from '../../src/game/core/Random';
 import { SKY_KEYS } from '../../src/game/render/SkySystem';
 import { Vehicle } from '../../src/game/entities/Vehicle';
@@ -97,35 +97,75 @@ test('BuildingGeometry: side UVs are in meters (u = width/16, v = height/28), ro
   expect(maxY > 56, 'spire rises above the box');
 });
 
-test('BuildingGeometry: street level = band box in the band builder + cornice/awnings in the style builder; trim stays separate and cheap', () => {
-  const style = new GeoBuilder(), band = new GeoBuilder(), rng = new Random(3);
+test('BuildingGeometry: street level = recessed band + arcade columns + cap, awnings in their own builder; trim stays separate and cheap', () => {
+  const style = new GeoBuilder(), band = new GeoBuilder(), awning = new GeoBuilder(), rng = new Random(3);
   const shop = sampleBuilding({ district: 'suburb', style: 'residential', h: 14.2, w: 16, d: 12 });
-  appendStreetLevel(style, band, shop, rng, false);
+  // Only the street-facing wall (+Z) sees a street: columns on that face and its two corners, nothing on the others.
+  appendStreetLevel(style, band, shop, rng, false, awning, 1);
   expect(band.vertexCount === 16, `shop band = 4 faces (got ${band.vertexCount / 4} quads)`);
-  // Band v spans exactly 0..1 over the band height, and the band tops out at SHOP_BAND_H.
+  // Band v spans exactly 0..1 over the band height, the band tops out at SHOP_BAND_H and stands ARCADE.recess behind the wall.
   const bg = band.build();
-  let maxY = 0, maxV = 0;
-  for (let i = 0; i < bg.attributes.position.count; i++) { maxY = Math.max(maxY, bg.attributes.position.getY(i)); maxV = Math.max(maxV, bg.attributes.uv.getY(i)); }
+  let maxY = 0, maxV = 0, maxZ = -Infinity;
+  for (let i = 0; i < bg.attributes.position.count; i++) { maxY = Math.max(maxY, bg.attributes.position.getY(i)); maxV = Math.max(maxV, bg.attributes.uv.getY(i)); maxZ = Math.max(maxZ, bg.attributes.position.getZ(i)); }
   approx(maxY, BAND.shopH, 1e-6, 'band height = SHOP_BAND_H');
   approx(maxV, 1, 1e-6, 'band v spans 0..1');
-  // Cornice (5 quads) + 4 two-sided awning segments x 2 quads x 2 sides = 16 quads.
-  expect(style.vertexCount === (5 + 16) * 4, `cornice + awnings = 21 quads (got ${style.vertexCount / 4})`);
+  approx(maxZ, 200 + 6 - ARCADE.recess, 1e-3, 'shop band recessed behind the wall line');
+  // Cap with its soffit (6 quads) + 2 corner columns (4 quads each) + one bay column per shop bay on the 16 m street face (3 quads each).
+  let bays = 0;
+  for (let s = ARCADE.recess + ARCADE.bay; s < 16 - ARCADE.recess - 1.5; s += ARCADE.bay) bays++;
+  expect(bays >= 2, `a 16 m face holds at least two bay columns (got ${bays})`);
+  expect(style.vertexCount === (6 + 8 + 3 * bays) * 4, `cap + corner + bay columns = ${6 + 8 + 3 * bays} quads (got ${style.vertexCount / 4})`);
+  // Awning: one slope + one valance quad, u along the span, v from 1 at the wall down to 0 at the hem.
+  expect(awning.vertexCount === 8, `awning = 2 quads (got ${awning.vertexCount / 4})`);
+  const ag = awning.build();
+  let vMin = 1, vMax = 0, uMax = 0;
+  for (let i = 0; i < 8; i++) { vMin = Math.min(vMin, ag.attributes.uv.getY(i)); vMax = Math.max(vMax, ag.attributes.uv.getY(i)); uMax = Math.max(uMax, ag.attributes.uv.getX(i)); }
+  expect(vMin === 0 && vMax === 1 && uMax > 3, `awning v spans 0..1 and u repeats along the span (u max ${uMax.toFixed(2)})`);
+  expect(ag.attributes.position.getY(0) > ag.attributes.position.getY(6), 'awning slopes down from the wall');
   const plinthStyle = new GeoBuilder(), plinth = new GeoBuilder();
-  appendStreetLevel(plinthStyle, plinth, sampleBuilding({}), rng, true);
-  expect(plinth.vertexCount === 16 && plinthStyle.vertexCount === 20, 'downtown plinth: band + cornice, no awnings');
-  // Detail pass: roof trim goes to the trim builder, the style builder only gets textured tiers / facade dressing.
+  appendStreetLevel(plinthStyle, plinth, sampleBuilding({}), rng, true, awning, 15);
+  expect(plinth.vertexCount === 16 && plinthStyle.vertexCount === 20 && awning.vertexCount === 8, 'downtown plinth: flush band + cap, no columns, no awning');
+  // Without a street mask a shop still gets its band and cap but no columns.
+  const s2 = new GeoBuilder();
+  appendStreetLevel(s2, new GeoBuilder(), shop, rng, false, null, 0);
+  expect(s2.vertexCount === 6 * 4, `no street faces: cap only (got ${s2.vertexCount / 4} quads)`);
+  // Arcade buildings raise their windowed walls to the arcade ceiling.
+  const raised = new GeoBuilder();
+  appendBuilding(raised, shop, bandHeight(shop, false) - 0.3);
+  const rg = raised.build();
+  let minY = Infinity;
+  for (let i = 0; i < rg.attributes.position.count; i++) minY = Math.min(minY, rg.attributes.position.getY(i));
+  approx(minY, BAND.shopH - 0.3, 1e-6, 'walls start at the arcade ceiling');
+  // Detail pass: roof trim goes to the trim builder, the style builder only gets textured tiers / facade relief.
   const gb = new GeoBuilder(), trim = new GeoBuilder();
   const low = sampleBuilding({ id: 4, district: 'suburb', style: 'concrete', h: 10.7, w: 20, d: 16 });
-  appendBuildingDetail(gb, trim, low, new Random(1), []);
+  appendBuildingDetail(gb, trim, low, new Random(1), [], 0);
   expect(massingOf(low).kind === 'box', 'low flat suburb building is a box');
-  expect(trim.vertexCount > 0 && trim.vertexCount <= 20 * 4, `roof under 12 m: coping band only, no walls or clutter (got ${trim.vertexCount / 4} quads)`);
+  expect(trim.vertexCount === 13 * 4, `roof under 12 m: two-step cornice only (13 quads), no walls or clutter (got ${trim.vertexCount / 4} quads)`);
+  expect(gb.vertexCount === 0, 'no street faces: no relief on the style mesh');
+  // With one street face the concrete building gets a ledge per window row and a pier per bay line on that face.
+  const gbR = new GeoBuilder();
+  appendBuildingDetail(gbR, new GeoBuilder(), low, new Random(1), [], 1, BAND.shopH);
+  expect(gbR.vertexCount > 0 && gbR.vertexCount % 4 === 0, `ledges + piers on the street face (got ${gbR.vertexCount / 4} quads)`);
   const tall = sampleBuilding({ id: 8, district: 'suburb', style: 'concrete', h: 21.2, w: 24, d: 20 });
   const gb2 = new GeoBuilder(), trim2 = new GeoBuilder();
-  appendBuildingDetail(gb2, trim2, tall, new Random(1), []);
-  expect(trim2.vertexCount / 4 >= 5 + 12 && trim2.vertexCount / 4 <= 80, `tall roof: coping + parapet frame + at most two clutter pieces (got ${trim2.vertexCount / 4} quads)`);
-  // Stepped roofs are capped at two tiers whatever the height.
+  appendBuildingDetail(gb2, trim2, tall, new Random(1), [], 0);
+  expect(trim2.vertexCount / 4 >= 13 + 12 && trim2.vertexCount / 4 <= 80, `tall roof: cornice + parapet frame + at most one clutter piece (got ${trim2.vertexCount / 4} quads)`);
+  // Stepped roofs are capped at two tiers whatever the height; a crown tower stops CHAMFER short and the detail pass chamfers it.
   const stepped = buildingGeometry(sampleBuilding({ id: 2, roofKind: 'stepped', h: 70.2, style: 'glass' }));
   expect(stepped.attributes.position.count === 2 * 20, `two tiers = 2 window boxes (got ${stepped.attributes.position.count / 20})`);
+  const towerB = sampleBuilding({ id: 4, h: 60 });
+  expect(hasCrown(towerB, massingOf(towerB).top), 'a 60 m flat downtown tower has a crown');
+  const tg = buildingGeometry(towerB);
+  let tMax = 0;
+  for (let i = 0; i < tg.attributes.position.count; i++) tMax = Math.max(tMax, tg.attributes.position.getY(i));
+  approx(tMax, 58, 1e-6, 'crown tower box stops 2 m short for the chamfer');
+  const gb3 = new GeoBuilder(), trim3 = new GeoBuilder();
+  appendBuildingDetail(gb3, trim3, towerB, new Random(1), [], 0);
+  const cg = gb3.build();
+  let cMax = 0;
+  for (let i = 0; i < cg.attributes.position.count; i++) cMax = Math.max(cMax, cg.attributes.position.getY(i));
+  approx(cMax, 60, 1e-6, 'chamfer reaches the tower top');
 });
 
 test('BuildingGeometry: every landmark kind yields parts; the ferris wheel has a rotating hub part', () => {

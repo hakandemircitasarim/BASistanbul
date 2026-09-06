@@ -27,11 +27,11 @@ const HDR_BOOST = 2;
  * Roughness / metalness / sky-probe strength per surface family. Everything lit is MeshStandardMaterial so the PMREM
  * sky probe actually shows up: without a specular term the whole city answers light identically and reads flat.
  * Rule of thumb: bare metal is the only family with metalness above 0.1 - painted steel is paint, glass is glass -
- * and the families are spread across the roughness range (glass 0.1, metal 0.35, paint 0.5, asphalt 0.85 with its
+ * and the families are spread across the roughness range (glass 0.26, metal 0.35, paint 0.5, asphalt 0.85 with its
  * lane paint at 0.55 via the map, stone and concrete 0.85-0.95, canvas 0.9) so light behaves differently on each.
  */
 const SURF = {
-  building: { roughness: 1, metalness: 0.04, env: 0.75 },
+  building: { roughness: 1, metalness: 0.04, env: 0.75, envGlass: 1.2 },
   plain: { roughness: 0.88, metalness: 0.05, env: 0.5 },
   road: { roughnessDay: 0.85, roughnessNight: 0.6, metalness: 0.03, env: 0.45 },
   ground: { roughness: 0.94, metalness: 0, env: 0.35 },
@@ -96,8 +96,10 @@ export class Materials {
         vertexColors: true, map: w.map, emissiveMap: w.emissive, emissive: WINDOW_EMISSIVE_COLOR, emissiveIntensity: 0,
         // Per-pixel relief so windows read as recessed instead of painted on a flat slab, plus a roughness map so
         // the glazing catches the sky and the render around it does not.
-        normalMap: w.normal, normalScale: new THREE.Vector2(0.75, 0.75), roughnessMap: w.rough,
-        roughness: SURF.building.roughness, metalness: SURF.building.metalness, envMapIntensity: SURF.building.env,
+        // 0.45: the relief is a high-passed albedo, and at 0.75 the plaster mottle rippled like wet watercolour.
+        normalMap: w.normal, normalScale: new THREE.Vector2(0.45, 0.45), roughnessMap: w.rough,
+        // The curtain wall bakes a sky-to-slate reflection into its albedo and leans harder on the sky probe over it.
+        roughness: SURF.building.roughness, metalness: SURF.building.metalness, envMapIntensity: style === 'glass' ? SURF.building.envGlass : SURF.building.env,
       });
     }
     this.plain = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: SURF.plain.roughness, metalness: SURF.plain.metalness, envMapIntensity: SURF.plain.env });
@@ -105,13 +107,13 @@ export class Materials {
     const shop = tex.shopfront();
     this.shopfront = new THREE.MeshStandardMaterial({
       vertexColors: true, map: shop.map, emissiveMap: shop.emissive, emissive: 0xffffff, emissiveIntensity: SHOP_EMISSIVE_DAY,
-      normalMap: shop.normal, normalScale: new THREE.Vector2(0.9, 0.9), roughnessMap: shop.rough,
+      normalMap: shop.normal, normalScale: new THREE.Vector2(0.6, 0.6), roughnessMap: shop.rough,
       roughness: SURF.building.roughness, metalness: SURF.building.metalness, envMapIntensity: SURF.building.env,
     });
     const pl = tex.plinth();
     this.plinth = new THREE.MeshStandardMaterial({
       vertexColors: true, map: pl.map, emissiveMap: pl.emissive, emissive: 0xffffff, emissiveIntensity: 0,
-      normalMap: pl.normal, normalScale: new THREE.Vector2(0.9, 0.9), roughnessMap: pl.rough,
+      normalMap: pl.normal, normalScale: new THREE.Vector2(0.7, 0.7), roughnessMap: pl.rough,
       roughness: SURF.building.roughness, metalness: SURF.building.metalness, envMapIntensity: SURF.building.env,
     });
     this.awning = new THREE.MeshStandardMaterial({ map: tex.awningTex(), vertexColors: true, side: THREE.DoubleSide, roughness: SURF.canvas.roughness, metalness: SURF.canvas.metalness, envMapIntensity: SURF.canvas.env });

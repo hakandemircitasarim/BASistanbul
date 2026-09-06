@@ -2,7 +2,7 @@
 import * as THREE from 'three';
 import type { Building, BuildingStyle, Landmark } from '../city/CityData';
 import type { Random } from '../core/Random';
-import { GLOW_U, PLINTH_BAND_H, PLINTH_TILE_W, ROOF_V, SHOP_BAND_H, SHOP_TILE_W, WINDOW_TILE_H, WINDOW_TILE_W } from './TextureFactory';
+import { GLOW_U, PLINTH_BAND_H, PLINTH_TILE_W, ROOF_STRIP_PX, ROOF_V, SHOP_BAND_H, SHOP_TILE_W, WINDOW_TILE_H, WINDOW_TILE_PX_H, WINDOW_TILE_W } from './TextureFactory';
 
 /** Material key for a landmark part: a windowed building style (plain parts use the white strip UV) or 'glow' (emissive neon parts). */
 export type LandmarkStyle = BuildingStyle | 'glow';
@@ -27,6 +27,22 @@ const OCT = Math.PI / 8;
 const TIERS = 2;
 /** Roofs below this height get no parapet walls or clutter: from the street they are never seen, only their edge is. */
 const CLUTTER_MIN_H = 12;
+/** Face bits for GeoBuilder.boxFaces. */
+export const FACE = { pz: 1, nz: 2, px: 4, nx: 8, top: 16, bot: 32, sides: 15, all: 63 } as const;
+/** World face bit of building face 0..3 (+Z, +X, -Z, -X). */
+const FACE_BIT = [FACE.pz, FACE.px, FACE.nz, FACE.nx];
+/** Towers above this height get a crown (chamfered top, cornice at its foot, plant room, mast). */
+const CROWN_MIN_H = 42;
+/** Crown chamfer: the top CHAMFER_H metres of a tower's corners are cut at 45 degrees, so the roof is inset by the same. */
+const CHAMFER_H = 2;
+/**
+ * Window grid of the facade textures in world units: 4 bays per 16 m tile, 8 rows under a 20 px roof strip per 28 m
+ * tile (TextureFactory.windows). Ledges, piers and balconies are placed on this grid so the relief lines up with
+ * the painted sills and mullions whatever the per-building UV offset (offsets are whole cells).
+ */
+const BAY_W = WINDOW_TILE_W / 4;
+const ROW_V = (1 - ROOF_STRIP_PX / WINDOW_TILE_PX_H) / 8;
+const ROW_H = ROW_V * WINDOW_TILE_H;
 const tmpColor = new THREE.Color();
 
 /** Accumulates indexed quads/triangles with position, normal, uv and color attributes. Build-time only. */
@@ -169,6 +185,95 @@ export class GeoBuilder {
     this.quad(x1, y0, z0, x0, y0, z0, x0, y1, z0, x1, y1, z0, 0, 0, -1, uOff + 0.25, 0, uOff + 0.25 + ux, 0, uOff + 0.25 + ux, 1, uOff + 0.25, 1);
     this.quad(x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, 1, 0, 0, uOff + 0.5, 0, uOff + 0.5 + uz, 0, uOff + 0.5 + uz, 1, uOff + 0.5, 1);
     this.quad(x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, -1, 0, 0, uOff + 0.75, 0, uOff + 0.75 + uz, 0, uOff + 0.75 + uz, 1, uOff + 0.75, 1);
+  }
+
+  /**
+   * Plain box emitting only the faces in `mask` (FACE bits). Relief pieces stuck to a wall (ledges, piers, balcony
+   * slabs, arcade columns) never need their hidden back / end faces, and a merged city mesh draws every face always.
+   */
+  boxFaces(x0: number, y0: number, z0: number, x1: number, y1: number, z1: number, color: number, mask: number): void {
+    const u = 0.25, v = ROOF_V;
+    this.setColor(color);
+    if (mask & FACE.pz) this.quad(x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1, 0, 0, 1, u, v, u, v, u, v, u, v);
+    if (mask & FACE.nz) this.quad(x1, y0, z0, x0, y0, z0, x0, y1, z0, x1, y1, z0, 0, 0, -1, u, v, u, v, u, v, u, v);
+    if (mask & FACE.px) this.quad(x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, 1, 0, 0, u, v, u, v, u, v, u, v);
+    if (mask & FACE.nx) this.quad(x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, -1, 0, 0, u, v, u, v, u, v, u, v);
+    if (mask & FACE.top) this.quad(x0, y1, z1, x1, y1, z1, x1, y1, z0, x0, y1, z0, 0, 1, 0, u, v, u, v, u, v, u, v);
+    if (mask & FACE.bot) this.quad(x0, y0, z0, x1, y0, z0, x1, y0, z1, x0, y0, z1, 0, -1, 0, u, v, u, v, u, v, u, v);
+  }
+
+  /**
+   * Two-step cornice around a roof edge: a fillet `out0` proud and `h0` tall under a crown slab `out1` proud and
+   * `h1` tall, whose underside is the visible soffit. Outer faces, the soffit ring and a single top quad only
+   * (13 quads): the parts buried in the wall and under the roof are never emitted.
+   */
+  cornice(x0: number, z0: number, x1: number, z1: number, top: number, out0: number, h0: number, out1: number, h1: number, color: number): void {
+    const u = 0.25, v = ROOF_V;
+    const yb = top - h0 - h1, ym = top - h1;
+    const ax0 = x0 - out0, ax1 = x1 + out0, az0 = z0 - out0, az1 = z1 + out0;
+    const bx0 = x0 - out1, bx1 = x1 + out1, bz0 = z0 - out1, bz1 = z1 + out1;
+    this.setColor(darken(color, 0.92));
+    // Fillet: four outer faces.
+    this.quad(ax0, yb, az1, ax1, yb, az1, ax1, ym, az1, ax0, ym, az1, 0, 0, 1, u, v, u, v, u, v, u, v);
+    this.quad(ax1, yb, az0, ax0, yb, az0, ax0, ym, az0, ax1, ym, az0, 0, 0, -1, u, v, u, v, u, v, u, v);
+    this.quad(ax1, yb, az1, ax1, yb, az0, ax1, ym, az0, ax1, ym, az1, 1, 0, 0, u, v, u, v, u, v, u, v);
+    this.quad(ax0, yb, az0, ax0, yb, az1, ax0, ym, az1, ax0, ym, az0, -1, 0, 0, u, v, u, v, u, v, u, v);
+    // Soffit ring under the slab (faces down): from the fillet's outer edge to the slab's outer edge.
+    this.setColor(darken(color, 0.7));
+    this.quad(bx0, ym, az1, bx1, ym, az1, bx1, ym, bz1, bx0, ym, bz1, 0, -1, 0, u, v, u, v, u, v, u, v);
+    this.quad(bx0, ym, bz0, bx1, ym, bz0, bx1, ym, az0, bx0, ym, az0, 0, -1, 0, u, v, u, v, u, v, u, v);
+    this.quad(bx0, ym, az0, ax0, ym, az0, ax0, ym, az1, bx0, ym, az1, 0, -1, 0, u, v, u, v, u, v, u, v);
+    this.quad(ax1, ym, az0, bx1, ym, az0, bx1, ym, az1, ax1, ym, az1, 0, -1, 0, u, v, u, v, u, v, u, v);
+    // Slab: four outer faces and the top.
+    this.setColor(color);
+    this.quad(bx0, ym, bz1, bx1, ym, bz1, bx1, top, bz1, bx0, top, bz1, 0, 0, 1, u, v, u, v, u, v, u, v);
+    this.quad(bx1, ym, bz0, bx0, ym, bz0, bx0, top, bz0, bx1, top, bz0, 0, 0, -1, u, v, u, v, u, v, u, v);
+    this.quad(bx1, ym, bz1, bx1, ym, bz0, bx1, top, bz0, bx1, top, bz1, 1, 0, 0, u, v, u, v, u, v, u, v);
+    this.quad(bx0, ym, bz0, bx0, ym, bz1, bx0, top, bz1, bx0, top, bz0, -1, 0, 0, u, v, u, v, u, v, u, v);
+    this.quad(bx0, top, bz1, bx1, top, bz1, bx1, top, bz0, bx0, top, bz0, 0, 1, 0, u, v, u, v, u, v, u, v);
+  }
+
+  /** Chamfered top: four 45-degree slopes from the rect at y0 to the rect inset by `inset` at y1, plus the flat top. */
+  chamferTop(x0: number, z0: number, x1: number, z1: number, y0: number, y1: number, inset: number, color: number, top: number): void {
+    const u = 0.25, v = ROOF_V;
+    const ix0 = x0 + inset, ix1 = x1 - inset, iz0 = z0 + inset, iz1 = z1 - inset;
+    const n = Math.SQRT1_2;
+    this.setColor(color);
+    this.quad(x0, y0, z1, x1, y0, z1, ix1, y1, iz1, ix0, y1, iz1, 0, n, n, u, v, u, v, u, v, u, v);
+    this.quad(x1, y0, z0, x0, y0, z0, ix0, y1, iz0, ix1, y1, iz0, 0, n, -n, u, v, u, v, u, v, u, v);
+    this.quad(x1, y0, z1, x1, y0, z0, ix1, y1, iz0, ix1, y1, iz1, n, n, 0, u, v, u, v, u, v, u, v);
+    this.quad(x0, y0, z0, x0, y0, z1, ix0, y1, iz1, ix0, y1, iz0, -n, n, 0, u, v, u, v, u, v, u, v);
+    this.setColor(top);
+    this.quad(ix0, y1, iz1, ix1, y1, iz1, ix1, y1, iz0, ix0, y1, iz0, 0, 1, 0, u, v, u, v, u, v, u, v);
+  }
+
+  /** Elliptical frustum (plain UV): radii rx0/rz0 at y0 tapering to rx1/rz1 at y1, with a flat top cap. */
+  frustum(cx: number, cz: number, rx0: number, rz0: number, rx1: number, rz1: number, y0: number, y1: number, segments: number, color: number, top: number, phase = 0): void {
+    const u = 0.25, v = ROOF_V;
+    this.setColor(color);
+    const dy = y1 - y0, dr = Math.max(rx0 - rx1, rz0 - rz1);
+    const nl = Math.hypot(dy, dr) || 1;
+    for (let i = 0; i < segments; i++) {
+      const a0 = phase + (i / segments) * Math.PI * 2, a1 = phase + ((i + 1) / segments) * Math.PI * 2, am = (a0 + a1) / 2;
+      const nx = Math.cos(am) * dy / nl, nz = Math.sin(am) * dy / nl, ny = dr / nl;
+      this.quad(cx + Math.cos(a1) * rx0, y0, cz + Math.sin(a1) * rz0, cx + Math.cos(a0) * rx0, y0, cz + Math.sin(a0) * rz0,
+        cx + Math.cos(a0) * rx1, y1, cz + Math.sin(a0) * rz1, cx + Math.cos(a1) * rx1, y1, cz + Math.sin(a1) * rz1, nx, ny, nz, u, v, u, v, u, v, u, v);
+    }
+    this.setColor(top);
+    for (let i = 0; i < segments; i++) {
+      const a0 = phase + (i / segments) * Math.PI * 2, a1 = phase + ((i + 1) / segments) * Math.PI * 2;
+      this.tri(cx, y1, cz, cx + Math.cos(a0) * rx1, y1, cz + Math.sin(a0) * rz1, cx + Math.cos(a1) * rx1, y1, cz + Math.sin(a1) * rz1, u, v);
+    }
+  }
+
+  /** Quad with explicit UVs and the normal from its winding (textured single-sided surfaces such as awning canvas). */
+  texQuad(ax: number, ay: number, az: number, bx: number, by: number, bz: number, cx: number, cy: number, cz: number, dx: number, dy: number, dz: number,
+    ua: number, va: number, ub: number, vb: number, uc: number, vc: number, ud: number, vd: number): void {
+    const ux = bx - ax, uy = by - ay, uz = bz - az, vx = cx - ax, vy = cy - ay, vz = cz - az;
+    let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    const l = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+    nx /= l; ny /= l; nz /= l;
+    this.quad(ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, ua, va, ub, vb, uc, vc, ud, vd);
   }
 
   /** Four-sided pyramid over the rectangle x0..x1 / z0..z1 from y0 to apexY. */
@@ -346,42 +451,48 @@ function twinRect(b: Building, n: number, m: Massing): void {
   else { m.tz0 = z0 + side; m.tz1 = z1 - side; m.tx0 = x0; m.tx1 = x1; if (b.facing === 1) m.tx1 = x1 - back; else m.tx0 = x0 + back; }
 }
 
-/** Appends the building to a builder (box / stepped tiers / one-sided setback / podium variants / box + spire) at world coordinates. */
-export function appendBuilding(gb: GeoBuilder, b: Building): void {
+/** Whether a tower gets a crown: chamfered top, cornice at its foot, plant room and mast (spires keep their pyramid). */
+export function hasCrown(b: Building, top: number): boolean { return top > CROWN_MIN_H && b.roofKind !== 'spire'; }
+
+/**
+ * Appends the building to a builder (box / stepped tiers / one-sided setback / podium variants / box + spire) at world
+ * coordinates. `y0` is where the full-footprint walls start: BASE_Y normally, the arcade ceiling for a shopfront
+ * building whose ground floor is recessed behind columns (appendStreetLevel). Crown towers stop CHAMFER_H short of
+ * the top so appendBuildingDetail can cut the corners.
+ */
+export function appendBuilding(gb: GeoBuilder, b: Building, y0 = BASE_Y): void {
   const roof = darken(b.color, ROOF_DARKEN);
   const wall = lighten(b.color, WALL_LIGHTEN);
   // Per-building whole-window UV offsets so buildings sharing a style texture do not share the lit pattern.
   const uOff = ((b.id * 7) % 4) / 4, vOff = ((b.id * 13) % 8) / 8;
   const x0 = b.x - b.w / 2, x1 = b.x + b.w / 2, z0 = b.z - b.d / 2, z1 = b.z + b.d / 2;
   const m = massingOf(b);
+  const topY = hasCrown(b, m.top) ? b.h - CHAMFER_H : b.h;
   if (m.kind === 'tiers') {
     const fr = [0.65, 0.35];
-    let y = BASE_Y;
+    let y = y0;
     let inset = 0;
     for (let t = 0; t < TIERS; t++) {
-      const y1 = t === TIERS - 1 ? b.h : y + b.h * fr[t];
+      const y1 = t === TIERS - 1 ? topY : y + b.h * fr[t];
       gb.boxWindows(x0 + inset, y, z0 + inset, x1 - inset, y1, z1 - inset, wall, roof, uOff, vOff);
-      if (b.style === 'artdeco') gb.boxPlain(x0 + inset - 0.4, y1 - 0.5, z0 + inset - 0.4, x1 - inset + 0.4, y1, z1 - inset + 0.4, roof);
+      if (b.style === 'artdeco' && t < TIERS - 1) gb.boxPlain(x0 + inset - 0.4, y1 - 0.5, z0 + inset - 0.4, x1 - inset + 0.4, y1, z1 - inset + 0.4, roof);
       y = y1;
       inset += Math.min(b.w, b.d) * 0.14;
     }
   } else if (m.kind === 'setback') {
-    gb.boxWindows(x0, BASE_Y, z0, x1, m.stepY, z1, wall, roof, uOff, vOff);
-    gb.boxWindows(m.tx0, m.stepY, m.tz0, m.tx1, b.h, m.tz1, wall, roof, uOff, vOff);
-    if (b.style === 'artdeco') {
-      gb.boxPlain(x0 - 0.4, m.stepY - 0.5, z0 - 0.4, x1 + 0.4, m.stepY, z1 + 0.4, roof);
-      gb.boxPlain(m.tx0 - 0.4, b.h - 0.5, m.tz0 - 0.4, m.tx1 + 0.4, b.h, m.tz1 + 0.4, roof);
-    }
+    gb.boxWindows(x0, y0, z0, x1, m.stepY, z1, wall, roof, uOff, vOff);
+    gb.boxWindows(m.tx0, m.stepY, m.tz0, m.tx1, topY, m.tz1, wall, roof, uOff, vOff);
+    if (b.style === 'artdeco') gb.boxPlain(x0 - 0.4, m.stepY - 0.5, z0 - 0.4, x1 + 0.4, m.stepY, z1 + 0.4, roof);
   } else if (m.kind === 'octagon') {
-    gb.boxWindows(x0, BASE_Y, z0, x1, PODIUM_H, z1, wall, roof, uOff, vOff);
+    gb.boxWindows(x0, y0, z0, x1, PODIUM_H, z1, wall, roof, uOff, vOff);
     const rx = (b.w / 2 - 0.4) / Math.cos(OCT), rz = (b.d / 2 - 0.4) / Math.cos(OCT);
-    gb.cylinder(b.x, b.z, rx, rz, PODIUM_H, b.h, 8, wall, true, roof, GLOW_U.none, OCT);
+    gb.cylinder(b.x, b.z, rx, rz, PODIUM_H, topY, 8, wall, true, roof, GLOW_U.none, OCT);
   } else if (m.kind === 'podium') {
-    gb.boxWindows(x0, BASE_Y, z0, x1, PODIUM_H, z1, wall, roof, uOff, vOff);
-    gb.boxWindows(m.tx0, PODIUM_H, m.tz0, m.tx1, b.h, m.tz1, wall, roof, uOff, vOff);
+    gb.boxWindows(x0, y0, z0, x1, PODIUM_H, z1, wall, roof, uOff, vOff);
+    gb.boxWindows(m.tx0, PODIUM_H, m.tz0, m.tx1, topY, m.tz1, wall, roof, uOff, vOff);
   } else {
-    gb.boxWindows(x0, BASE_Y, z0, x1, b.h, z1, wall, roof, uOff, vOff);
-    if (b.style === 'artdeco') gb.boxPlain(x0 - 0.4, b.h - 0.5, z0 - 0.4, x1 + 0.4, b.h, z1 + 0.4, roof);
+    // Twin towers keep their full-height base box: the chamfer sits on the top tier built by the detail pass.
+    gb.boxWindows(x0, y0, z0, x1, m.kind === 'twin' ? b.h : topY, z1, wall, roof, uOff, vOff);
     if (b.roofKind === 'spire') {
       const in2 = Math.min(b.w, b.d) * 0.2;
       gb.pyramid(x0 + in2, z0 + in2, x1 - in2, z1 - in2, b.h, b.h + Math.max(4, b.h * 0.18), darken(b.accent, 0.8));
@@ -519,7 +630,8 @@ export const BAND = { shopH: SHOP_BAND_H, shopTile: SHOP_TILE_W, shopOut: 0.16, 
 
 const FACE_DIR: [number, number][] = [[0, 1], [1, 0], [0, -1], [-1, 0]];
 const FACE_YAW = [0, Math.PI / 2, Math.PI, -Math.PI / 2];
-const AWNING_COLORS: [number, number][] = [[0xd83b46, 0xf0e6d8], [0x1f7a5a, 0xf0e6d8], [0x2a5aa8, 0xf0e6d8], [0xe07a1f, 0x3a2a20], [0x8a2f70, 0xf0e6d8]];
+/** Awning tints multiplied into the two-tone canvas (cream / mid grey stripes): a saturated hue gives colour / dark stripes. */
+const AWNING_COLORS = [0xe0484f, 0x2a9a6e, 0x3a70c8, 0xf0902a, 0xa04a8a, 0xe8e0d0];
 
 /** Nearest glow-atlas cell for an accent color (used by crowns and neon fins). */
 function glowCellFor(color: number): number {
@@ -531,52 +643,112 @@ function glowCellFor(color: number): number {
   return GLOW_U.orange;
 }
 
+/** Height of a building's ground-floor band (band texture height, clamped for very low buildings). */
+export function bandHeight(b: Building, plinthStyle: boolean): number {
+  return Math.min(plinthStyle ? BAND.plinthH : BAND.shopH, Math.max(3, b.h - 2.5));
+}
+
+/** Arcade geometry: the shopfront band steps back behind a row of columns standing on the wall line. */
+export const ARCADE = { recess: 0.35, colW: 0.5, bay: SHOP_TILE_W / 4, awningRepeat: 4 } as const;
+
 /**
- * Ground floor: a band in front of the wall (shopfront glazing or downtown stone plinth) plus a cornice cap in the
- * building mesh, and fabric awnings over the shop bays on the street-facing side.
+ * Face-local frame of building face `f`: start point (sx, sz), unit tangent (tx, tz) running the way the face's u
+ * runs (boxWindows / bandBox convention), outward normal (nx, nz) and the face length. Bays and window columns start
+ * at s = 0 from here whatever the per-building UV offset (offsets are whole cells).
  */
-export function appendStreetLevel(styleGb: GeoBuilder, bandGb: GeoBuilder, b: Building, rng: Random, plinthStyle: boolean): void {
+interface FaceFrame { sx: number; sz: number; tx: number; tz: number; nx: number; nz: number; len: number }
+const faceOut: FaceFrame = { sx: 0, sz: 0, tx: 0, tz: 0, nx: 0, nz: 0, len: 0 };
+function faceFrame(x0: number, z0: number, x1: number, z1: number, f: number): FaceFrame {
+  const o = faceOut;
+  if (f === 0) { o.sx = x0; o.sz = z1; o.tx = 1; o.tz = 0; o.nx = 0; o.nz = 1; o.len = x1 - x0; }
+  else if (f === 1) { o.sx = x1; o.sz = z1; o.tx = 0; o.tz = -1; o.nx = 1; o.nz = 0; o.len = z1 - z0; }
+  else if (f === 2) { o.sx = x1; o.sz = z0; o.tx = -1; o.tz = 0; o.nx = 0; o.nz = -1; o.len = x1 - x0; }
+  else { o.sx = x0; o.sz = z0; o.tx = 0; o.tz = 1; o.nx = -1; o.nz = 0; o.len = z1 - z0; }
+  return o;
+}
+
+/**
+ * Box stuck to face `f`: along the face from s0 to s1, from `in_` behind the wall to `out` in front of it, y0..y1.
+ * `mask` names the faces in face-local terms (FACE.pz = front, FACE.nz = back, px/nx = the two ends, top, bot).
+ */
+function faceBox(gb: GeoBuilder, fr: FaceFrame, s0: number, s1: number, y0: number, y1: number, in_: number, out: number, color: number, mask: number, f: number): void {
+  const ax = fr.sx + fr.tx * s0 - fr.nx * in_, az = fr.sz + fr.tz * s0 - fr.nz * in_;
+  const bx = fr.sx + fr.tx * s1 + fr.nx * out, bz = fr.sz + fr.tz * s1 + fr.nz * out;
+  // Rotate the local mask into world faces: front = this face, back = the opposite one, ends = the neighbours.
+  let m = mask & (FACE.top | FACE.bot);
+  if (mask & FACE.pz) m |= FACE_BIT[f];
+  if (mask & FACE.nz) m |= FACE_BIT[(f + 2) % 4];
+  if (mask & FACE.px) m |= FACE_BIT[(f + 1) % 4];
+  if (mask & FACE.nx) m |= FACE_BIT[(f + 3) % 4];
+  gb.boxFaces(Math.min(ax, bx), y0, Math.min(az, bz), Math.max(ax, bx), y1, Math.max(az, bz), color, m);
+}
+
+/**
+ * Ground floor. Downtown: a stone plinth band in front of the wall under a cornice cap. Shops: the glazed band steps
+ * back ARCADE.recess behind the wall line and a row of columns (every shop bay, on the faces that hold a street)
+ * stands in front of it under the cap's soffit, so the ground floor is an arcade with real shadow; a striped canvas
+ * awning (its own builder, Materials.awning: u along the span, v down the drop) hangs over the street-facing bays.
+ * `streetMask` = bits of the faces (FACE_BIT order) that see a street; hidden faces get no columns.
+ */
+export function appendStreetLevel(styleGb: GeoBuilder, bandGb: GeoBuilder, b: Building, rng: Random, plinthStyle: boolean, awningGb: GeoBuilder | null = null, streetMask = 15): void {
   const out = plinthStyle ? BAND.plinthOut : BAND.shopOut;
   const tile = plinthStyle ? BAND.plinthTile : BAND.shopTile;
-  const h = Math.min(plinthStyle ? BAND.plinthH : BAND.shopH, Math.max(3, b.h - 2.5));
-  const x0 = b.x - b.w / 2 - out, x1 = b.x + b.w / 2 + out, z0 = b.z - b.d / 2 - out, z1 = b.z + b.d / 2 + out;
+  const h = bandHeight(b, plinthStyle);
+  const wx0 = b.x - b.w / 2, wx1 = b.x + b.w / 2, wz0 = b.z - b.d / 2, wz1 = b.z + b.d / 2;
+  const rec = plinthStyle ? -out : ARCADE.recess;
+  const x0 = wx0 + rec, x1 = wx1 - rec, z0 = wz0 + rec, z1 = wz1 - rec;
   // Slight tint from the building color so blocks do not all share one shopfront hue.
   const tintK = plinthStyle ? 0.62 : 0.78;
   bandGb.bandBox(x0, 0, z0, x1, h, z1, tile, lighten(b.color, tintK));
-  // Cornice capping the band (also hides the step back to the wall).
+  // Cornice capping the band (also hides the step back to the wall); its underside is the arcade soffit.
   const cap = lighten(b.color, plinthStyle ? 0.3 : 0.55);
-  styleGb.boxPlain(x0 - 0.18, h - 0.32, z0 - 0.18, x1 + 0.18, h + 0.16, z1 + 0.18, cap);
+  const cx0 = wx0 - out - 0.18, cx1 = wx1 + out + 0.18, cz0 = wz0 - out - 0.18, cz1 = wz1 + out + 0.18;
+  styleGb.boxPlain(cx0, h - 0.32, cz0, cx1, h + 0.16, cz1, cap, !plinthStyle);
   if (plinthStyle) return;
+  // Arcade columns: a square pier on every corner that touches a street, a slimmer one per shop bay along each
+  // street face, all from the pavement up into the cap. Front and end faces only — the back stands in the band.
+  const col = darken(cap, 0.9), cw = ARCADE.colW, yTop = h - 0.3;
+  const corner = (f: number, g: number): boolean => ((streetMask >> f) & 1) === 1 || ((streetMask >> g) & 1) === 1;
+  if (corner(0, 1)) styleGb.boxFaces(wx1 - rec - 0.1, 0, wz1 - rec - 0.1, wx1 + out, yTop, wz1 + out, col, FACE.sides);
+  if (corner(1, 2)) styleGb.boxFaces(wx1 - rec - 0.1, 0, wz0 - out, wx1 + out, yTop, wz0 + rec + 0.1, col, FACE.sides);
+  if (corner(2, 3)) styleGb.boxFaces(wx0 - out, 0, wz0 - out, wx0 + rec + 0.1, yTop, wz0 + rec + 0.1, col, FACE.sides);
+  if (corner(3, 0)) styleGb.boxFaces(wx0 - out, 0, wz1 - rec - 0.1, wx0 + rec + 0.1, yTop, wz1 + out, col, FACE.sides);
+  for (let f = 0; f < 4; f++) {
+    if (((streetMask >> f) & 1) === 0) continue;
+    const fr = faceFrame(wx0, wz0, wx1, wz1, f);
+    // Bay lines of the recessed band start `rec` in from the wall's corner.
+    for (let s = rec + ARCADE.bay; s < fr.len - rec - 1.5; s += ARCADE.bay) {
+      faceBox(styleGb, fr, s - cw / 2, s + cw / 2, 0, yTop, rec - 0.02, out, col, FACE.pz | FACE.px | FACE.nx, f);
+    }
+  }
+  if (!awningGb) return;
   const face = b.facing;
   const along = face === 0 || face === 2 ? b.w : b.d;
   if (along < 6) return;
-  const dir = FACE_DIR[face];
-  const nx = dir[0], nz = dir[1];
-  const tx = nz, tz = -nx;
-  const wall = (face === 0 || face === 2 ? b.d : b.w) / 2 + out;
+  const fr = faceFrame(wx0, wz0, wx1, wz1, face);
   const pal = AWNING_COLORS[rng.int(0, AWNING_COLORS.length - 1)];
-  const segs = 4;
-  const yTop = h - 0.85, yOut = yTop - 0.5, depth = 1.35, hang = 0.42;
-  const span = along - 1.2;
-  const px = (t: number, o: number): number => b.x + tx * t + nx * o;
-  const pz = (t: number, o: number): number => b.z + tz * t + nz * o;
+  const yTopA = h - 0.85, yOut = yTopA - 0.5, depth = 1.35, hang = 0.42;
+  const s0 = 0.6, s1 = fr.len - 0.6;
+  const px = (t: number, o: number): number => fr.sx + fr.tx * t + fr.nx * o;
+  const pz = (t: number, o: number): number => fr.sz + fr.tz * t + fr.nz * o;
   // Fabric in open air over the door: the ground occlusion ramp does not apply to it.
-  const ao = styleGb.bakeAo;
-  styleGb.bakeAo = false;
-  for (let i = 0; i < segs; i++) {
-    const t0 = -span / 2 + (span * i) / segs, t1 = -span / 2 + (span * (i + 1)) / segs;
-    const c = i % 2 === 0 ? pal[0] : pal[1];
-    styleGb.plainQuad(px(t0, wall), yTop, pz(t0, wall), px(t1, wall), yTop, pz(t1, wall),
-      px(t1, wall + depth), yOut, pz(t1, wall + depth), px(t0, wall + depth), yOut, pz(t0, wall + depth), c, true);
-    styleGb.plainQuad(px(t0, wall + depth), yOut, pz(t0, wall + depth), px(t1, wall + depth), yOut, pz(t1, wall + depth),
-      px(t1, wall + depth), yOut - hang, pz(t1, wall + depth), px(t0, wall + depth), yOut - hang, pz(t0, wall + depth), c, true);
-  }
-  styleGb.bakeAo = ao;
+  const ao = awningGb.bakeAo;
+  awningGb.bakeAo = false;
+  awningGb.setColor(pal);
+  const u0 = s0 / ARCADE.awningRepeat, u1 = s1 / ARCADE.awningRepeat;
+  const slope = Math.hypot(depth, yTopA - yOut), total = slope + hang;
+  const vMid = hang / total;
+  // Slope (normal up and out), then the valance hanging from its outer edge (normal out).
+  awningGb.texQuad(px(s0, out), yTopA, pz(s0, out), px(s1, out), yTopA, pz(s1, out), px(s1, out + depth), yOut, pz(s1, out + depth), px(s0, out + depth), yOut, pz(s0, out + depth),
+    u0, 1, u1, 1, u1, vMid, u0, vMid);
+  awningGb.texQuad(px(s0, out + depth), yOut, pz(s0, out + depth), px(s1, out + depth), yOut, pz(s1, out + depth), px(s1, out + depth), yOut - hang, pz(s1, out + depth), px(s0, out + depth), yOut - hang, pz(s0, out + depth),
+    u0, vMid, u1, vMid, u1, 0, u0, 0);
+  awningGb.bakeAo = ao;
 }
 
-/** Coping band around a roof edge: 0.3 m overhang, 0.6 m deep, a shade darker than the wall so the roofline reads as a solid edge. */
+/** Roof-edge cornice: a two-step profile (0.15 m fillet under a 0.35 m slab) a shade darker than the wall so the roofline reads as a solid edge. */
 function parapetBand(gb: GeoBuilder, x0: number, z0: number, x1: number, z1: number, top: number, wall: number): void {
-  gb.boxPlain(x0 - 0.3, top - 0.6, z0 - 0.3, x1 + 0.3, top - 0.02, z1 + 0.3, darken(wall, 0.85));
+  gb.cornice(x0, z0, x1, z1, top - 0.02, 0.15, 0.3, 0.35, 0.35, darken(wall, 0.85));
 }
 
 /** Low parapet walls standing on the coping: one hollow frame (skipped on tiny roofs and on roofs too low to be seen). */
@@ -593,13 +765,31 @@ function plantBox(gb: GeoBuilder, x0: number, y0: number, z0: number, x1: number
   gb.boxPlain(x0 - o, ya - 0.1, z0 - o, x1 + o, ya + 0.1, z1 + o, slat);
 }
 
+/** Window sill heights (world y) of the facade texture on a wall with UV offset vOff, between ya and yb, written to `out`; returns the count. */
+function sillRows(style: BuildingStyle, vOff: number, ya: number, yb: number, out: number[]): number {
+  // Window bottom as a fraction of the row from the row's top (TextureFactory.windows: wy + wh per style).
+  const wyh = style === 'glass' ? 0.76 : style === 'concrete' ? 0.72 : style === 'artdeco' ? 0.8 : style === 'neon' ? 0.7 : 0.7;
+  let n = 0;
+  const kMin = Math.floor((ya / WINDOW_TILE_H + vOff) / ROW_V) - 1, kMax = Math.ceil((yb / WINDOW_TILE_H + vOff) / ROW_V) + 1;
+  for (let k = kMin; k <= kMax; k++) {
+    const r = ((k % 8) + 8) % 8, tileN = (k - r) / 8;
+    // Row r counts up from the bottom of the tile; the sill sits (1 - wyh) of a row above the row's bottom.
+    const y = ((tileN + r * ROW_V + (1 - wyh) * ROW_V) - vOff) * WINDOW_TILE_H;
+    if (y >= ya && y <= yb) out[n++] = y;
+  }
+  return n;
+}
+const sillScratch: number[] = [];
+
 /**
- * Roof clutter, parapets, pilasters, ledges, crowns and blank-wall sign panels for one building. Textured tiers,
- * facade dressing and sign panels go to `gb` (the building's style mesh, casts shadows); parapets, roof clutter
- * and crowns go to `trim` (one city-wide plain mesh that stays out of the shadow pass — nothing on a roof throws a
- * shadow the street can see). Glow parts of both land in whatever glow sink the builders share.
+ * Roof clutter, parapets, ledges, piers, balconies, crowns and blank-wall sign panels for one building. Textured
+ * tiers, facade relief and sign panels go to `gb` (the building's style mesh, casts shadows); cornices, roof clutter
+ * and crown trim go to `trim` (one city-wide plain mesh that stays out of the shadow pass — nothing on a roof
+ * throws a shadow the street can see). Glow parts of both land in whatever glow sink the builders share.
+ * `streetMask` = faces that see a street (FACE_BIT order; relief goes only there), `bandTop` = height of the
+ * ground-floor band the relief must clear (0 without one).
  */
-export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Building, rng: Random, signs: WallSign[]): void {
+export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Building, rng: Random, signs: WallSign[], streetMask = 15, bandTop = 0): void {
   const x0 = b.x - b.w / 2, x1 = b.x + b.w / 2, z0 = b.z - b.d / 2, z1 = b.z + b.d / 2;
   const roof = darken(b.color, ROOF_DARKEN);
   const wall = lighten(b.color, WALL_LIGHTEN);
@@ -613,6 +803,8 @@ export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Buildi
   const alongX = b.facing === 0 || b.facing === 2;
   const cap = lighten(b.color, 0.28);
   const ph = downtown ? 1.05 : 0.8;
+  const crown = hasCrown(b, top);
+  const topY = crown ? top - CHAMFER_H : top;
 
   // --- Massing extras stacked on the base box --------------------------------------------------
   if (kind === 'twin') {
@@ -623,7 +815,7 @@ export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Buildi
     gb.boxWindows(mm.tx0, h, mm.tz0, mm.tx1, t1, mm.tz1, wall, roof, uOff, vOff);
     parapetBand(trim, mm.tx0, mm.tz0, mm.tx1, mm.tz1, t1, wall);
     twinRect(b, 2, mm);
-    gb.boxWindows(mm.tx0, t1, mm.tz0, mm.tx1, top, mm.tz1, wall, roof, uOff, vOff);
+    gb.boxWindows(mm.tx0, t1, mm.tz0, mm.tx1, topY, mm.tz1, wall, roof, uOff, vOff);
     rx0 = mm.tx0; rx1 = mm.tx1; rz0 = mm.tz0; rz1 = mm.tz1;
   } else if (kind === 'box' && roofVariant === 1 && b.w > 10 && b.d > 10 && b.roofKind === 'flat') {
     // Raised street-side wing: 55% of the frontage x 45% of the depth climbs two more floors, so the plan reads as an L.
@@ -651,31 +843,58 @@ export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Buildi
     parapetWalls(trim, x0, z0, x1, z1, h, ph, cap);
     if (b.facing === 0) rz0 = pz0 + pd; else if (b.facing === 2) rz1 = pz0; else if (b.facing === 1) rx0 = px0 + pw; else rx1 = px0;
   } else if (kind === 'octagon') {
-    // Chamfered shaft: a coping ring on the podium edge and on the shaft top.
+    // Chamfered shaft: a coping ring on the podium edge; the crown handles the shaft top.
     parapetBand(trim, x0, z0, x1, z1, PODIUM_H, wall);
     const rx = (b.w / 2 - 0.4) / Math.cos(OCT), rz = (b.d / 2 - 0.4) / Math.cos(OCT);
-    trim.cylinder(b.x, b.z, rx + 0.3, rz + 0.3, h - 0.6, h - 0.02, 8, darken(wall, 0.85), false, darken(wall, 0.85), GLOW_U.none, OCT);
+    if (!crown) trim.cylinder(b.x, b.z, rx + 0.3, rz + 0.3, h - 0.6, h - 0.02, 8, darken(wall, 0.85), false, darken(wall, 0.85), GLOW_U.none, OCT);
     const k = 0.62;
     rx0 = b.x - (b.w / 2) * k; rx1 = b.x + (b.w / 2) * k; rz0 = b.z - (b.d / 2) * k; rz1 = b.z + (b.d / 2) * k;
   } else if (kind === 'podium') {
     parapetBand(trim, x0, z0, x1, z1, PODIUM_H, wall);
     parapetWalls(trim, x0, z0, x1, z1, PODIUM_H, ph, cap);
-    parapetBand(trim, rx0, rz0, rx1, rz1, h, wall);
+    if (!crown) parapetBand(trim, rx0, rz0, rx1, rz1, h, wall);
   } else if (kind === 'setback') {
     parapetBand(trim, x0, z0, x1, z1, stepY, wall);
-    parapetBand(trim, rx0, rz0, rx1, rz1, h, wall);
-    parapetWalls(trim, rx0, rz0, rx1, rz1, h, ph, cap);
-  } else if (b.roofKind !== 'spire') {
+    if (!crown) { parapetBand(trim, rx0, rz0, rx1, rz1, h, wall); parapetWalls(trim, rx0, rz0, rx1, rz1, h, ph, cap); }
+  } else if (b.roofKind !== 'spire' && !crown) {
     parapetBand(trim, rx0, rz0, rx1, rz1, top, wall);
     parapetWalls(trim, rx0, rz0, rx1, rz1, top, ph, cap);
   }
-  const rw = rx1 - rx0, rd = rz1 - rz0;
-  const crown = top > 42 && b.roofKind !== 'spire';
+  let rw = rx1 - rx0, rd = rz1 - rz0;
 
-  // --- Roof clutter (one or two pieces; roofs under CLUTTER_MIN_H are never seen from the street) ----------------
+  // --- Crown: chamfered corners over a cornice, plant room and mast ------------------------------
+  if (crown) {
+    // The top CHAMFER_H metres of the shaft are cut back at 45 degrees (a lighter wall tint on the slopes), with a
+    // two-step cornice and a darker string band at the foot of the cut. No saturated accent band: only the neon
+    // style keeps a glowing strip there.
+    const slope = lighten(b.color, 0.42), band = darken(wall, 0.72);
+    if (kind === 'octagon') {
+      const rx = (b.w / 2 - 0.4) / Math.cos(OCT), rz = (b.d / 2 - 0.4) / Math.cos(OCT);
+      gb.frustum(b.x, b.z, rx, rz, rx - CHAMFER_H, rz - CHAMFER_H, topY, top, 8, slope, roof, OCT);
+      trim.cylinder(b.x, b.z, rx + 0.35, rz + 0.35, topY - 0.45, topY, 8, darken(wall, 0.85), false, darken(wall, 0.85), GLOW_U.none, OCT);
+      trim.cylinder(b.x, b.z, rx + 0.2, rz + 0.2, topY - 1.2, topY - 0.55, 8, b.style === 'neon' ? b.neonColor : band, false, null, b.style === 'neon' ? glowCellFor(b.neonColor) : GLOW_U.none, OCT);
+      rx0 += CHAMFER_H * 0.6; rx1 -= CHAMFER_H * 0.6; rz0 += CHAMFER_H * 0.6; rz1 -= CHAMFER_H * 0.6;
+    } else {
+      gb.chamferTop(rx0, rz0, rx1, rz1, topY, top, CHAMFER_H, slope, roof);
+      parapetBand(trim, rx0, rz0, rx1, rz1, topY, wall);
+      if (b.style === 'neon') trim.boxPlain(rx0 - 0.25, topY - 1.2, rz0 - 0.25, rx1 + 0.25, topY - 0.7, rz1 + 0.25, b.neonColor, false, glowCellFor(b.neonColor));
+      else trim.boxFaces(rx0 - 0.2, topY - 1.2, rz0 - 0.2, rx1 + 0.2, topY - 0.7, rz1 + 0.2, band, FACE.sides);
+      rx0 += CHAMFER_H; rx1 -= CHAMFER_H; rz0 += CHAMFER_H; rz1 -= CHAMFER_H;
+    }
+    rw = rx1 - rx0; rd = rz1 - rz0;
+    const mw = rw * 0.4, md = rd * 0.4, mx = (rx0 + rx1) / 2, mz = (rz0 + rz1) / 2;
+    if (mw > 3 && md > 3) plantBox(trim, mx - mw / 2, top, mz - md / 2, mx + mw / 2, top + 4, mz + md / 2, darken(b.color, 0.7));
+    if (b.id % 4 === 2) {
+      const sh = Math.max(10, top * 0.14);
+      trim.bar(mx, top + 4, mz, mx, top + 4 + sh, mz, 0.7, 0xb0b4ba);
+      trim.bar(mx, top + 4 + sh, mz, mx, top + 4 + sh + 3, mz, 0.3, 0xd0d4da);
+      trim.boxPlain(mx - 0.25, top + 6.9 + sh, mz - 0.25, mx + 0.25, top + 7.5 + sh, mz + 0.25, 0xff2418, false, GLOW_U.red);
+    }
+  }
+
+  // --- Roof clutter (one piece; roofs under CLUTTER_MIN_H are never seen from the street) ----------------
   if (b.roofKind !== 'spire' && rw > 9 && rd > 9 && !crown && top >= CLUTTER_MIN_H) {
-    const n = rng.int(1, 2);
-    for (let i = 0; i < n; i++) {
+    {
       const cx = rng.range(rx0 + 2.2, rx1 - 2.2), cz = rng.range(rz0 + 2.2, rz1 - 2.2);
       const kindR = rng.int(0, 3);
       if (kindR === 0) {
@@ -695,12 +914,12 @@ export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Buildi
       }
     }
   }
-  // Plant / AC enclosure on one roof in three.
-  if (b.roofKind !== 'spire' && rw > 8 && rd > 8 && !crown && top >= CLUTTER_MIN_H && rng.chance(1 / 3)) {
+  // Plant / AC enclosure on one roof in four.
+  if (b.roofKind !== 'spire' && rw > 8 && rd > 8 && !crown && top >= CLUTTER_MIN_H && rng.chance(1 / 4)) {
     const cx = rng.range(rx0 + 2.5, rx1 - 2.5), cz = rng.range(rz0 + 2.2, rz1 - 2.2);
     plantBox(trim, cx - 1.5, top, cz - 1.25, cx + 1.5, top + 2, cz + 1.25, 0x9a948c);
   }
-  if (top > 26 && top <= 42 && b.roofKind !== 'spire' && rng.chance(0.5)) {
+  if (top > 26 && top <= CROWN_MIN_H && b.roofKind !== 'spire' && rng.chance(0.5)) {
     const ax = (rx0 + rx1) / 2 + rng.range(-rw * 0.22, rw * 0.22), az = (rz0 + rz1) / 2 + rng.range(-rd * 0.22, rd * 0.22);
     const mastTop = top + rng.range(5, 13);
     trim.bar(ax, top, az, ax, mastTop, az, 0.34, 0xb0b4ba);
@@ -711,45 +930,65 @@ export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Buildi
     trim.boxPlain(ax - 0.2, mastTop, az - 0.2, ax + 0.2, mastTop + 0.55, az + 0.2, 0xff2418, false, GLOW_U.red);
   }
 
-  // --- Facade dressing --------------------------------------------------------------------------
-  if (downtown && kind === 'box' && b.roofKind === 'flat' && h >= 26) {
-    // Vertical pilaster strips running the full shaft.
-    const yb = BAND.plinthH + 0.3, yt = h - 1.4, t = 0.3, hw = 0.6, col = lighten(b.color, 0.5);
-    if (yt > yb + 4) {
-      const nX = Math.min(3, Math.max(1, Math.round(b.w / 8) - 1));
-      for (let i = 1; i <= nX; i++) {
-        const px = x0 + (b.w * i) / (nX + 1);
-        gb.boxPlain(px - hw, yb, z0 - t, px + hw, yt, z0, col);
-        gb.boxPlain(px - hw, yb, z1, px + hw, yt, z1 + t, col);
+  // --- Facade relief on the faces that see a street ---------------------------------------------
+  // Relief runs on the full-footprint walls from above the ground-floor band to under the roof edge.
+  const yBase = bandTop > 0 ? bandTop + 0.3 : 0.4;
+  const yTop = Math.min(wallTop, topY) - 0.9;
+  const relief = downtown || b.style === 'glass' || b.style === 'concrete';
+  if (relief && yTop > yBase + 3 && streetMask !== 0) {
+    // Spandrel ledge under every window row (0.12 m proud, 0.25 m tall: front and underside, the top is a sliver only
+    // a roof camera sees) and a pier strip on every bay line (0.18 m proud: front and both flanks). The ledge passes
+    // behind the piers.
+    // Tints stay close to the wall (a chalk-white strip on dark glass read as a toy): the relief comes from the shadow.
+    const glass = b.style === 'glass';
+    const ledCol = lighten(b.color, glass ? 0.2 : 0.34), pierCol = lighten(b.color, glass ? 0.12 : 0.26);
+    const nS = sillRows(b.style, vOff, yBase + 0.3, yTop, sillScratch);
+    for (let f = 0; f < 4; f++) {
+      if (((streetMask >> f) & 1) === 0) continue;
+      const fr = faceFrame(x0, z0, x1, z1, f);
+      if (fr.len < 6) continue;
+      for (let i = 0; i < nS; i++) {
+        const ys = sillScratch[i];
+        faceBox(gb, fr, 0, fr.len, ys - 0.25, ys, 0, 0.12, ledCol, FACE.pz | FACE.bot, f);
       }
-      const nZ = Math.min(3, Math.max(1, Math.round(b.d / 8) - 1));
-      for (let i = 1; i <= nZ; i++) {
-        const pz = z0 + (b.d * i) / (nZ + 1);
-        gb.boxPlain(x0 - t, yb, pz - hw, x0, yt, pz + hw, col);
-        gb.boxPlain(x1, yb, pz - hw, x1 + t, yt, pz + hw, col);
+      for (let s = BAY_W; s < fr.len - 1; s += BAY_W) {
+        faceBox(gb, fr, s - 0.25, s + 0.25, yBase, yTop, 0, 0.18, pierCol, FACE.pz | FACE.px | FACE.nx, f);
+      }
+    }
+    // Tower shafts standing on a podium / setback keep the piers (no ledges: the shaft is seen from far below).
+    if ((kind === 'podium' || kind === 'setback') && topY - stepY > 8) {
+      const sy0 = stepY + 1.2, sy1 = topY - 0.9;
+      for (let f = 0; f < 4; f++) {
+        if (((streetMask >> f) & 1) === 0) continue;
+        const fr = faceFrame(mm.tx0, mm.tz0, mm.tx1, mm.tz1, f);
+        for (let s = BAY_W; s < fr.len - 1; s += BAY_W) {
+          faceBox(gb, fr, s - 0.25, s + 0.25, sy0, sy1, 0, 0.18, pierCol, FACE.pz | FACE.px | FACE.nx, f);
+        }
       }
     }
   }
-  if (crown) {
-    // Crown: a 1.2 m overhanging slab under the roof edge, a 1.4 m accent band that glows at night (taller bands bloom
-    // into slabs from across the city), a mechanical
-    // penthouse with a louvre screen on the roof, and a spire on one tower in four.
-    const slab = lighten(b.color, 0.32), accent = darken(b.accent, 0.72), glow = glowCellFor(b.accent);
-    if (kind === 'octagon') {
-      const rx = (b.w / 2 - 0.4) / Math.cos(OCT), rz = (b.d / 2 - 0.4) / Math.cos(OCT);
-      trim.cylinder(b.x, b.z, rx + 1.2, rz + 1.2, top - 1.1, top - 0.02, 8, slab, false, slab, GLOW_U.none, OCT);
-      trim.cylinder(b.x, b.z, rx + 0.5, rz + 0.5, top - 2.5, top - 1.1, 8, accent, false, null, glow, OCT);
-    } else {
-      trim.boxPlain(rx0 - 1.2, top - 1.1, rz0 - 1.2, rx1 + 1.2, top - 0.02, rz1 + 1.2, slab);
-      trim.boxPlain(rx0 - 0.5, top - 2.5, rz0 - 0.5, rx1 + 0.5, top - 1.1, rz1 + 0.5, accent, false, glow);
-    }
-    const mw = rw * 0.4, md = rd * 0.4, mx = (rx0 + rx1) / 2, mz = (rz0 + rz1) / 2;
-    if (mw > 3 && md > 3) plantBox(trim, mx - mw / 2, top, mz - md / 2, mx + mw / 2, top + 4, mz + md / 2, darken(b.color, 0.7));
-    if (b.id % 4 === 2) {
-      const sh = Math.max(10, top * 0.14);
-      trim.bar(mx, top + 4, mz, mx, top + 4 + sh, mz, 0.7, 0xb0b4ba);
-      trim.bar(mx, top + 4 + sh, mz, mx, top + 4 + sh + 3, mz, 0.3, 0xd0d4da);
-      trim.boxPlain(mx - 0.25, top + 6.9 + sh, mz - 0.25, mx + 0.25, top + 7.5 + sh, mz + 0.25, 0xff2418, false, GLOW_U.red);
+  if (b.style === 'residential' && yTop > yBase + 3 && streetMask !== 0) {
+    // Balcony on every other window of the rows where the texture paints a rail: a slab under the window (front and
+    // underside) with a thin parapet panel on its front edge (both faces); the slivers on top are never seen.
+    const slab = lighten(b.color, 0.45), rail = darken(b.color, 0.75);
+    const bw = 1.6, bd = 0.42, bt = 0.12, rh = 0.95;
+    const nS = sillRows(b.style, vOff, yBase + 0.4, yTop, sillScratch);
+    // Street-facing wall only: the side walls keep the painted rails (a balcony every other bay on every face
+    // doubled the residential mesh).
+    const f = b.facing;
+    if (((streetMask >> f) & 1) === 1) {
+      const fr = faceFrame(x0, z0, x1, z1, f);
+      for (let i = 0; i < nS; i++) {
+        // Rows with painted rails alternate; sillRows lists rows bottom-up so the parity is stable per building.
+        if ((i + (b.id & 1)) % 2 === 1) continue;
+        const ys = sillScratch[i] - 0.1;
+        for (let c = (f & 1); ; c += 2) {
+          const sc = c * BAY_W + BAY_W / 2;
+          if (sc + bw / 2 > fr.len - 0.3) break;
+          faceBox(gb, fr, sc - bw / 2, sc + bw / 2, ys - bt, ys, 0, bd, slab, FACE.pz | FACE.bot, f);
+          faceBox(gb, fr, sc - bw / 2, sc + bw / 2, ys, ys + rh, -bd + 0.06, bd, rail, FACE.pz | FACE.nz, f);
+        }
+      }
     }
   }
   if (b.style === 'artdeco' && !downtown) {
@@ -777,9 +1016,9 @@ export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Buildi
     const ez = dir[1] !== 0 ? 0.45 : (b.d / 2) * 0.55;
     gb.boxPlain(fx - Math.max(0.3, ex * 0.12), BAND.shopH + 1, fz - Math.max(0.3, ez * 0.12), fx + Math.max(0.3, ex * 0.12), wallTop - 1, fz + Math.max(0.3, ez * 0.12), b.neonColor, false, glowCellFor(b.neonColor));
   }
-  if (b.style === 'residential' || b.style === 'concrete') {
-    // A string course splitting the facade, plus a chimney-ish vent block.
-    if (wallTop > 13) gb.boxPlain(x0 - 0.35, wallTop * 0.5, z0 - 0.35, x1 + 0.35, wallTop * 0.5 + 0.3, z1 + 0.35, lighten(b.color, 0.45));
+  if (b.style === 'residential' && wallTop > 13) {
+    // A string course splitting the facade.
+    gb.boxPlain(x0 - 0.35, wallTop * 0.5, z0 - 0.35, x1 + 0.35, wallTop * 0.5 + 0.3, z1 + 0.35, lighten(b.color, 0.45));
   }
 
   // --- Blank side wall with a big painted sign ---------------------------------------------------

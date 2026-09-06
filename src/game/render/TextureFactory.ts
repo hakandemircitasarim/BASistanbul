@@ -6,7 +6,7 @@ import { Random } from '../core/Random';
 export interface WindowTextures { map: THREE.CanvasTexture; emissive: THREE.CanvasTexture; normal: THREE.CanvasTexture; rough: THREE.CanvasTexture }
 export interface AtlasRect { u0: number; v0: number; u1: number; v1: number }
 
-/** Window tile: 512x1024 px = 16 m x 28 m; the top ROOF_STRIP px (v > 0.98) are a plain wall color used by roofs and plain parts. */
+/** Window tile: 16 m x 28 m, drawn in a 1024 x 2048 design space (1024 x 1024 for the curtain-wall styles); the top ROOF_STRIP_PX of every WINDOW_TILE_PX_H (v > 0.98) are a plain wall color used by roofs and plain parts. */
 export const WINDOW_TILE_W = 16;
 export const WINDOW_TILE_H = 28;
 export const WINDOW_TILE_PX_H = 1024;
@@ -17,7 +17,7 @@ export const ROOF_V = 1 - ROOF_STRIP_PX / 2 / WINDOW_TILE_PX_H;
 export const GLOW_U = { none: 0.0625, magenta: 0.1875, cyan: 0.3125, yellow: 0.4375, orange: 0.5625, red: 0.6875, green: 0.8125, white: 0.9375 } as const;
 const GLOW_CELLS: number[] = [0x000000, 0xff2d95, 0x00e5ff, 0xfff03b, 0xff7a00, 0xff2418, 0x2bff6a, 0xf0f4ff];
 export const ROAD_TILE_M = 14;
-/** Street-level band tiles: the ground-floor shopfront (beach/suburb) and the downtown stone plinth. u repeats every TILE_W m, v spans the band height exactly. */
+/** Street-level band tiles: the ground-floor shopfront (beach/suburb) and the downtown stone plinth. u repeats every TILE_W m, v spans the band height exactly. The shop tile carries a pier on every quarter (4 m), where BuildingGeometry's arcade columns stand. */
 export const SHOP_TILE_W = 16;
 export const SHOP_BAND_H = 4.2;
 export const PLINTH_TILE_W = 16;
@@ -397,9 +397,56 @@ export class TextureFactory {
   }
 
   /**
-   * Albedo + emissive window tiles for a building style. 4 columns x 8 rows per 16 m x 28 m tile; lit windows cluster
-   * per floor. 512 x 1024 px so mullions and blinds stay crisp at street level; the relief map is derived from a
-   * half-res copy and the roughness is painted directly (glazing smooth, render rough) instead of read from luminance.
+   * Soft-edged stroke: the body at alpha `a` plus a 1 px skirt at 40 %, so the edge lands between two texels and the
+   * mip chain averages it into a tone. A 1 px full-alpha highlight line survives three mip levels as a lone bright
+   * texel, which is the white sparkle every tower used to carry at 100-300 m.
+   */
+  private softRect(c: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, col: string, a: number): void {
+    c.fillStyle = col;
+    c.globalAlpha = a * 0.4;
+    c.fillRect(x - 1, y - 1, w + 2, h + 2);
+    c.globalAlpha = a;
+    c.fillRect(x, y, w, h);
+    c.globalAlpha = 1;
+  }
+
+  /** In-place wrapping 1 px soften ([1 2 1] / 4, separable) of a canvas' RGB, alpha untouched: every edge then sits between texels and mips average instead of sparkling. */
+  private soften(ctx: CanvasRenderingContext2D, W: number, H: number): void {
+    const img = ctx.getImageData(0, 0, W, H);
+    const s = img.data, t = new Uint8ClampedArray(s.length);
+    for (let y = 0; y < H; y++) {
+      const row = y * W;
+      for (let x = 0; x < W; x++) {
+        const l = (row + (x === 0 ? W - 1 : x - 1)) * 4, c = (row + x) * 4, rr = (row + (x === W - 1 ? 0 : x + 1)) * 4;
+        t[c] = (s[l] + 2 * s[c] + s[rr] + 2) >> 2;
+        t[c + 1] = (s[l + 1] + 2 * s[c + 1] + s[rr + 1] + 2) >> 2;
+        t[c + 2] = (s[l + 2] + 2 * s[c + 2] + s[rr + 2] + 2) >> 2;
+        t[c + 3] = s[c + 3];
+      }
+    }
+    for (let y = 0; y < H; y++) {
+      const up = (y === 0 ? H - 1 : y - 1) * W, dn = (y === H - 1 ? 0 : y + 1) * W, row = y * W;
+      for (let x = 0; x < W; x++) {
+        const u = (up + x) * 4, c = (row + x) * 4, d = (dn + x) * 4;
+        s[c] = (t[u] + 2 * t[c] + t[d] + 2) >> 2;
+        s[c + 1] = (t[u + 1] + 2 * t[c + 1] + t[d + 1] + 2) >> 2;
+        s[c + 2] = (t[u + 2] + 2 * t[c + 2] + t[d + 2] + 2) >> 2;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+
+  /**
+   * Albedo + emissive window tiles for a building style: 4 columns x 8 rows per 16 m x 28 m tile, drawn in one design
+   * space of 1024 x 2048 px (64 px/m, so a 4 m bay gets 256 px and a frame is a 4-6 px stroke rather than a smear).
+   * The punched-window styles keep that resolution; the curtain-wall styles (glass, neon: tall panes and vertical
+   * mullions, whose horizontal edges are long bands) drop to 1024 x 1024 through a scaled context. The emissive and
+   * roughness maps carry pane-sized shapes and are drawn at a quarter, the relief is derived from a half-res copy.
+   * No 1 px highlight survives: every lit edge is a 3 px feathered stroke and the albedo gets a 1 px soften before
+   * upload, so the lower mips average to a calm tone instead of the white sparkle of the old 1 px lines. Per cell
+   * the pane shows something different behind it (a blind at its own height, curtains, a dark or a cool room), a
+   * fifth of the sills carry an AC unit and the curtain walls carry a baked sky-to-slate reflection with a rooftop
+   * band, so a glass tower reads cyan / slate instead of navy plastic.
    */
   windows(style: BuildingStyle, seed = 1): WindowTextures {
     const key = `win:${style}:${seed}`;
@@ -408,26 +455,33 @@ export class TextureFactory {
     const nk = this.cache.get(key + ':nrm') as THREE.CanvasTexture | undefined;
     const rk = this.cache.get(key + ':rgh') as THREE.CanvasTexture | undefined;
     if (mk && ek && nk && rk) return { map: mk, emissive: ek, normal: nk, rough: rk };
-    // P = pixels per "design pixel": every hand-placed size below is written for the old 256 x 512 layout.
-    const W = 512, H = 1024, P = 2;
+    // Design space: 1024 x 2048 for the 16 m x 28 m tile. P = px per design px of the original 256 x 512 layout.
+    const W = 1024, H = 2048, P = 4;
+    const curtainWall = style === 'glass' || style === 'neon';
+    const mapH = curtainWall ? H / 2 : H;
     const rng = new Random(seed * 7919 + style.length);
-    // The emissive and roughness maps only carry pane-sized shapes, so both are drawn at half resolution (same
-    // coordinates, scaled context): that halves their memory without softening anything the eye can pick out.
-    const m = this.canvas(W, H), e = this.canvas(W / 2, H / 2), r = this.canvas(W / 2, H / 2);
-    e.ctx.scale(0.5, 0.5);
-    r.ctx.scale(0.5, 0.5);
+    const m = this.canvas(W, mapH), e = this.canvas(W / 4, H / 4), r = this.canvas(W / 4, H / 4);
+    // Structure canvas for the relief (half res): frames, sills, mullions, piers and spandrels as height steps, and
+    // nothing else - a relief derived from the albedo turned every reflection and blind into a bump.
+    const n = this.canvas(W / 2, mapH / 2);
+    if (curtainWall) m.ctx.scale(1, 0.5);
+    n.ctx.scale(0.5, curtainWall ? 0.25 : 0.5);
+    e.ctx.scale(0.25, 0.25);
+    r.ctx.scale(0.25, 0.25);
+    n.ctx.fillStyle = grey(0.5);
+    n.ctx.fillRect(0, 0, W, H);
     const wall = style === 'glass' ? 0x9fb4c8 : style === 'concrete' ? 0xb8b8b4 : style === 'artdeco' ? 0xd8d0c0 : style === 'neon' ? 0xe8e0e8 : 0xd4cfc4;
     m.ctx.fillStyle = hex(wall);
     m.ctx.fillRect(0, 0, W, H);
-    // Render / stucco: broad soft tonal patches plus a fine grain, instead of the 2 px speckle that read as static.
-    this.mottle(m.ctx, W, H, rng, 110, 20, 60, 0.04, 5000, 0.03, true);
+    // Render / stucco: broad soft tonal patches. No 1 px grain here - the soften pass and the mips would only turn it into shimmer.
+    this.mottle(m.ctx, W, H, rng, 150, 40, 130, 0.035, 0, 0, true);
     e.ctx.fillStyle = '#000';
     e.ctx.fillRect(0, 0, W, H);
     r.ctx.fillStyle = grey(0.92);
     r.ctx.fillRect(0, 0, W, H);
     const cols = 4, rows = 8;
-    const cw = W / cols, rh = (H - ROOF_STRIP_PX) / rows;
-    const top = ROOF_STRIP_PX;
+    const top = ROOF_STRIP_PX * (H / WINDOW_TILE_PX_H);
+    const cw = W / cols, rh = (H - top) / rows;
     // Colour-temperature banding every 3-4 floors (rendered floors against plastered ones, a change of contractor,
     // a later extension) so a 20-storey wall is not one flat tint. Faint enough to read as material, not stripes.
     const bandRows = 3 + (seed % 2);
@@ -440,21 +494,31 @@ export class TextureFactory {
     }
     // Style-specific facade dressing drawn before the glazing.
     if (style === 'artdeco') {
-      // Vertical fluting between window columns.
+      // Pilasters between the window columns: a light 44 px pier with three fluting grooves and a shadow on its right.
       for (let c = 0; c <= cols; c++) {
         const x = c * cw;
-        m.ctx.fillStyle = tint(wall, 0.22);
-        m.ctx.fillRect(x - 5 * P, top, 10 * P, H - top);
-        m.ctx.fillStyle = rgba(0, 0, 0, 0.16);
-        m.ctx.fillRect(x + 5 * P, top, 3 * P, H - top);
+        m.ctx.fillStyle = tint(wall, 0.2);
+        m.ctx.fillRect(x - 22, top, 44, H - top);
+        for (let g = -1; g <= 1; g++) {
+          this.softRect(m.ctx, x + g * 12 - 3, top, 4, H - top, '#000', 0.16);
+          this.softRect(m.ctx, x + g * 12 + 1, top, 3, H - top, '#fff', 0.26);
+        }
+        this.softRect(m.ctx, x + 22, top, 6, H - top, '#000', 0.2);
+        r.ctx.fillStyle = grey(0.82);
+        r.ctx.fillRect(x - 22, top, 44, H - top);
+        n.ctx.fillStyle = grey(0.62);
+        n.ctx.fillRect(x - 22, top, 44, H - top);
+        n.ctx.fillStyle = grey(0.5);
+        for (let g = -1; g <= 1; g++) n.ctx.fillRect(x + g * 12 - 3, top, 4, H - top);
       }
     } else if (style === 'concrete') {
-      // Precast panel joints.
-      m.ctx.fillStyle = rgba(0, 0, 0, 0.2);
-      for (let c = 0; c <= cols; c++) m.ctx.fillRect(c * cw - P, top, 2 * P, H - top);
-    } else if (style === 'residential') {
-      m.ctx.fillStyle = rgba(0, 0, 0, 0.07);
-      for (let i = 0; i < 26; i++) m.ctx.fillRect(0, top + rng.range(0, H), W, P);
+      // Precast panel joints: a 6 px groove with a lit lip.
+      for (let c = 0; c <= cols; c++) {
+        this.softRect(m.ctx, c * cw - 3, top, 6, H - top, '#000', 0.28);
+        this.softRect(m.ctx, c * cw + 3, top, 3, H - top, '#fff', 0.18);
+        n.ctx.fillStyle = grey(0.38);
+        n.ctx.fillRect(c * cw - 3, top, 6, H - top);
+      }
     }
     // Per-style window shapes (fractions of a cell).
     let wx = 0.2, wy = 0.25, ww = 0.6, wh = 0.5;
@@ -463,62 +527,102 @@ export class TextureFactory {
     else if (style === 'artdeco') { wx = 0.28; wy = 0.14; ww = 0.44; wh = 0.66; }
     else if (style === 'neon') { wx = 0.06; wy = 0.24; ww = 0.88; wh = 0.46; }
     else { wx = 0.16; wy = 0.2; ww = 0.68; wh = 0.5; }
-    // Lighter glass: the old near-black panes made every facade a grid of holes. Curtain walls are a sky blue-grey,
-    // punched windows a slate that still reads as glass beside a light wall.
-    const glassBase = style === 'glass' ? '#7f9fbd' : '#5c728c';
+    // Punched windows are a slate that still reads as glass beside a light wall; the curtain wall bakes its own sky.
+    const glassBase = '#5c728c';
+    // Bright on purpose: downtown vertex colours (0x3e4a5e, 0x4c5a6e) multiply these down to a slate by the time they are lit.
+    const GLASS_TONES = ['#a8ccec', '#a4dadc', '#b8c4d0'];
     // Night colour temperatures: warm white, tungsten, cool fluorescent. Each seed favours one of them so two towers
     // side by side do not light identically.
     const HUES: [number, number, number][] = [[255, 240, 200], [255, 210, 138], [217, 232, 255]];
     const bias = seed % 3;
-    // Mullion / frame: a 4 px bar with a 1 px lighter edge along its top or left, so it reads as a lit frame and not a black line.
-    const frame = (x: number, y: number, w: number, h: number, dark: string, light: string): void => {
+    // Mullion: a 6 px bar with a 3 px lighter stroke along its top or left, so it reads as a lit frame and not a black line.
+    const frame = (x: number, y: number, w: number, h: number, dark: string, light: string, lightA: number): void => {
       m.ctx.fillStyle = dark;
       m.ctx.fillRect(x, y, w, h);
-      m.ctx.fillStyle = light;
-      if (w >= h) m.ctx.fillRect(x, y, w, 1); else m.ctx.fillRect(x, y, 1, h);
+      if (w >= h) this.softRect(m.ctx, x, y, w, 3, light, lightA); else this.softRect(m.ctx, x, y, 3, h, light, lightA);
       e.ctx.fillStyle = '#000';
       e.ctx.fillRect(x, y, w, h);
       r.ctx.fillStyle = grey(0.6);
       r.ctx.fillRect(x, y, w, h);
+      n.ctx.fillStyle = grey(0.6);
+      n.ctx.fillRect(x, y, w, h);
     };
-    // Frame with depth: an f px lighter frame around the opening with a lit top edge, a dark reveal (fake
-    // occlusion) along the top and left of the glass, and optionally a sill below with a light top edge and a
-    // shadow line beneath it. Frames are painted rough (0.6) beside the 0.1 glass and cut out of the emissive.
-    const reveal = (gx: number, gy: number, gw: number, gh: number, f: number, frameCol: string, sill: boolean, revealA: number): void => {
-      const x0 = gx - f, w0 = gw + 2 * f;
-      for (const c of [m.ctx, e.ctx, r.ctx]) {
-        c.fillStyle = c === m.ctx ? frameCol : c === e.ctx ? '#000' : grey(0.6);
+    // Frame with depth: an f px frame around the opening with lit top / left edges and a shaded right edge, a dark
+    // reveal (fake occlusion) along the head and the left jamb of the glass, and optionally a sill below with a lit
+    // top and a shadow beneath. Frames are painted rough (0.6) beside the 0.26 glass and cut out of the emissive.
+    const reveal = (gx: number, gy: number, gw: number, gh: number, f: number, frameCol: string, sill: boolean, revealA: number, edgeA = 0.3): void => {
+      const x0 = gx - f, w0 = gw + 2 * f, hh = gh + (sill ? f : 2 * f);
+      for (const c of [m.ctx, e.ctx, r.ctx, n.ctx]) {
+        c.fillStyle = c === m.ctx ? frameCol : c === e.ctx ? '#000' : c === r.ctx ? grey(0.6) : grey(0.62);
         c.fillRect(x0, gy - f, w0, f);
         c.fillRect(x0, gy, f, gh);
         c.fillRect(gx + gw, gy, f, gh);
         if (!sill) c.fillRect(x0, gy + gh, w0, f);
       }
-      m.ctx.fillStyle = rgba(255, 255, 255, 0.32);
-      m.ctx.fillRect(x0, gy - f, w0, 1);
-      m.ctx.fillRect(x0, gy - f, 1, gh + (sill ? f : 2 * f));
-      m.ctx.fillStyle = rgba(0, 0, 0, 0.22);
-      m.ctx.fillRect(gx + gw + f - 1, gy - f, 1, gh + (sill ? f : 2 * f));
+      n.ctx.fillStyle = grey(0.42);
+      n.ctx.fillRect(gx, gy, gw, gh);
+      this.softRect(m.ctx, x0, gy - f, w0, 3, '#fff', edgeA);
+      this.softRect(m.ctx, x0, gy - f, 3, hh, '#fff', edgeA);
+      this.softRect(m.ctx, gx + gw + f - 3, gy - f, 3, hh, '#000', 0.22);
       m.ctx.fillStyle = rgba(0, 0, 0, revealA);
-      m.ctx.fillRect(gx, gy, gw, 3);
-      m.ctx.fillRect(gx, gy, 3, gh);
+      m.ctx.fillRect(gx, gy, gw, 8);
+      m.ctx.fillRect(gx, gy, 8, gh);
       m.ctx.fillStyle = rgba(0, 0, 0, revealA * 0.5);
-      m.ctx.fillRect(gx, gy + 3, gw, 2);
-      m.ctx.fillRect(gx + 3, gy, 2, gh);
+      m.ctx.fillRect(gx, gy + 8, gw, 5);
+      m.ctx.fillRect(gx + 8, gy, 5, gh);
       if (sill) {
-        const sy = gy + gh, sx = x0 - 2, sw = w0 + 4;
+        const sy = gy + gh, sx = x0 - 6, sw = w0 + 12;
         m.ctx.fillStyle = tint(wall, 0.42);
-        m.ctx.fillRect(sx, sy, sw, 5);
-        m.ctx.fillStyle = rgba(255, 255, 255, 0.5);
-        m.ctx.fillRect(sx, sy, sw, 1);
-        m.ctx.fillStyle = rgba(0, 0, 0, 0.32);
-        m.ctx.fillRect(sx, sy + 5, sw, 3);
-        m.ctx.fillStyle = rgba(0, 0, 0, 0.1);
-        m.ctx.fillRect(sx, sy + 8, sw, 3);
+        m.ctx.fillRect(sx, sy, sw, 14);
+        this.softRect(m.ctx, sx, sy, sw, 3, '#fff', 0.4);
+        this.softRect(m.ctx, sx, sy + 14, sw, 8, '#000', 0.3);
+        this.softRect(m.ctx, sx, sy + 22, sw, 8, '#000', 0.1);
         e.ctx.fillStyle = '#000';
-        e.ctx.fillRect(sx, sy, sw, 8);
+        e.ctx.fillRect(sx, sy, sw, 24);
         r.ctx.fillStyle = grey(0.7);
-        r.ctx.fillRect(sx, sy, sw, 5);
+        r.ctx.fillRect(sx, sy, sw, 14);
+        n.ctx.fillStyle = grey(0.66);
+        n.ctx.fillRect(sx, sy, sw, 14);
       }
+    };
+    // Baked reflection: a horizon at 55 % of the pane with a haze band along it and a jagged line of reflected
+    // rooftops below - what a facade shows at street level, and what the sky probe alone cannot (it has no city in it).
+    const skyline = (gx: number, gy: number, gw: number, gh: number, k: number): void => {
+      const hy = gy + gh * 0.55;
+      const haze = m.ctx.createLinearGradient(0, hy - 16, 0, hy + 2);
+      haze.addColorStop(0, rgba(232, 246, 252, 0));
+      haze.addColorStop(0.85, rgba(232, 246, 252, 0.4 * k));
+      haze.addColorStop(1, rgba(232, 246, 252, 0));
+      m.ctx.fillStyle = haze;
+      m.ctx.fillRect(gx, hy - 16, gw, 18);
+      m.ctx.fillStyle = rgba(38, 54, 70, 0.3 * k);
+      for (let x = gx; x < gx + gw;) {
+        const w = rng.range(10, 28), h = rng.range(6, 30);
+        m.ctx.fillRect(x, hy, Math.min(w, gx + gw - x), h);
+        x += w;
+      }
+      const wash = m.ctx.createLinearGradient(0, hy, 0, gy + gh);
+      wash.addColorStop(0, rgba(38, 54, 70, 0.2 * k));
+      wash.addColorStop(1, rgba(38, 54, 70, 0.05 * k));
+      m.ctx.fillStyle = wash;
+      m.ctx.fillRect(gx, hy, gw, gy + gh - hy);
+    };
+    // Split-unit air conditioner hung under a sill: a pale box with a louvre grille, a shadow beneath.
+    const acUnit = (ax: number, ay: number): void => {
+      const aw = 44, ah = 30;
+      this.softRect(m.ctx, ax - 2, ay + ah, aw + 4, 8, '#000', 0.3);
+      m.ctx.fillStyle = '#cfccc3';
+      m.ctx.fillRect(ax, ay, aw, ah);
+      this.softRect(m.ctx, ax, ay, aw, 3, '#fff', 0.5);
+      this.softRect(m.ctx, ax + aw - 4, ay, 4, ah, '#000', 0.25);
+      m.ctx.fillStyle = rgba(60, 60, 64, 0.5);
+      for (let yy = ay + 12; yy < ay + ah - 3; yy += 4) m.ctx.fillRect(ax + 4, yy, aw - 8, 2);
+      e.ctx.fillStyle = '#000';
+      e.ctx.fillRect(ax, ay, aw, ah);
+      r.ctx.fillStyle = grey(0.55);
+      r.ctx.fillRect(ax, ay, aw, ah);
+      n.ctx.fillStyle = grey(0.64);
+      n.ctx.fillRect(ax, ay, aw, ah);
     };
     for (let row = 0; row < rows; row++) {
       const y0 = top + row * rh;
@@ -527,36 +631,33 @@ export class TextureFactory {
       if (style === 'artdeco') {
         m.ctx.fillStyle = tint(wall, 0.3);
         m.ctx.fillRect(0, y0 + rh - 6 * P, W, 4 * P);
-        m.ctx.fillStyle = rgba(0, 0, 0, 0.22);
-        m.ctx.fillRect(0, y0 + rh - 2 * P, W, 3 * P);
-        for (let d = 0; d < 16; d++) { m.ctx.fillStyle = rgba(0, 0, 0, 0.12); m.ctx.fillRect(d * (W / 16) + 4 * P, y0 + rh - 10 * P, 6 * P, 4 * P); }
+        this.softRect(m.ctx, 0, y0 + rh - 6 * P, W, 3, '#fff', 0.35);
+        this.softRect(m.ctx, 0, y0 + rh - 2 * P, W, 3 * P, '#000', 0.22);
+        for (let d = 0; d < 16; d++) this.softRect(m.ctx, d * (W / 16) + 4 * P, y0 + rh - 10 * P, 6 * P, 4 * P, '#000', 0.12);
+        n.ctx.fillStyle = grey(0.62);
+        n.ctx.fillRect(0, y0 + rh - 6 * P, W, 4 * P);
       } else if (style === 'residential') {
-        m.ctx.fillStyle = rgba(0, 0, 0, 0.18);
-        m.ctx.fillRect(0, y0 + rh - 3 * P, W, 3 * P);
-        // Balcony rail on alternating floors: a light band with bars.
-        if (row % 2 === 0) {
-          m.ctx.fillStyle = tint(wall, 0.35);
-          m.ctx.fillRect(0, y0 + rh * 0.62, W, 3 * P);
-          m.ctx.fillRect(0, y0 + rh * 0.86, W, 4 * P);
-          m.ctx.fillStyle = rgba(70, 62, 54, 0.55);
-          for (let bx = 3 * P; bx < W; bx += 9 * P) m.ctx.fillRect(bx, y0 + rh * 0.62, 2 * P, rh * 0.26);
-        }
+        this.softRect(m.ctx, 0, y0 + rh - 3 * P, W, 3 * P, '#000', 0.18);
       } else if (style === 'neon') {
         m.ctx.fillStyle = row % 2 === 0 ? rgba(255, 120, 200, 0.4) : rgba(90, 220, 255, 0.4);
         m.ctx.fillRect(0, y0 + rh - 6 * P, W, 3 * P);
-        m.ctx.fillStyle = rgba(0, 0, 0, 0.14);
-        m.ctx.fillRect(0, y0 + rh - 3 * P, W, 2 * P);
+        this.softRect(m.ctx, 0, y0 + rh - 3 * P, W, 2 * P, '#000', 0.14);
       } else if (style === 'glass') {
-        // Opaque spandrel under every floor of the curtain wall.
-        m.ctx.fillStyle = rgba(28, 40, 56, 0.85);
-        m.ctx.fillRect(0, y0 + rh * 0.78, W, rh * 0.22);
-        m.ctx.fillStyle = rgba(210, 226, 240, 0.35);
-        m.ctx.fillRect(0, y0 + rh * 0.78, W, 2 * P);
+        // Opaque spandrel under every floor of the curtain wall; two tones alternate per floor, and each bay drifts a little.
+        const dark = row % 2 === 0;
+        for (let c = 0; c < cols; c++) {
+          const d = rng.range(-10, 10);
+          m.ctx.fillStyle = dark ? rgba(56 + d, 68 + d, 84 + d, 0.9) : rgba(104 + d, 118 + d, 134 + d, 0.9);
+          m.ctx.fillRect(c * cw, y0 + rh * 0.78, cw, rh * 0.22);
+        }
+        this.softRect(m.ctx, 0, y0 + rh * 0.78, W, 4, '#d2e2f0', 0.4);
+        this.softRect(m.ctx, 0, y0 + rh * 0.78 + 4, W, 6, '#000', 0.2);
         r.ctx.fillStyle = grey(0.5);
         r.ctx.fillRect(0, y0 + rh * 0.78, W, rh * 0.22);
+        n.ctx.fillStyle = grey(0.47);
+        n.ctx.fillRect(0, y0 + rh * 0.78, W, rh * 0.22);
       } else {
-        m.ctx.fillStyle = rgba(0, 0, 0, 0.12);
-        m.ctx.fillRect(0, y0 + rh - 2 * P, W, 2 * P);
+        this.softRect(m.ctx, 0, y0 + rh - 2 * P, W, 2 * P, '#000', 0.12);
       }
       // Per-row luminance drift: eight identical floors stacked read as stripes, a few percent either way breaks it.
       const rowLum = rng.range(-0.06, 0.06);
@@ -566,57 +667,98 @@ export class TextureFactory {
         const x0 = c * cw;
         let gx = x0 + wx * cw, gy = y0 + wy * rh, gw = ww * cw, gh = wh * rh;
         if (ground && style !== 'glass') { gx = x0 + 0.1 * cw; gy = y0 + 0.12 * rh; gw = 0.8 * cw; gh = 0.86 * rh; }
-        m.ctx.fillStyle = glassBase;
-        m.ctx.fillRect(gx, gy, gw, gh);
-        m.ctx.fillStyle = rowLum > 0 ? rgba(255, 255, 255, rowLum) : rgba(0, 0, 0, -rowLum);
-        m.ctx.fillRect(gx, gy, gw, gh);
-        // What is behind the glass: blinds, a curtain, a dark room, a cool office - so panes stop being one flat tone.
-        const roll = rng.next();
-        const blinds = roll < 0.24;
-        let curtainX = -1, curtainW = 0;
-        if (blinds) {
-          // Slats are far below texel size, so blinds are a lighter cream pane with only a faint stripe.
-          m.ctx.fillStyle = rgba(228, 222, 210, 0.32);
+        if (style === 'glass') {
+          // Curtain wall pane: a random tone (blue / teal / grey) under a sky-to-slate gradient and a reflected skyline.
+          m.ctx.fillStyle = GLASS_TONES[rng.int(0, 2)];
           m.ctx.fillRect(gx, gy, gw, gh);
-          m.ctx.fillStyle = rgba(240, 236, 226, 0.16);
-          for (let yy = gy + 2 * P; yy < gy + gh - P; yy += 6 * P) m.ctx.fillRect(gx, yy, gw, 2 * P);
-        } else if (roll < 0.4) {
-          curtainW = gw * rng.range(0.4, 0.55);
-          curtainX = rng.chance(0.5) ? gx : gx + gw - curtainW;
-          m.ctx.fillStyle = rgba(236, 226, 210, 0.6);
-          m.ctx.fillRect(curtainX, gy, curtainW, gh);
-        } else if (roll < 0.6) {
-          m.ctx.fillStyle = rgba(0, 0, 0, 0.25);
+          const sky = m.ctx.createLinearGradient(0, gy, 0, gy + gh);
+          sky.addColorStop(0, rgba(200, 240, 250, 0.65));
+          sky.addColorStop(0.5, rgba(200, 240, 250, 0));
+          sky.addColorStop(0.55, rgba(40, 52, 66, 0));
+          sky.addColorStop(1, rgba(40, 52, 66, 0.4));
+          m.ctx.fillStyle = sky;
           m.ctx.fillRect(gx, gy, gw, gh);
-        } else if (roll < 0.7) {
-          m.ctx.fillStyle = rgba(205, 228, 255, 0.3);
+        } else {
+          m.ctx.fillStyle = glassBase;
           m.ctx.fillRect(gx, gy, gw, gh);
         }
-        // Sky reflection: a faint vertical gradient (8% light at the head, 6% dark at the sill).
-        const grad = m.ctx.createLinearGradient(gx, gy, gx, gy + gh);
-        grad.addColorStop(0, 'rgba(255,255,255,0.08)');
-        grad.addColorStop(0.45, 'rgba(255,255,255,0)');
-        grad.addColorStop(1, 'rgba(0,0,0,0.06)');
+        m.ctx.fillStyle = rowLum > 0 ? rgba(255, 255, 255, rowLum) : rgba(0, 0, 0, -rowLum);
+        m.ctx.fillRect(gx, gy, gw, gh);
+        // What is behind the glass: a blind at its own height, curtains, a dark room, a cool office - so panes stop
+        // being one flat tone and no two cells of a column match.
+        const roll = rng.next();
+        const blinds = roll < (style === 'glass' ? 0.3 : 0.26);
+        let blindH = 0, curtainX = -1, curtainW = 0;
+        if (blinds) {
+          // Slats are 4 px (6 cm) apart: a faint stripe on a cream pane, pulled down to somewhere between a third and all the way.
+          blindH = gh * rng.range(0.35, 1);
+          m.ctx.fillStyle = rgba(232, 226, 214, style === 'glass' ? 0.45 : 0.55);
+          m.ctx.fillRect(gx, gy, gw, blindH);
+          m.ctx.fillStyle = rgba(110, 104, 94, 0.2);
+          for (let yy = gy + 4; yy < gy + blindH - 4; yy += 6) m.ctx.fillRect(gx, yy, gw, 2);
+          m.ctx.fillStyle = rgba(140, 132, 120, 0.7);
+          m.ctx.fillRect(gx, gy + blindH - 5, gw, 5);
+          if (blindH < gh) {
+            m.ctx.fillStyle = rgba(0, 0, 0, 0.22);
+            m.ctx.fillRect(gx, gy + blindH, gw, gh - blindH);
+          }
+        } else if (roll < 0.44 && style !== 'glass') {
+          curtainW = gw * rng.range(0.3, 0.5);
+          curtainX = rng.chance(0.5) ? gx : gx + gw - curtainW;
+          m.ctx.fillStyle = rgba(236, 226, 210, 0.7);
+          m.ctx.fillRect(curtainX, gy, curtainW, gh);
+          m.ctx.fillStyle = rgba(90, 80, 70, 0.14);
+          for (let xx = curtainX + 4; xx < curtainX + curtainW - 3; xx += 10) m.ctx.fillRect(xx, gy, 3, gh);
+          if (rng.chance(0.35)) {
+            // Both sides drawn, a gap of room between them.
+            const ox = curtainX === gx ? gx + gw - curtainW : gx;
+            m.ctx.fillStyle = rgba(236, 226, 210, 0.7);
+            m.ctx.fillRect(ox, gy, curtainW, gh);
+            m.ctx.fillStyle = rgba(90, 80, 70, 0.14);
+            for (let xx = ox + 4; xx < ox + curtainW - 3; xx += 10) m.ctx.fillRect(xx, gy, 3, gh);
+          }
+        } else if (roll < 0.64) {
+          m.ctx.fillStyle = rgba(0, 0, 0, style === 'glass' ? 0.16 : 0.25);
+          m.ctx.fillRect(gx, gy, gw, gh);
+        } else if (roll < 0.76) {
+          m.ctx.fillStyle = rgba(205, 228, 255, 0.3);
+          m.ctx.fillRect(gx, gy, gw, gh);
+        } else if (roll < 0.83 && style !== 'glass' && !ground) {
+          // A plant on the sill: a dark green mound with a lighter top, low in the pane.
+          const pw = gw * rng.range(0.2, 0.32), px = gx + rng.range(6, gw - pw - 6);
+          m.ctx.fillStyle = rgba(46, 96, 52, 0.85);
+          m.ctx.fillRect(px, gy + gh - 24, pw, 24);
+          m.ctx.fillStyle = rgba(96, 150, 78, 0.6);
+          m.ctx.fillRect(px + 4, gy + gh - 24, pw - 8, 8);
+        }
+        // Sky reflection: light at the head, dark at the foot, the horizon band in between (strong on the curtain wall).
+        const grad = m.ctx.createLinearGradient(0, gy, 0, gy + gh);
+        grad.addColorStop(0, rgba(255, 255, 255, style === 'glass' ? 0.14 : 0.1));
+        grad.addColorStop(0.45, rgba(255, 255, 255, 0));
+        grad.addColorStop(1, rgba(0, 0, 0, 0.08));
         m.ctx.fillStyle = grad;
         m.ctx.fillRect(gx, gy, gw, gh);
-        // Glazing is glass whatever sits behind it: 0.1, a shade more with blinds pressed to the pane.
-        r.ctx.fillStyle = grey(blinds ? 0.15 : 0.1);
+        skyline(gx, gy, gw, gh, style === 'glass' ? 1 : blinds ? 0.25 : 0.45);
+        // Glazing is glass whatever sits behind it: 0.26 keeps the sky probe as a broad sheen, not a pinpoint.
+        r.ctx.fillStyle = grey(blinds ? 0.32 : 0.26);
         r.ctx.fillRect(gx, gy, gw, gh);
         // Night: a lit pane is brightest at the ceiling and falls off to the floor; hue and level vary per pane.
         if (rng.chance(rowLit)) {
           const hue = rng.chance(0.55) ? HUES[bias] : HUES[rng.int(0, 2)];
           // Big ground-floor panes at full level saturate to flat white after tone mapping: keep them lower.
           const I = ground && style !== 'glass' ? rng.range(0.32, 0.6) : rng.range(0.5, 1.0);
-          const g = e.ctx.createLinearGradient(gx, gy, gx, gy + gh);
+          const g = e.ctx.createLinearGradient(0, gy, 0, gy + gh);
           g.addColorStop(0, rgba(hue[0] * I, hue[1] * I, hue[2] * I, 1));
           g.addColorStop(0.2, rgba(hue[0] * I, hue[1] * I, hue[2] * I, 1));
           g.addColorStop(1, rgba(hue[0] * I * 0.45, hue[1] * I * 0.45, hue[2] * I * 0.45, 1));
           e.ctx.fillStyle = g;
           e.ctx.fillRect(gx, gy, gw, gh);
           if (blinds) {
-            // Slats glow through as stripes.
+            // The blind glows through as stripes; below its rail the room is bare.
+            e.ctx.fillStyle = rgba(0, 0, 0, 0.35);
+            e.ctx.fillRect(gx, gy, gw, blindH);
             e.ctx.fillStyle = rgba(0, 0, 0, 0.3);
-            for (let yy = gy + 2 * P; yy < gy + gh - P; yy += 6 * P) e.ctx.fillRect(gx, yy, gw, 2 * P);
+            for (let yy = gy + 4; yy < gy + blindH - 4; yy += 6) e.ctx.fillRect(gx, yy, gw, 2);
           }
           if (curtainX >= 0) {
             e.ctx.fillStyle = rgba(0, 0, 0, 0.5);
@@ -624,61 +766,80 @@ export class TextureFactory {
           }
           if (rng.chance(0.3)) {
             e.ctx.fillStyle = rgba(0, 0, 0, 0.7);
-            e.ctx.fillRect(gx, gy + gh * rng.range(0.1, 0.5), gw, 3);
+            e.ctx.fillRect(gx, gy + gh * rng.range(0.1, 0.5), gw, 6);
           }
         }
         // Frames, reveals, sills and mullions (all cut black out of the emissive too).
+        let sillY = -1;
         if (style === 'glass') {
-          // Curtain wall: slim aluminium frame, shallow reveal, spandrel instead of a sill.
-          const dk = rgba(150, 176, 200, 0.7), lt = rgba(224, 236, 246, 0.8);
-          frame(gx + gw / 2 - 2, gy, 4, gh, dk, lt);
-          reveal(gx, gy, gw, gh, 3, rgba(200, 214, 226, 0.95), false, 0.2);
+          // Curtain wall: slim aluminium mullion, shallow reveal, spandrel instead of a sill.
+          frame(gx + gw / 2 - 3, gy, 6, gh, rgba(150, 176, 200, 0.75), '#e0ecf6', 0.45);
+          reveal(gx, gy, gw, gh, 6, rgba(196, 210, 222, 0.95), false, 0.14, 0.14);
         } else if (style === 'neon') {
-          const dk = rgba(20, 26, 34, 0.7), lt = rgba(120, 130, 140, 0.7);
-          for (let k = 1; k < 4; k++) frame(gx + (gw * k) / 4 - 2, gy, 4, gh, dk, lt);
-          reveal(gx, gy, gw, gh, 3, rgba(44, 48, 56, 0.95), !ground, 0.3);
+          for (let k = 1; k < 4; k++) frame(gx + (gw * k) / 4 - 3, gy, 6, gh, rgba(20, 26, 34, 0.75), '#78828c', 0.7);
+          reveal(gx, gy, gw, gh, 8, rgba(44, 48, 56, 0.95), !ground, 0.3);
+          if (!ground) sillY = gy + gh + 22;
         } else if (style === 'concrete') {
           // Deep punched opening: precast frame, a strong reveal shadow, a sill.
-          frame(gx + gw / 2 - 2, gy, 4, gh, rgba(40, 44, 50, 0.8), rgba(150, 150, 146, 0.8));
-          reveal(gx, gy, gw, gh, 4, tint(wall, 0.14), !ground, 0.42);
+          frame(gx + gw / 2 - 3, gy, 6, gh, rgba(40, 44, 50, 0.8), '#969692', 0.8);
+          reveal(gx, gy, gw, gh, 14, tint(wall, 0.14), !ground, 0.42);
+          if (!ground) sillY = gy + gh + 22;
         } else if (style === 'artdeco') {
-          frame(gx + gw / 2 - 2, gy, 4, gh, rgba(60, 60, 70, 0.7), rgba(180, 176, 168, 0.8));
-          reveal(gx, gy, gw, gh, 4, tint(wall, 0.45), !ground, 0.3);
+          frame(gx + gw / 2 - 3, gy, 6, gh, rgba(60, 60, 70, 0.75), '#b4b0a8', 0.8);
+          reveal(gx, gy, gw, gh, 12, tint(wall, 0.45), !ground, 0.3);
+          if (!ground) sillY = gy + gh + 22;
         } else if (!ground) {
           // Residential: white frame, sill and an occasional shutter (under the reveal so it is shadowed too).
-          frame(gx + gw / 2 - 2, gy, 4, gh, rgba(236, 232, 226, 0.9), rgba(255, 255, 255, 0.9));
+          frame(gx + gw / 2 - 3, gy, 6, gh, rgba(236, 232, 226, 0.9), '#fff', 0.9);
           if (rng.chance(0.3)) {
-            m.ctx.fillStyle = rgba(120, 150, 130, 0.85);
-            m.ctx.fillRect(gx, gy, gw * 0.45, gh);
-            m.ctx.fillStyle = rgba(0, 0, 0, 0.18);
-            for (let yy = gy + 4; yy < gy + gh - 2; yy += 6) m.ctx.fillRect(gx + 2, yy, gw * 0.45 - 4, 2);
+            const sw = gw * 0.45;
+            m.ctx.fillStyle = rgba(120, 150, 130, 0.88);
+            m.ctx.fillRect(gx, gy, sw, gh);
+            m.ctx.fillStyle = rgba(0, 0, 0, 0.2);
+            for (let yy = gy + 8; yy < gy + gh - 4; yy += 8) m.ctx.fillRect(gx + 4, yy, sw - 8, 3);
             e.ctx.fillStyle = '#000';
-            e.ctx.fillRect(gx, gy, gw * 0.45, gh);
+            e.ctx.fillRect(gx, gy, sw, gh);
             r.ctx.fillStyle = grey(0.7);
-            r.ctx.fillRect(gx, gy, gw * 0.45, gh);
+            r.ctx.fillRect(gx, gy, sw, gh);
           }
-          reveal(gx, gy, gw, gh, 4, rgba(250, 248, 244, 0.92), true, 0.3);
+          reveal(gx, gy, gw, gh, 12, rgba(250, 248, 244, 0.92), true, 0.3);
+          sillY = gy + gh + 22;
         } else {
-          frame(gx + gw / 2 - 2, gy, 4, gh, rgba(40, 44, 50, 0.8), rgba(150, 150, 146, 0.8));
-          reveal(gx, gy, gw, gh, 4, rgba(52, 56, 62, 0.92), false, 0.3);
+          frame(gx + gw / 2 - 3, gy, 6, gh, rgba(40, 44, 50, 0.8), '#969692', 0.8);
+          reveal(gx, gy, gw, gh, 12, rgba(52, 56, 62, 0.92), false, 0.3);
         }
+        // A fifth of the sills carry a split-unit air conditioner, hung to one side.
+        if (sillY > 0 && rng.chance(0.2)) acUnit(rng.chance(0.5) ? gx + 4 : gx + gw - 48, sillY + 4);
+      }
+      if (style === 'residential' && row % 2 === 0 && !ground) {
+        // Balcony parapet on alternating floors: a handrail, bars and a bottom rail standing on the slab, in front of the wall.
+        const ry0 = y0 + rh * 0.74, ry1 = y0 + rh * 0.96;
+        this.softRect(m.ctx, 0, ry0, W, 6, tint(wall, 0.45), 1);
+        this.softRect(m.ctx, 0, ry0, W, 2, '#fff', 0.35);
+        this.softRect(m.ctx, 0, ry1 - 5, W, 5, tint(wall, 0.4), 1);
+        m.ctx.fillStyle = rgba(70, 62, 54, 0.6);
+        for (let bx = 10; bx < W; bx += 28) m.ctx.fillRect(bx, ry0 + 6, 4, ry1 - ry0 - 11);
+        this.softRect(m.ctx, 0, ry1, W, 6, '#000', 0.22);
+        e.ctx.fillStyle = rgba(0, 0, 0, 0.5);
+        e.ctx.fillRect(0, ry0, W, ry1 - ry0);
+        n.ctx.fillStyle = grey(0.6);
+        n.ctx.fillRect(0, ry0, W, 6);
+        n.ctx.fillRect(0, ry1 - 5, W, 5);
       }
     }
     this.grime(m.ctx, W, H, rng, rh, top, P);
     // Plain strip at the top (v > 0.98): white in the albedo (vertex color shows exactly), black in the emissive.
     // The strip stays fully non-emissive: walls tile through it, so anything lit here would show up as bands on facades.
     m.ctx.fillStyle = '#ffffff';
-    m.ctx.fillRect(0, 0, W, ROOF_STRIP_PX);
+    m.ctx.fillRect(0, 0, W, top);
     e.ctx.fillStyle = '#000';
-    e.ctx.fillRect(0, 0, W, ROOF_STRIP_PX);
+    e.ctx.fillRect(0, 0, W, top);
     r.ctx.fillStyle = grey(0.9);
-    r.ctx.fillRect(0, 0, W, ROOF_STRIP_PX);
+    r.ctx.fillRect(0, 0, W, top);
+    this.soften(m.ctx, W, mapH);
     const map = this.finish(key + ':map', m.canvas, true);
     const emissive = this.finish(key + ':emi', e.canvas, true);
-    // The relief only needs the frame steps, not the grain: derive it from a half-res copy.
-    const half = this.canvas(W / 2, H / 2);
-    half.ctx.drawImage(m.canvas, 0, 0, W / 2, H / 2);
-    const normal = this.normalFromLuminance(key + ':nrm', half.canvas, 6.5);
+    const normal = this.normalFromLuminance(key + ':nrm', n.canvas, 4.5, 8);
     const rough = this.finish(key + ':rgh', r.canvas, false);
     return { map, emissive, normal, rough };
   }
@@ -687,7 +848,7 @@ export class TextureFactory {
    * Derives a tangent-space normal map from a painted albedo, reading luminance as height: dark glass sinks into
    * the wall, bright fluting and cornices stand out. Cheap way to give flat facades per-pixel relief.
    */
-  private normalFromLuminance(key: string, src: HTMLCanvasElement, strength: number): THREE.CanvasTexture {
+  private normalFromLuminance(key: string, src: HTMLCanvasElement, strength: number, highPass = 4): THREE.CanvasTexture {
     const hit = this.cache.get(key) as THREE.CanvasTexture | undefined;
     if (hit) return hit;
     const W = src.width, H = src.height;
@@ -700,8 +861,9 @@ export class TextureFactory {
     for (let i = 0, p = 0; i < n; i++, p += 4) lum[i] = (img[p] * 0.2126 + img[p + 1] * 0.7152 + img[p + 2] * 0.0722) / 255;
     // High pass: the painted albedo has broad gradients (a glass pane shaded top to bottom, a wall gradient) that would
     // read as a curved surface and make every window look like a pillow. Subtracting a wide blur keeps only the sharp
-    // steps - mullions, sills, fluting, fascia edges - so panes stay flat and their frames get the relief.
-    const R = 4;
+    // steps - mullions, sills, fluting, fascia edges - so panes stay flat and their frames get the relief. Facades
+    // pass 8 (their strokes are 3-6 px wide and their sills 14 px), the ground tiles keep the tight 4.
+    const R = highPass;
     wide.set(lum);
     this.boxBlur(wide, tmp, W, H, R);
     for (let i = 0; i < n; i++) tmp[i] = lum[i] - wide[i];
@@ -782,7 +944,14 @@ export class TextureFactory {
     }
   }
 
-  /** Ground-floor shopfront band (16 m x 4.2 m): four bays of glazing, doors and fascias; emissive = warm shop interiors + fascia glow. */
+  /**
+   * Ground-floor shopfront band (16 m x 4.2 m at 2048 x 512 px, 128 px/m): eight shops with painted interiors
+   * behind the glass - shelving, counters, a doner spit, mannequins, tiled floors - plus a bay under a rolled steel
+   * shutter and a recessed apartment doorway, with Turkish names lettered on the fascias. The interior scene is
+   * drawn once on a scratch canvas and used twice: dimmed through the glass in the albedo, and under a warm ceiling
+   * light in the emissive, so the same shelves that show by day glow at night. Relief comes from a structure canvas
+   * (piers, fascias, frames, slats), not the albedo, so a poster does not read as a bump.
+   */
   shopfront(): WindowTextures {
     const key = 'shop';
     const mk = this.cache.get(key + ':map') as THREE.CanvasTexture | undefined;
@@ -790,101 +959,496 @@ export class TextureFactory {
     const nk = this.cache.get(key + ':nrm') as THREE.CanvasTexture | undefined;
     const rk = this.cache.get(key + ':rgh') as THREE.CanvasTexture | undefined;
     if (mk && ek && nk && rk) return { map: mk, emissive: ek, normal: nk, rough: rk };
-    const W = 1024, H = 256;
+    const W = 2048, H = 512;
+    const sx = W / SHOP_TILE_W, sy = H / SHOP_BAND_H;
+    const X = (mx: number): number => mx * sx;
+    const Y = (my: number): number => (SHOP_BAND_H - my) * sy;
     const rng = new Random(1301);
-    const m = this.canvas(W, H), e = this.canvas(W, H);
-    m.ctx.fillStyle = '#c8c2b6';
+    const m = this.canvas(W, H), e = this.canvas(W / 2, H / 2), r = this.canvas(W / 4, H / 4), n = this.canvas(W / 2, H / 2), scene = this.canvas(W, H);
+    e.ctx.scale(0.5, 0.5);
+    r.ctx.scale(0.25, 0.25);
+    n.ctx.scale(0.5, 0.5);
+    m.ctx.fillStyle = '#cdc6b8';
     m.ctx.fillRect(0, 0, W, H);
-    this.mottle(m.ctx, W, H, rng, 60, 20, 60, 0.05, 4000, 0.03, true);
+    this.mottle(m.ctx, W, H, rng, 90, 30, 90, 0.05, 0, 0, true);
     e.ctx.fillStyle = '#000';
     e.ctx.fillRect(0, 0, W, H);
-    const FASCIA = [0x1f3a5c, 0x7a2140, 0x1f5a48, 0x6a3a12];
-    const GLOWC = [0x59c8ff, 0xff6aa8, 0x62ffc0, 0xffb15c];
-    const bays = 4, bw = W / bays;
-    // v = 0 at the bottom of the canvas -> canvas y = H is the pavement.
-    const kerbY = H - 14, fasciaH = 52;
-    for (let i = 0; i < bays; i++) {
-      const x = i * bw;
-      // Fascia band across the top of the bay.
-      m.ctx.fillStyle = hex(FASCIA[i]);
-      m.ctx.fillRect(x + 2, 0, bw - 4, fasciaH);
-      m.ctx.fillStyle = rgba(255, 255, 255, 0.16);
-      m.ctx.fillRect(x + 2, 0, bw - 4, 5);
-      m.ctx.fillStyle = rgba(0, 0, 0, 0.35);
-      m.ctx.fillRect(x + 2, fasciaH - 6, bw - 4, 6);
-      // Abstract lettering on the fascia (bars).
-      let lx = x + 26;
-      for (let k = 0; k < 5 + (i % 3); k++) {
-        const lw = 10 + ((k * 7 + i * 5) % 22);
-        m.ctx.fillStyle = rgba(255, 245, 225, 0.9);
-        m.ctx.fillRect(lx, 16, lw, 20);
-        e.ctx.fillStyle = tint(GLOWC[i], 0.15);
-        e.ctx.fillRect(lx, 16, lw, 20);
-        lx += lw + 10;
-        if (lx > x + bw - 40) break;
+    r.ctx.fillStyle = grey(0.9);
+    r.ctx.fillRect(0, 0, W, H);
+    n.ctx.fillStyle = grey(0.5);
+    n.ctx.fillRect(0, 0, W, H);
+    scene.ctx.clearRect(0, 0, W, H);
+    type Kind = 'bakkal' | 'eczane' | 'kebap' | 'door' | 'kuafor' | 'shutter' | 'simit' | 'market' | 'butik';
+    // Widths sum to 16 m in four 4 m groups, so a pier falls on every quarter of the tile (the arcade column line).
+    const bays: { name: string; w: number; kind: Kind; fascia: number; text: number; glow: number }[] = [
+      { name: 'BAKKAL', w: 2.3, kind: 'bakkal', fascia: 0x1f5a48, text: 0xfff4dc, glow: 0x62ffc0 },
+      { name: 'ECZANE', w: 1.7, kind: 'eczane', fascia: 0xf0f2ee, text: 0x1e8a4c, glow: 0x3cf080 },
+      { name: 'KEBAP', w: 2.2, kind: 'kebap', fascia: 0x8c2020, text: 0xffe6b0, glow: 0xffb15c },
+      { name: 'KUAFÖR', w: 1.8, kind: 'kuafor', fascia: 0x6a2050, text: 0xffe0f0, glow: 0xff6aa8 },
+      { name: 'BERBER', w: 1.6, kind: 'shutter', fascia: 0x1f3a5c, text: 0xf0f4ff, glow: 0x59c8ff },
+      { name: '', w: 0.9, kind: 'door', fascia: 0x8c8478, text: 0, glow: 0 },
+      { name: 'SİMİT', w: 1.5, kind: 'simit', fascia: 0xb87a1c, text: 0x3a2408, glow: 0xffd070 },
+      { name: 'MARKET', w: 2.2, kind: 'market', fascia: 0x1c4fa8, text: 0xffffff, glow: 0x7fb4ff },
+      { name: 'BUTİK', w: 1.8, kind: 'butik', fascia: 0x2a2a30, text: 0xf4e8d8, glow: 0xffe0b0 },
+    ];
+    // Heights above the pavement (m): stall riser, glazing, fascia.
+    const RISER = 0.35, GLASS_TOP = 3.3, FASCIA_Y = 3.4, PIER = 0.24;
+    const floorY = Y(0.85);
+    const sc = scene.ctx;
+    // Palette for goods on shelves.
+    const GOODS = ['#e04a2a', '#f2b632', '#2e8ad8', '#43b05c', '#f4f0e6', '#d94f8a', '#7b4ad6', '#ff8a2a'];
+    const shelves = (x0: number, x1: number, ys: number[], dense: boolean, wallCol: string): void => {
+      sc.fillStyle = wallCol;
+      sc.fillRect(x0, Y(GLASS_TOP), x1 - x0, floorY - Y(GLASS_TOP));
+      for (const yb of ys) {
+        const y = Y(yb);
+        sc.fillStyle = '#d9cfbf';
+        sc.fillRect(x0, y, x1 - x0, 5);
+        sc.fillStyle = rgba(0, 0, 0, 0.25);
+        sc.fillRect(x0, y + 5, x1 - x0, 4);
+        for (let x = x0 + 6; x < x1 - 12;) {
+          const w = rng.range(10, dense ? 18 : 24), h = rng.range(16, 34);
+          sc.fillStyle = GOODS[rng.int(0, GOODS.length - 1)];
+          sc.fillRect(x, y - h, w, h);
+          sc.fillStyle = rgba(255, 255, 255, 0.25);
+          sc.fillRect(x, y - h, w, 4);
+          x += w + rng.range(2, dense ? 4 : 10);
+        }
       }
-      // Stone pier between bays.
+    };
+    const counter = (x0: number, x1: number, col: string, topCol: string): void => {
+      const y = Y(0.95);
+      sc.fillStyle = col;
+      sc.fillRect(x0, y, x1 - x0, Y(0.4) - y);
+      sc.fillStyle = topCol;
+      sc.fillRect(x0 - 3, y - 6, x1 - x0 + 6, 8);
+      sc.fillStyle = rgba(0, 0, 0, 0.3);
+      sc.fillRect(x0 - 3, y + 2, x1 - x0 + 6, 5);
+    };
+    const poster = (x: number, y: number, w: number, h: number, col: string): void => {
+      sc.fillStyle = '#f6f2ea';
+      sc.fillRect(x, y, w, h);
+      sc.fillStyle = col;
+      sc.fillRect(x + 4, y + 4, w - 8, h * 0.55);
+      sc.fillStyle = rgba(40, 40, 44, 0.7);
+      for (let yy = y + h * 0.62; yy < y + h - 6; yy += 7) sc.fillRect(x + 6, yy, w - 12 - rng.range(0, w * 0.4), 3);
+    };
+    const floor = (x0: number, x1: number, light: string, dark: string): void => {
+      // Tiled floor seen through the glass: rows closer together toward the back, a skirting line at the wall.
+      sc.fillStyle = light;
+      sc.fillRect(x0, floorY, x1 - x0, Y(RISER) - floorY);
+      sc.fillStyle = dark;
+      const rowsY = [0.85, 0.74, 0.62, 0.48];
+      for (let i = 0; i < rowsY.length; i++) sc.fillRect(x0, Y(rowsY[i]), x1 - x0, 2);
+      for (let x = x0; x < x1; x += 0.36 * sx) sc.fillRect(x, floorY, 2, Y(RISER) - floorY);
+      sc.fillStyle = rgba(0, 0, 0, 0.45);
+      sc.fillRect(x0, floorY - 5, x1 - x0, 6);
+    };
+    const doorStep = (dx0: number, dx1: number): void => {
+      sc.fillStyle = rgba(0, 0, 0, 0.2);
+      sc.fillRect(dx0, Y(0.62), dx1 - dx0, Y(RISER) - Y(0.62));
+    };
+    const spots = (x0: number, x1: number, count: number): void => {
+      // Ceiling: a darker strip with recessed spots drawn as bright discs (they bloom in the emissive).
+      sc.fillStyle = '#6a625a';
+      sc.fillRect(x0, Y(GLASS_TOP), x1 - x0, Y(3.05) - Y(GLASS_TOP));
+      for (let k = 0; k < count; k++) {
+        const cx = x0 + ((k + 0.5) / count) * (x1 - x0);
+        sc.fillStyle = '#fff4dc';
+        sc.beginPath();
+        sc.arc(cx, Y(3.16), 7, 0, Math.PI * 2);
+        sc.fill();
+      }
+    };
+    let mx = 0;
+    const fasciaFont = `900 ${Math.round(0.42 * sy)}px 'Trebuchet MS', 'Segoe UI', 'DejaVu Sans', Arial, sans-serif`;
+    for (const bay of bays) {
+      const bx0 = X(mx), bx1 = X(mx + bay.w);
+      const ix0 = X(mx + PIER / 2), ix1 = X(mx + bay.w - PIER / 2);
+      mx += bay.w;
+      if (bay.kind === 'door') {
+        // Recessed apartment entrance: dark reveal, a panelled timber door with a fanlight, a step and a number plate.
+        m.ctx.fillStyle = '#2a2622';
+        m.ctx.fillRect(ix0, Y(FASCIA_Y), ix1 - ix0, Y(0) - Y(FASCIA_Y));
+        const dw = Math.min(0.9 * sx, ix1 - ix0 - 12), dx = (ix0 + ix1) / 2 - dw / 2;
+        m.ctx.fillStyle = '#6a4426';
+        m.ctx.fillRect(dx, Y(2.5), dw, Y(0.42) - Y(2.5));
+        for (const [py0, py1] of [[2.3, 1.55], [1.35, 0.6]]) {
+          this.softRect(m.ctx, dx + 10, Y(py0), dw - 20, Y(py1) - Y(py0), '#000', 0.3);
+          this.softRect(m.ctx, dx + 14, Y(py0) + 4, dw - 28, Y(py1) - Y(py0) - 8, '#8a5c34', 1);
+        }
+        m.ctx.fillStyle = '#c8a040';
+        m.ctx.fillRect(dx + dw - 16, Y(1.05), 6, 12);
+        // Fanlight and its dim lamp.
+        m.ctx.fillStyle = '#9fb0b8';
+        m.ctx.fillRect(dx, Y(2.95), dw, Y(2.55) - Y(2.95));
+        e.ctx.fillStyle = rgba(150, 120, 80, 1);
+        e.ctx.fillRect(dx, Y(2.95), dw, Y(2.55) - Y(2.95));
+        // Step and number plate.
+        m.ctx.fillStyle = '#8a8478';
+        m.ctx.fillRect(ix0, Y(0.42), ix1 - ix0, Y(0) - Y(0.42));
+        this.softRect(m.ctx, ix0, Y(0.42), ix1 - ix0, 3, '#fff', 0.35);
+        m.ctx.fillStyle = '#1a3c8c';
+        m.ctx.fillRect(dx - 22, Y(2.2), 18, 14);
+        // Lintel band where the fascia would be.
+        m.ctx.fillStyle = hex(bay.fascia);
+        m.ctx.fillRect(bx0, Y(SHOP_BAND_H), bx1 - bx0, Y(FASCIA_Y));
+        // Structure: the recess sits back, the door step forward.
+        n.ctx.fillStyle = grey(0.22);
+        n.ctx.fillRect(ix0, Y(FASCIA_Y), ix1 - ix0, Y(0.42) - Y(FASCIA_Y));
+        n.ctx.fillStyle = grey(0.35);
+        n.ctx.fillRect(dx, Y(2.95), dw, Y(0.42) - Y(2.95));
+        r.ctx.fillStyle = grey(0.55);
+        r.ctx.fillRect(dx, Y(2.5), dw, Y(0.42) - Y(2.5));
+      } else if (bay.kind === 'shutter') {
+        // Rolled steel shutter down over the whole opening: a housing box, slats, a tag sprayed low.
+        m.ctx.fillStyle = '#5a5e62';
+        m.ctx.fillRect(ix0, Y(GLASS_TOP + 0.05), ix1 - ix0, Y(3.0) - Y(GLASS_TOP + 0.05));
+        this.softRect(m.ctx, ix0, Y(3.0), ix1 - ix0, 6, '#000', 0.35);
+        for (let y = Y(3.0); y < Y(RISER); y += 10) {
+          m.ctx.fillStyle = '#9ca2a6';
+          m.ctx.fillRect(ix0, y, ix1 - ix0, 10);
+          this.softRect(m.ctx, ix0, y, ix1 - ix0, 3, '#fff', 0.3);
+          this.softRect(m.ctx, ix0, y + 6, ix1 - ix0, 4, '#000', 0.3);
+          n.ctx.fillStyle = grey(0.58);
+          n.ctx.fillRect(ix0, y, ix1 - ix0, 5);
+          n.ctx.fillStyle = grey(0.42);
+          n.ctx.fillRect(ix0, y + 5, ix1 - ix0, 5);
+        }
+        m.ctx.lineCap = 'round';
+        m.ctx.lineWidth = 9;
+        m.ctx.strokeStyle = rgba(230, 40, 120, 0.8);
+        m.ctx.beginPath();
+        m.ctx.moveTo(ix0 + 30, Y(1.1));
+        m.ctx.quadraticCurveTo(ix0 + 70, Y(0.5), ix0 + 110, Y(1.05));
+        m.ctx.lineTo(ix0 + 150, Y(0.6));
+        m.ctx.stroke();
+        m.ctx.strokeStyle = rgba(40, 60, 200, 0.7);
+        m.ctx.beginPath();
+        m.ctx.moveTo(ix0 + 90, Y(0.9));
+        m.ctx.quadraticCurveTo(ix0 + 140, Y(1.4), ix0 + 190, Y(0.85));
+        m.ctx.stroke();
+        r.ctx.fillStyle = grey(0.5);
+        r.ctx.fillRect(ix0, Y(GLASS_TOP + 0.05), ix1 - ix0, Y(RISER) - Y(GLASS_TOP + 0.05));
+      } else {
+        // Glazed shop: interior scene, then the glass over it.
+        const gx0 = ix0 + 6, gx1 = ix1 - 6, gy0 = Y(GLASS_TOP), gy1 = Y(RISER);
+        const doorLeft = rng.chance(0.5);
+        // Inner width in metres; the narrow bays (< 2 m) get one mirror / mannequin and shorter counters.
+        const bw = (gx1 - gx0) / sx, narrow = bw < 2.0;
+        const dw = 0.8 * sx;
+        const dx0 = doorLeft ? gx0 + 6 : gx1 - 6 - dw, dx1 = dx0 + dw;
+        sc.save();
+        sc.beginPath();
+        sc.rect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+        sc.clip();
+        switch (bay.kind) {
+          case 'bakkal': {
+            shelves(gx0, gx1, [1.35, 1.95, 2.55], false, '#c9b48a');
+            spots(gx0, gx1, 2);
+            floor(gx0, gx1, '#b8ae9e', rgba(60, 50, 40, 0.5));
+            // Fruit crates stacked at the window.
+            const cx = doorLeft ? gx1 - 0.9 * sx : gx0 + 10;
+            for (let row = 0; row < 2; row++) {
+              for (let k = 0; k < 2; k++) {
+                const x = cx + k * 0.42 * sx, y = Y(0.85 + row * 0.32);
+                sc.fillStyle = '#a8804a';
+                sc.fillRect(x, y - 0.3 * sy, 0.38 * sx, 0.3 * sy);
+                sc.fillStyle = ['#ff8a2a', '#d8302a', '#5cc040', '#f2d040'][rng.int(0, 3)];
+                for (let b = 0; b < 4; b++) { sc.beginPath(); sc.arc(x + 6 + b * 8, y - 0.3 * sy + 5, 5, 0, Math.PI * 2); sc.fill(); }
+              }
+            }
+            counter(doorLeft ? gx0 + dw + 16 : gx0 + 10, doorLeft ? gx0 + dw + 16 + 0.6 * sx : gx0 + 10 + 0.6 * sx, '#7a5a3a', '#e0d6c4');
+            break;
+          }
+          case 'eczane': {
+            sc.fillStyle = '#eef2ee';
+            sc.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+            for (const yb of [1.4, 2.0, 2.6]) {
+              const y = Y(yb);
+              sc.fillStyle = '#d8dcd8';
+              sc.fillRect(gx0, y, gx1 - gx0, 5);
+              for (let x = gx0 + 8; x < gx1 - 14;) {
+                const w = rng.range(10, 16), h = rng.range(14, 26);
+                sc.fillStyle = rng.chance(0.6) ? '#f8fafc' : rng.chance(0.5) ? '#3b78c8' : '#3cb060';
+                sc.fillRect(x, y - h, w, h);
+                sc.fillStyle = rgba(0, 0, 0, 0.12);
+                sc.fillRect(x, y - h, w, 3);
+                x += w + 4;
+              }
+            }
+            spots(gx0, gx1, 3);
+            floor(gx0, gx1, '#d4d6d2', rgba(70, 76, 80, 0.35));
+            counter(doorLeft ? gx1 - 0.7 * sx : gx0 + 12, doorLeft ? gx1 - 12 : gx0 + 0.7 * sx, '#e8ece8', '#b8c4c8');
+            // Green cross on the side wall.
+            const cxp = doorLeft ? gx0 + 24 : gx1 - 64;
+            sc.fillStyle = '#1e9a4c';
+            sc.fillRect(cxp, Y(2.75), 40, 40);
+            sc.fillStyle = '#ffffff';
+            sc.fillRect(cxp + 16, Y(2.75) + 6, 8, 28);
+            sc.fillRect(cxp + 6, Y(2.75) + 16, 28, 8);
+            break;
+          }
+          case 'kebap': {
+            sc.fillStyle = '#8a3628';
+            sc.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+            // Menu board on the back wall.
+            const mbx = doorLeft ? gx1 - 1.0 * sx : gx0 + 16;
+            sc.fillStyle = '#2a1a14';
+            sc.fillRect(mbx, Y(2.9), 0.85 * sx, Y(2.05) - Y(2.9));
+            sc.fillStyle = rgba(255, 236, 200, 0.85);
+            for (let yy = Y(2.8); yy < Y(2.1); yy += 12) sc.fillRect(mbx + 8, yy, rng.range(30, 70), 4);
+            spots(gx0, gx1, 2);
+            floor(gx0, gx1, '#b09a80', rgba(60, 40, 30, 0.5));
+            // Counter with a steel top and the doner spit standing on it.
+            const kx0 = doorLeft ? gx0 + dw + 16 : gx0 + 10, kx1 = doorLeft ? gx1 - 10 : gx1 - dw - 16;
+            counter(kx0, kx1, '#4a3a30', '#c8ccd0');
+            const sxp = (kx0 + kx1) / 2;
+            const spit = sc.createLinearGradient(sxp - 18, 0, sxp + 18, 0);
+            spit.addColorStop(0, '#7a4218');
+            spit.addColorStop(0.45, '#d89048');
+            spit.addColorStop(1, '#8a4c1c');
+            sc.fillStyle = spit;
+            sc.beginPath();
+            sc.moveTo(sxp - 12, Y(2.35));
+            sc.lineTo(sxp + 12, Y(2.35));
+            sc.lineTo(sxp + 20, Y(1.15));
+            sc.lineTo(sxp - 20, Y(1.15));
+            sc.closePath();
+            sc.fill();
+            sc.fillStyle = '#c0c4c8';
+            sc.fillRect(sxp - 2, Y(2.55), 4, Y(1.0) - Y(2.55));
+            sc.fillStyle = rgba(255, 120, 40, 0.5);
+            sc.fillRect(sxp + 24, Y(2.3), 10, Y(1.2) - Y(2.3));
+            break;
+          }
+          case 'kuafor': {
+            sc.fillStyle = '#caa8bc';
+            sc.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+            spots(gx0, gx1, 3);
+            floor(gx0, gx1, '#c8c0c4', rgba(60, 40, 60, 0.35));
+            // Two mirrors with chairs in front of them.
+            for (let k = 0; k < (narrow ? 1 : 2); k++) {
+              const x = (doorLeft ? gx0 + dw + 0.15 * sx : gx0 + 0.15 * sx) + k * 0.8 * sx;
+              sc.fillStyle = '#3a3038';
+              sc.fillRect(x - 4, Y(2.55), 0.62 * sx + 8, Y(1.45) - Y(2.55) + 8);
+              const mg = sc.createLinearGradient(0, Y(2.55), 0, Y(1.45));
+              mg.addColorStop(0, '#eef4f8');
+              mg.addColorStop(1, '#b8c8d4');
+              sc.fillStyle = mg;
+              sc.fillRect(x, Y(2.55) + 4, 0.62 * sx, Y(1.45) - Y(2.55));
+              sc.fillStyle = '#26262c';
+              sc.fillRect(x + 8, Y(1.3), 0.46 * sx, Y(0.7) - Y(1.3));
+              sc.fillStyle = '#9aa0a6';
+              sc.fillRect(x + 0.24 * sx, Y(0.7), 10, Y(0.5) - Y(0.7));
+              sc.fillRect(x + 0.1 * sx, Y(0.5), 0.3 * sx, 6);
+            }
+            poster(doorLeft ? gx0 + 16 : gx1 - 66, Y(2.7), 50, 70, '#d8407a');
+            break;
+          }
+          case 'simit': {
+            sc.fillStyle = '#d9b070';
+            sc.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+            spots(gx0, gx1, 2);
+            floor(gx0, gx1, '#c4b49a', rgba(70, 50, 30, 0.45));
+            // Back shelves and a glass display case, both stacked with simit rings.
+            const ring = (x: number, y: number): void => {
+              sc.fillStyle = '#c98a3a';
+              sc.beginPath(); sc.arc(x, y, 9, 0, Math.PI * 2); sc.fill();
+              sc.fillStyle = '#7a4c18';
+              sc.beginPath(); sc.arc(x, y, 3.5, 0, Math.PI * 2); sc.fill();
+              sc.fillStyle = rgba(255, 240, 200, 0.35);
+              sc.beginPath(); sc.arc(x - 2, y - 3, 4, 0, Math.PI * 2); sc.fill();
+            };
+            for (const yb of [1.7, 2.2, 2.7]) {
+              sc.fillStyle = '#8a6030';
+              sc.fillRect(gx0, Y(yb), gx1 - gx0, 5);
+              for (let x = gx0 + 14; x < gx1 - 10; x += 20) ring(x, Y(yb) - 9);
+            }
+            const cx0 = doorLeft ? gx0 + dw + 12 : gx0 + 10, cx1 = doorLeft ? gx1 - 10 : gx1 - dw - 12;
+            counter(cx0, cx1, '#e8e2d8', '#b0aca4');
+            sc.fillStyle = rgba(200, 230, 240, 0.35);
+            sc.fillRect(cx0, Y(1.45), cx1 - cx0, Y(0.95) - Y(1.45));
+            for (let x = cx0 + 14; x < cx1 - 10; x += 20) ring(x, Y(1.1));
+            break;
+          }
+          case 'market': {
+            shelves(gx0, gx1, [1.15, 1.65, 2.15, 2.65], true, '#e6e6de');
+            spots(gx0, gx1, 3);
+            floor(gx0, gx1, '#d0d2cc', rgba(60, 64, 70, 0.35));
+            // Drinks fridge by the door.
+            const fw = 0.6 * sx, fx = doorLeft ? gx0 + dw + 14 : gx1 - 14 - fw;
+            sc.fillStyle = '#e4e8ec';
+            sc.fillRect(fx, Y(2.3), fw, Y(0.45) - Y(2.3));
+            sc.fillStyle = '#24405c';
+            sc.fillRect(fx + 6, Y(2.15), fw - 12, Y(0.6) - Y(2.15));
+            sc.fillStyle = rgba(120, 200, 255, 0.6);
+            sc.fillRect(fx + 6, Y(2.15), fw - 12, 4);
+            for (let yy = Y(1.95); yy < Y(0.7); yy += 22) for (let x = fx + 12; x < fx + fw - 16; x += 12) { sc.fillStyle = GOODS[rng.int(0, 3)]; sc.fillRect(x, yy, 8, 16); }
+            break;
+          }
+          case 'butik': {
+            sc.fillStyle = '#efe6d8';
+            sc.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+            spots(gx0, gx1, 3);
+            floor(gx0, gx1, '#c8b8a0', rgba(80, 60, 40, 0.4));
+            // Clothes rail across the back.
+            sc.fillStyle = '#8a8a90';
+            sc.fillRect(gx0 + 10, Y(2.3), gx1 - gx0 - 20, 4);
+            for (let x = gx0 + 20; x < gx1 - 30; x += 22) {
+              sc.fillStyle = GOODS[rng.int(0, GOODS.length - 1)];
+              sc.fillRect(x, Y(2.3) + 8, 16, Y(1.3) - Y(2.3));
+            }
+            // Mannequins in the window: torso on a stand.
+            for (let k = 0; k < (narrow ? 1 : 2); k++) {
+              const x = doorLeft ? gx1 - 0.5 * sx - k * 0.55 * sx : gx0 + 0.12 * sx + k * 0.55 * sx;
+              sc.fillStyle = '#3a3a40';
+              sc.fillRect(x + 0.14 * sx, Y(0.85), 6, Y(0.42) - Y(0.85));
+              sc.fillRect(x + 0.04 * sx, Y(0.42), 0.26 * sx, 6);
+              sc.fillStyle = k === 0 ? '#d84060' : '#3868b8';
+              sc.beginPath();
+              sc.moveTo(x, Y(1.95));
+              sc.lineTo(x + 0.34 * sx, Y(1.95));
+              sc.lineTo(x + 0.3 * sx, Y(0.9));
+              sc.lineTo(x + 0.04 * sx, Y(0.9));
+              sc.closePath();
+              sc.fill();
+              sc.fillStyle = '#e8d8c8';
+              sc.beginPath(); sc.arc(x + 0.17 * sx, Y(2.1), 11, 0, Math.PI * 2); sc.fill();
+            }
+            poster(doorLeft ? gx0 + 16 : gx1 - 66, Y(2.85), 50, 70, '#e0a030');
+            break;
+          }
+          default:
+            break;
+        }
+        doorStep(dx0, dx1);
+        sc.restore();
+        // Albedo: dark glass, the scene seen through it, a sky gradient and a diagonal sheen over it.
+        m.ctx.fillStyle = '#2c3e4e';
+        m.ctx.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+        m.ctx.globalAlpha = 0.78;
+        m.ctx.drawImage(scene.canvas, gx0, gy0, gx1 - gx0, gy1 - gy0, gx0, gy0, gx1 - gx0, gy1 - gy0);
+        m.ctx.globalAlpha = 1;
+        const refl = m.ctx.createLinearGradient(0, gy0, 0, gy1);
+        refl.addColorStop(0, rgba(200, 228, 244, 0.28));
+        refl.addColorStop(0.4, rgba(200, 228, 244, 0.04));
+        refl.addColorStop(1, rgba(20, 30, 40, 0.16));
+        m.ctx.fillStyle = refl;
+        m.ctx.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+        m.ctx.save();
+        m.ctx.beginPath();
+        m.ctx.rect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+        m.ctx.clip();
+        const shx = gx0 + (gx1 - gx0) * rng.range(0.2, 0.6);
+        const sheen = m.ctx.createLinearGradient(shx, gy0, shx + 90, gy1);
+        sheen.addColorStop(0, rgba(255, 255, 255, 0));
+        sheen.addColorStop(0.45, rgba(255, 255, 255, 0.1));
+        sheen.addColorStop(0.55, rgba(255, 255, 255, 0.1));
+        sheen.addColorStop(1, rgba(255, 255, 255, 0));
+        m.ctx.fillStyle = sheen;
+        m.ctx.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+        m.ctx.restore();
+        // Emissive: the scene under a warm ceiling light that falls off toward the floor.
+        e.ctx.drawImage(scene.canvas, gx0, gy0, gx1 - gx0, gy1 - gy0, gx0, gy0, gx1 - gx0, gy1 - gy0);
+        e.ctx.save();
+        e.ctx.globalCompositeOperation = 'multiply';
+        const warm = e.ctx.createLinearGradient(0, gy0, 0, gy1);
+        warm.addColorStop(0, rgba(255, 226, 180, 1));
+        warm.addColorStop(0.55, rgba(230, 190, 140, 1));
+        warm.addColorStop(1, rgba(120, 90, 60, 1));
+        e.ctx.fillStyle = warm;
+        e.ctx.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+        e.ctx.restore();
+        // Frames: head and jambs, the door's frame and push bar, one mullion per ~1.1 m; black in the emissive.
+        const mullions: number[] = [];
+        for (let x = gx0 + 0.9 * sx; x < gx1 - 0.4 * sx; x += 0.9 * sx) if (x < dx0 - 12 || x > dx1 + 12) mullions.push(x);
+        for (const c of [m.ctx, e.ctx]) {
+          c.fillStyle = c === m.ctx ? '#2a3038' : '#000';
+          c.fillRect(gx0 - 6, gy0 - 6, gx1 - gx0 + 12, 8);
+          c.fillRect(gx0 - 6, gy0, 6, gy1 - gy0);
+          c.fillRect(gx1, gy0, 6, gy1 - gy0);
+          for (const x of mullions) c.fillRect(x - 3, gy0, 6, gy1 - gy0);
+          c.fillRect(dx0 - 5, gy0, 5, gy1 - gy0);
+          c.fillRect(dx1, gy0, 5, gy1 - gy0);
+          c.fillRect(dx0, Y(1.05), dw, 5);
+          c.fillRect(dx0, Y(2.35), dw, 4);
+        }
+        this.softRect(m.ctx, gx0 - 6, gy0 - 6, gx1 - gx0 + 12, 3, '#9aa8b4', 0.7);
+        for (const x of mullions) this.softRect(m.ctx, x - 3, gy0, 3, gy1 - gy0, '#9aa8b4', 0.5);
+        this.softRect(m.ctx, dx0, Y(1.05), dw, 2, '#c8d0d8', 0.7);
+        // Structure: glass recessed, frames raised. Roughness: glass smooth, frames satin.
+        n.ctx.fillStyle = grey(0.36);
+        n.ctx.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+        n.ctx.fillStyle = grey(0.62);
+        n.ctx.fillRect(gx0 - 6, gy0 - 6, gx1 - gx0 + 12, 8);
+        for (const x of mullions) n.ctx.fillRect(x - 3, gy0, 6, gy1 - gy0);
+        n.ctx.fillRect(dx0 - 5, gy0, 5, gy1 - gy0);
+        n.ctx.fillRect(dx1, gy0, 5, gy1 - gy0);
+        r.ctx.fillStyle = grey(0.22);
+        r.ctx.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+        r.ctx.fillStyle = grey(0.55);
+        for (const x of mullions) r.ctx.fillRect(x - 3, gy0, 6, gy1 - gy0);
+      }
+      // Fascia: a painted sign box with the shop name, a lit top edge and a shadow under it; dimly backlit at night.
+      if (bay.kind !== 'door') {
+        const fy0 = Y(SHOP_BAND_H), fy1 = Y(FASCIA_Y);
+        m.ctx.fillStyle = hex(bay.fascia);
+        m.ctx.fillRect(bx0 + 3, fy0, bx1 - bx0 - 6, fy1 - fy0);
+        this.softRect(m.ctx, bx0 + 3, fy0, bx1 - bx0 - 6, 4, '#fff', 0.2);
+        this.softRect(m.ctx, bx0 + 3, fy1 - 8, bx1 - bx0 - 6, 8, '#000', 0.35);
+        const fg = e.ctx.createLinearGradient(0, fy0, 0, fy1);
+        fg.addColorStop(0, tint(bay.fascia, -0.55));
+        fg.addColorStop(1, tint(bay.fascia, -0.7));
+        e.ctx.fillStyle = fg;
+        e.ctx.fillRect(bx0 + 3, fy0, bx1 - bx0 - 6, fy1 - fy0);
+        for (const c of [m.ctx, e.ctx]) {
+          c.font = fasciaFont;
+          c.textAlign = 'center';
+          c.textBaseline = 'middle';
+          c.fillStyle = c === m.ctx ? hex(bay.text) : tint(bay.glow, 0.25);
+          c.fillText(bay.name, (bx0 + bx1) / 2, (fy0 + fy1) / 2 + 2, bx1 - bx0 - 40);
+        }
+        n.ctx.fillStyle = grey(0.56);
+        n.ctx.fillRect(bx0 + 3, fy0, bx1 - bx0 - 6, fy1 - fy0);
+        r.ctx.fillStyle = grey(0.55);
+        r.ctx.fillRect(bx0 + 3, fy0, bx1 - bx0 - 6, fy1 - fy0);
+        // Awning valance shadow just under the fascia (the real awning is geometry, and only on the street face).
+        this.softRect(m.ctx, bx0 + 3, fy1, bx1 - bx0 - 6, 8, '#000', 0.25);
+      }
+      // Stone piers between the bays (each bay owns the pier on its left; the last one wraps to the seam).
+      const pxl = bx0 - X(PIER / 2), pw = X(PIER);
       m.ctx.fillStyle = '#a9a396';
-      m.ctx.fillRect(x, fasciaH, 16, H - fasciaH);
-      m.ctx.fillStyle = rgba(255, 255, 255, 0.18);
-      m.ctx.fillRect(x + 1, fasciaH, 4, H - fasciaH);
-      // Glazing + door.
-      const gx = x + 18, gy = fasciaH + 12, gw = bw - 36, gh = kerbY - gy;
-      m.ctx.fillStyle = '#2c3e4e';
-      m.ctx.fillRect(gx, gy, gw, gh);
-      const doorW = 54, doorX = i % 2 === 0 ? gx + gw - doorW - 8 : gx + 8;
-      // Interior: a dim warm base, ceiling spots that bloom, and shelving / counters as dark silhouettes against them.
-      e.ctx.fillStyle = rgba(150, 118, 78, 1);
-      e.ctx.fillRect(gx, gy, gw, gh);
-      const spots = rng.int(2, 3);
-      for (let k = 0; k < spots; k++) {
-        const sx = gx + gw * ((k + 0.5) / spots) + rng.range(-18, 18), sy = gy + gh * 0.12, sr = gh * rng.range(0.45, 0.65);
-        const g = e.ctx.createRadialGradient(sx, sy, 0, sx, sy, sr);
-        g.addColorStop(0, rgba(255, 236, 200, 1));
-        g.addColorStop(0.35, rgba(255, 220, 160, 0.55));
-        g.addColorStop(1, rgba(255, 200, 130, 0));
-        e.ctx.fillStyle = g;
-        e.ctx.fillRect(sx - sr, sy - sr, sr * 2, sr * 2);
+      m.ctx.fillRect(pxl, Y(FASCIA_Y), pw, Y(0) - Y(FASCIA_Y));
+      this.softRect(m.ctx, pxl, Y(FASCIA_Y), 4, Y(0) - Y(FASCIA_Y), '#fff', 0.22);
+      this.softRect(m.ctx, pxl + pw - 5, Y(FASCIA_Y), 5, Y(0) - Y(FASCIA_Y), '#000', 0.28);
+      if (pxl < 0) {
+        m.ctx.fillRect(W + pxl, Y(FASCIA_Y), -pxl, Y(0) - Y(FASCIA_Y));
+        this.softRect(m.ctx, W + pxl, Y(FASCIA_Y), 4, Y(0) - Y(FASCIA_Y), '#fff', 0.22);
       }
-      e.ctx.fillStyle = rgba(0, 0, 0, 0.35);
-      e.ctx.fillRect(gx, gy + gh * 0.66, gw, gh * 0.34);
-      const shelves = rng.int(3, 5);
-      for (let k = 0; k < shelves; k++) {
-        const sw = rng.range(14, 40), sh = gh * rng.range(0.3, 0.62);
-        const sx = gx + rng.range(4, gw - sw - 4);
-        e.ctx.fillStyle = rgba(0, 0, 0, 0.62);
-        e.ctx.fillRect(sx, gy + gh - sh, sw, sh);
-        m.ctx.fillStyle = rgba(0, 0, 0, 0.18);
-        m.ctx.fillRect(sx, gy + gh - sh, sw, sh);
-      }
-      // Mullions over the glass in both maps.
-      for (const c of [m.ctx, e.ctx]) {
-        c.fillStyle = c === m.ctx ? 'rgba(30,38,46,0.95)' : 'rgba(0,0,0,0.85)';
-        for (let k = 1; k < 4; k++) c.fillRect(gx + (gw * k) / 4 - 3, gy, 6, gh);
-        c.fillRect(gx - 3, gy - 3, gw + 6, 6);
-        c.fillRect(doorX, gy, 4, gh);
-        c.fillRect(doorX + doorW, gy, 4, gh);
-        c.fillRect(doorX, gy + gh * 0.18, doorW, 5);
-      }
-      m.ctx.fillStyle = rgba(200, 216, 230, 0.35);
-      for (let k = 1; k < 4; k++) m.ctx.fillRect(gx + (gw * k) / 4 - 3, gy, 1, gh);
-      // Awning valance stub drawn on the wall (the real awning is geometry).
-      m.ctx.fillStyle = rgba(0, 0, 0, 0.28);
-      m.ctx.fillRect(x + 2, fasciaH, bw - 4, 7);
+      e.ctx.fillStyle = '#000';
+      e.ctx.fillRect(pxl, 0, pw, H);
+      if (pxl < 0) e.ctx.fillRect(W + pxl, 0, -pxl, H);
+      n.ctx.fillStyle = grey(0.64);
+      n.ctx.fillRect(pxl, Y(FASCIA_Y), pw, Y(0) - Y(FASCIA_Y));
+      if (pxl < 0) n.ctx.fillRect(W + pxl, Y(FASCIA_Y), -pxl, Y(0) - Y(FASCIA_Y));
     }
-    // Kerb / plinth strip along the bottom.
+    // Stall riser / plinth strip along the bottom (under the glazing, the piers stand on it).
     m.ctx.fillStyle = '#6c6a66';
-    m.ctx.fillRect(0, kerbY, W, H - kerbY);
-    m.ctx.fillStyle = rgba(0, 0, 0, 0.3);
-    m.ctx.fillRect(0, kerbY, W, 3);
-    this.grime(m.ctx, W, H, rng, H * 0.6, 0);
+    m.ctx.fillRect(0, Y(RISER), W, H - Y(RISER));
+    this.softRect(m.ctx, 0, Y(RISER), W, 4, '#000', 0.3);
+    e.ctx.fillStyle = '#000';
+    e.ctx.fillRect(0, Y(RISER), W, H - Y(RISER));
+    n.ctx.fillStyle = grey(0.56);
+    n.ctx.fillRect(0, Y(RISER), W, H - Y(RISER));
+    r.ctx.fillStyle = grey(0.85);
+    r.ctx.fillRect(0, Y(RISER), W, H - Y(RISER));
+    this.grime(m.ctx, W, H, rng, H * 0.6, 0, 2);
+    this.soften(m.ctx, W, H);
     const map = this.finish(key + ':map', m.canvas, true, true, true);
     const emissive = this.finish(key + ':emi', e.canvas, true, true, true);
-    // Relief and roughness only need the mullion / pier steps: derive both from a half-res copy.
-    const half = this.canvas(W / 2, H / 2);
-    half.ctx.drawImage(m.canvas, 0, 0, W / 2, H / 2);
-    const normal = this.normalFromLuminance(key + ':nrm', half.canvas, 5.5);
-    const rough = this.roughFromLuminance(key + ':rgh', half.canvas, 0.1, 0.92);
+    const normal = this.normalFromLuminance(key + ':nrm', n.canvas, 5, 8);
+    const rough = this.finish(key + ':rgh', r.canvas, false, true, true);
     return { map, emissive, normal, rough };
   }
 
@@ -898,7 +1462,9 @@ export class TextureFactory {
     if (mk && ek && nk && rk) return { map: mk, emissive: ek, normal: nk, rough: rk };
     const W = 1024, H = 384;
     const rng = new Random(1607);
-    const m = this.canvas(W, H), e = this.canvas(W, H);
+    // The emissive only carries pane-sized lobby shapes: half resolution through a scaled context.
+    const m = this.canvas(W, H), e = this.canvas(W / 2, H / 2);
+    e.ctx.scale(0.5, 0.5);
     m.ctx.fillStyle = '#4a4e58';
     m.ctx.fillRect(0, 0, W, H);
     this.mottle(m.ctx, W, H, rng, 70, 20, 60, 0.06, 4000, 0.03, false);
@@ -962,13 +1528,14 @@ export class TextureFactory {
     m.ctx.fillStyle = '#2f333b';
     m.ctx.fillRect(0, base, W, H - base);
     this.grime(m.ctx, W, H, rng, H * 0.6, 0);
+    this.soften(m.ctx, W, H);
     const map = this.finish(key + ':map', m.canvas, true, true, true);
     const emissive = this.finish(key + ':emi', e.canvas, true, true, true);
     // Relief and roughness only need the mullion / pier steps: derive both from a half-res copy.
     const half = this.canvas(W / 2, H / 2);
     half.ctx.drawImage(m.canvas, 0, 0, W / 2, H / 2);
-    const normal = this.normalFromLuminance(key + ':nrm', half.canvas, 5.5);
-    const rough = this.roughFromLuminance(key + ':rgh', half.canvas, 0.1, 0.92);
+    const normal = this.normalFromLuminance(key + ':nrm', half.canvas, 5.5, 8);
+    const rough = this.roughFromLuminance(key + ':rgh', half.canvas, 0.26, 0.92);
     return { map, emissive, normal, rough };
   }
 
@@ -1585,16 +2152,16 @@ export class TextureFactory {
     return this.finish(key, canvas, true);
   }
 
-  /** One 1024x1024 atlas with a glowing white row per word; tint via vertex colors. Returns per-word UV rects. */
+  /** One 512 x 1024 atlas (2 MB) with a glowing white row per word - the words are short, so half the width of the old square atlas keeps the same 52 px row height; tint via vertex colors. Returns per-word UV rects. */
   neonAtlas(words: readonly string[]): { texture: THREE.CanvasTexture; rects: Map<string, AtlasRect> } {
     const key = 'neonAtlas';
     const c = this.cache.get(key) as THREE.CanvasTexture | undefined;
     if (c && this.atlasRects) return { texture: c, rects: this.atlasRects };
-    const S = 1024;
-    const { canvas, ctx } = this.canvas(S, S);
-    ctx.clearRect(0, 0, S, S);
+    const SW = 512, SH = 1024;
+    const { canvas, ctx } = this.canvas(SW, SH);
+    ctx.clearRect(0, 0, SW, SH);
     const rows = Math.max(1, words.length);
-    const rh = Math.floor(S / rows);
+    const rh = Math.floor(SH / rows);
     const fontPx = Math.floor(rh * 0.62);
     ctx.font = `900 ${fontPx}px 'Trebuchet MS', 'Segoe UI', Arial, sans-serif`;
     ctx.textBaseline = 'middle';
@@ -1603,82 +2170,113 @@ export class TextureFactory {
     for (let i = 0; i < words.length; i++) {
       const w = words[i];
       const y = i * rh + rh / 2;
-      const tw = Math.min(S - 40, ctx.measureText(w).width);
+      const tw = Math.min(SW - 40, ctx.measureText(w).width);
       const x = 20;
       ctx.shadowColor = 'rgba(255,255,255,0.95)';
       ctx.shadowBlur = fontPx * 0.5;
       ctx.fillStyle = 'rgba(255,255,255,0.6)';
-      ctx.fillText(w, x, y, S - 40);
-      ctx.fillText(w, x, y, S - 40);
-      ctx.fillText(w, x, y, S - 40);
+      ctx.fillText(w, x, y, SW - 40);
+      ctx.fillText(w, x, y, SW - 40);
+      ctx.fillText(w, x, y, SW - 40);
       ctx.shadowBlur = fontPx * 0.12;
       ctx.fillStyle = '#ffffff';
-      ctx.fillText(w, x, y, S - 40);
+      ctx.fillText(w, x, y, SW - 40);
       ctx.shadowBlur = 0;
       const pad = fontPx * 0.35;
-      rects.set(w, { u0: (x - pad) / S, u1: (x + tw + pad) / S, v0: 1 - (i * rh + rh) / S, v1: 1 - (i * rh) / S });
+      rects.set(w, { u0: (x - pad) / SW, u1: (x + tw + pad) / SW, v0: 1 - (i * rh + rh) / SH, v1: 1 - (i * rh) / SH });
     }
     const texture = this.finish(key, canvas, true, false);
     this.atlasRects = rects;
     return { texture, rects };
   }
 
-  /** Palm frond with alpha: a tapered leaf with feathered leaflets, tip toward +v. Leaflets darken toward the rachis, some tips have dried. */
+  /**
+   * Palm frond with alpha (256 x 512, tip toward +v): 34 leaflet pairs, each split along its own vein into a lit
+   * upper half and a shaded lower half with a lighter vein between them, sweeping forward and hooking down at the
+   * tip. Leaflets are filled slivers, not hairlines: an alpha-tested texture with thin strokes dissolves in the lower
+   * mips and the palm turns into a cloud of speckles a few metres away. A fifth of the tips have dried.
+   */
   palmFrond(): THREE.CanvasTexture {
     const key = 'frond';
     const c = this.cache.get(key) as THREE.CanvasTexture | undefined;
     if (c) return c;
-    const W = 128, H = 256;
+    const W = 256, H = 512;
     const { canvas, ctx } = this.canvas(W, H);
     ctx.clearRect(0, 0, W, H);
     const rng = new Random(81);
     const cx = W / 2;
-    // Leaflets are filled slivers, not hairlines: an alpha-tested texture with thin strokes dissolves in the lower
-    // mips and the palm turns into a cloud of speckles a few metres away.
-    for (let i = 0; i < 20; i++) {
-      const t = i / 20;
-      const y = H - 10 - t * (H - 22);
-      const len = (1 - t * 0.8) * 54 + 8;
-      const drop = 24 + t * 8;
-      const wid = 9 - t * 3.5;
-      const j = rng.int(-8, 8);
+    const N = 34;
+    for (let i = 0; i < N; i++) {
+      const t = i / N;
+      const y = H - 16 - t * (H - 36);
+      const len = (1 - t * 0.78) * 112 + 14;
+      const sweep = 46 + t * 22;
+      const wid = 13 - t * 6;
+      const j = rng.int(-10, 10);
       for (const dir of [-1, 1]) {
-        const dry = rng.chance(0.2);
-        const ex = cx + dir * len, ey = y - drop;
-        // Rachis-to-tip gradient: shaded olive at the stem, lighter green at the tip; a fifth of the tips are dry.
-        const g = ctx.createLinearGradient(cx, y, ex, ey);
-        g.addColorStop(0, rgba(58 + j, 96 + j, 52, 1));
-        g.addColorStop(dry ? 0.55 : 1, rgba(110 + j, 150 + j, 70, 1));
-        if (dry) g.addColorStop(1, rgba(152, 118, 58, 1));
+        const dry = rng.chance(0.18);
+        const curl = rng.range(5, 12);
+        const ex = cx + dir * len, ey = y - sweep + curl;
+        // Control points: the vein bows forward, the tip hooks back down.
+        const vcx = cx + dir * len * 0.58, vcy = y - sweep * 0.42;
+        const tipCol = dry ? [156, 120, 58] : [116 + j, 160 + j, 72];
+        const tipShade = dry ? [118, 88, 40] : [80 + j, 122 + j, 54];
+        // Upper (lit) half.
+        let g = ctx.createLinearGradient(cx, y, ex, ey);
+        g.addColorStop(0, rgba(66 + j, 108 + j, 54, 1));
+        g.addColorStop(dry ? 0.6 : 1, rgba(tipCol[0] + (dry ? -20 : 0), tipCol[1] + (dry ? 20 : 0), tipCol[2], 1));
+        if (dry) g.addColorStop(1, rgba(tipCol[0], tipCol[1], tipCol[2], 1));
         ctx.fillStyle = g;
         ctx.beginPath();
-        ctx.moveTo(cx, y + wid * 0.5);
-        ctx.quadraticCurveTo(cx + dir * len * 0.55, y - drop * 0.15, ex, ey);
-        ctx.quadraticCurveTo(cx + dir * len * 0.5, y - drop * 0.5 + wid, cx, y - wid * 0.5);
+        ctx.moveTo(cx, y - wid * 0.5);
+        ctx.quadraticCurveTo(cx + dir * len * 0.5, y - sweep * 0.62 - wid * 0.4, ex, ey);
+        ctx.quadraticCurveTo(vcx, vcy, cx, y);
         ctx.closePath();
         ctx.fill();
-        // 1 px vein down the middle of the leaflet.
-        ctx.strokeStyle = rgba(40, 70, 36, 0.55);
-        ctx.lineWidth = 1;
+        // Lower (shaded) half.
+        g = ctx.createLinearGradient(cx, y, ex, ey);
+        g.addColorStop(0, rgba(44 + j, 80 + j, 42, 1));
+        g.addColorStop(1, rgba(tipShade[0], tipShade[1], tipShade[2], 1));
+        ctx.fillStyle = g;
         ctx.beginPath();
         ctx.moveTo(cx, y);
-        ctx.quadraticCurveTo(cx + dir * len * 0.52, y - drop * 0.32 + wid * 0.5, ex, ey);
+        ctx.quadraticCurveTo(vcx, vcy, ex, ey);
+        ctx.quadraticCurveTo(cx + dir * len * 0.5, y - sweep * 0.12 + wid * 0.5, cx, y + wid * 0.5);
+        ctx.closePath();
+        ctx.fill();
+        // Lighter vein between the halves, fading toward the tip.
+        const vg = ctx.createLinearGradient(cx, y, ex, ey);
+        vg.addColorStop(0, rgba(180 + j, 206 + j, 120, 0.7));
+        vg.addColorStop(1, rgba(180 + j, 206 + j, 120, 0.15));
+        ctx.strokeStyle = vg;
+        ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        ctx.moveTo(cx, y);
+        ctx.quadraticCurveTo(vcx, vcy, ex, ey);
         ctx.stroke();
       }
     }
-    // Rachis, tapering to the tip.
+    // Rachis, tapering to the tip, with a lit left edge.
     const rg = ctx.createLinearGradient(0, H, 0, 0);
     rg.addColorStop(0, '#6f8a44');
     rg.addColorStop(1, '#93b05c');
     ctx.fillStyle = rg;
     ctx.beginPath();
-    ctx.moveTo(cx - 5, H);
-    ctx.lineTo(cx + 5, H);
-    ctx.lineTo(cx + 1.5, 4);
-    ctx.lineTo(cx - 1.5, 4);
+    ctx.moveTo(cx - 8, H);
+    ctx.lineTo(cx + 8, H);
+    ctx.lineTo(cx + 2, 6);
+    ctx.lineTo(cx - 2, 6);
     ctx.closePath();
     ctx.fill();
-    this.bleedAlpha(ctx, W, H, 6);
+    ctx.fillStyle = rgba(220, 232, 170, 0.45);
+    ctx.beginPath();
+    ctx.moveTo(cx - 8, H);
+    ctx.lineTo(cx - 4, H);
+    ctx.lineTo(cx - 1, 6);
+    ctx.lineTo(cx - 2, 6);
+    ctx.closePath();
+    ctx.fill();
+    this.bleedAlpha(ctx, W, H, 8);
     return this.finish(key, canvas, true, false);
   }
 
@@ -1722,28 +2320,35 @@ export class TextureFactory {
     return this.finish(key, canvas, true);
   }
 
-  /** Palm trunk bark (64 x 256, tiles both ways): fibrous brown with chevron leaf-scar bands, a light ridge over a dark shadow. */
+  /**
+   * Palm trunk bark (128 x 512, tiles both ways): fibrous brown with wide, soft leaf-scar chevrons - a lit ridge, a
+   * darker fibrous band under it with short vertical fibres in it, and a shadow tail - softened 1 px so the bands
+   * read as bark at arm's length and average to a calm tone up the trunk.
+   */
   palmBark(): THREE.CanvasTexture {
     const key = 'bark';
     const c = this.cache.get(key) as THREE.CanvasTexture | undefined;
     if (c) return c;
-    const W = 64, H = 256;
+    const W = 128, H = 512;
     const { canvas, ctx } = this.canvas(W, H);
     const rng = new Random(83);
     ctx.fillStyle = '#8a6a44';
     ctx.fillRect(0, 0, W, H);
-    this.mottle(ctx, W, H, rng, 14, 8, 24, 0.08, 500, 0.05, true);
-    // Vertical fibres.
-    for (let i = 0; i < 40; i++) {
-      const v = rng.chance(0.5) ? 255 : 0;
+    this.mottle(ctx, W, H, rng, 30, 12, 40, 0.08, 0, 0, true);
+    // Vertical fibres: long faint strands and shorter darker ones.
+    for (let i = 0; i < 90; i++) {
+      const light = rng.chance(0.5), v = light ? 255 : 0;
       ctx.fillStyle = rgba(v, v * 0.9, v * 0.75, rng.range(0.03, 0.08));
-      ctx.fillRect(rng.range(0, W), 0, rng.range(1, 2), H);
+      const y = rng.range(0, H), h = rng.range(H * 0.2, H);
+      ctx.fillRect(rng.range(0, W), y, rng.range(1, 3), h);
+      if (y + h > H) ctx.fillRect(rng.range(0, W), 0, rng.range(1, 3), y + h - H);
     }
     // Leaf scars: chevrons (so the band meets itself across the u seam), alternating direction per band.
-    const bandH = 16;
-    for (let k = 0; k < H / bandH; k++) {
-      const y0 = k * bandH + rng.range(-2, 2);
-      const rise = (k % 2 === 0 ? 1 : -1) * rng.range(3, 6);
+    const bandH = 32;
+    const bands = H / bandH;
+    for (let k = 0; k < bands; k++) {
+      const y0 = k * bandH + rng.range(-3, 3);
+      const rise = (k % 2 === 0 ? 1 : -1) * rng.range(7, 11);
       const chevron = (y: number, h: number): void => {
         ctx.beginPath();
         ctx.moveTo(0, y);
@@ -1755,13 +2360,23 @@ export class TextureFactory {
         ctx.closePath();
         ctx.fill();
       };
-      ctx.fillStyle = rgba(232, 204, 156, 0.32);
-      chevron(y0, 2);
-      ctx.fillStyle = rgba(40, 24, 12, 0.45);
-      chevron(y0 + 2, 4);
-      ctx.fillStyle = rgba(40, 24, 12, 0.18);
-      chevron(y0 + 6, 3);
+      ctx.fillStyle = rgba(236, 208, 160, 0.3);
+      chevron(y0, 6);
+      ctx.fillStyle = rgba(250, 232, 196, 0.22);
+      chevron(y0 + 1, 2);
+      ctx.fillStyle = rgba(40, 24, 12, 0.42);
+      chevron(y0 + 6, 10);
+      ctx.fillStyle = rgba(40, 24, 12, 0.16);
+      chevron(y0 + 16, 7);
+      // Fibres inside the dark band: the torn edge of the old leaf base.
+      for (let f = 0; f < 14; f++) {
+        const x = rng.range(0, W);
+        const yy = y0 + 6 + rise * (1 - Math.abs(x - W / 2) / (W / 2));
+        ctx.fillStyle = rng.chance(0.7) ? rgba(20, 10, 4, 0.35) : rgba(230, 200, 150, 0.2);
+        ctx.fillRect(x, yy - rng.range(0, 3), rng.range(1, 2), rng.range(8, 16));
+      }
     }
+    this.soften(ctx, W, H);
     return this.finish(key, canvas, true);
   }
 
@@ -1811,44 +2426,49 @@ export class TextureFactory {
     return this.finish(key, canvas, true, false);
   }
 
-  /** Equirectangular star field (sampled by the sky dome shader): varied magnitudes plus a faint milky band. */
+  /**
+   * Equirectangular star field (sampled by the sky dome shader): varied magnitudes plus a faint milky band.
+   * 1024 x 512 (2 MB): the dome shader maps the lower half to the hemisphere below the horizon, which stays black, and
+   * a star is a single texel either way - at this size it lands as a soft 3-4 px point on a 720p frame.
+   */
   starField(): THREE.CanvasTexture {
     const key = 'stars';
     const c = this.cache.get(key) as THREE.CanvasTexture | undefined;
     if (c) return c;
-    const W = 2048, H = 1024;
+    const W = 1024, H = 512;
     const { canvas, ctx } = this.canvas(W, H);
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, W, H);
     const rng = new Random(91);
     // Milky band across the upper hemisphere.
     ctx.globalCompositeOperation = 'lighter';
-    for (let i = 0; i < 900; i++) {
+    for (let i = 0; i < 700; i++) {
       const x = rng.range(0, W);
       const band = H * 0.24 + Math.sin((x / W) * Math.PI * 2) * H * 0.1;
       const y = band + rng.range(-1, 1) * rng.range(0, 1) * H * 0.09;
       if (y < 0 || y > H * 0.55) continue;
-      const g = ctx.createRadialGradient(x, y, 0, x, y, rng.range(10, 34));
+      const rad = rng.range(5, 17);
+      const g = ctx.createRadialGradient(x, y, 0, x, y, rad);
       g.addColorStop(0, 'rgba(150,160,210,0.10)');
       g.addColorStop(1, 'rgba(120,130,190,0)');
       ctx.fillStyle = g;
-      ctx.fillRect(x - 34, y - 34, 68, 68);
+      ctx.fillRect(x - 17, y - 17, 34, 34);
     }
     ctx.globalCompositeOperation = 'source-over';
-    for (let i = 0; i < 2600; i++) {
-      const b = rng.range(0.25, 0.8);
+    for (let i = 0; i < 2000; i++) {
+      const b = rng.range(0.22, 0.75);
       ctx.fillStyle = rgba(255 * b, 255 * b, 255 * Math.min(1, b + 0.1), 1);
       ctx.fillRect(rng.range(0, W), rng.range(0, H * 0.55), 1, 1);
     }
-    // A handful of bright stars with a cross flare.
-    for (let i = 0; i < 90; i++) {
-      const x = rng.range(0, W), y = rng.range(0, H * 0.52);
+    // A handful of bright stars with a short cross flare.
+    for (let i = 0; i < 70; i++) {
+      const x = Math.floor(rng.range(1, W - 1)), y = Math.floor(rng.range(1, H * 0.52));
       const warm = rng.chance(0.3);
       ctx.fillStyle = warm ? 'rgba(255,225,190,1)' : 'rgba(220,236,255,1)';
-      ctx.fillRect(x, y, 2, 2);
-      ctx.fillStyle = warm ? 'rgba(255,225,190,0.4)' : 'rgba(220,236,255,0.4)';
-      ctx.fillRect(x - 2, y, 6, 1);
-      ctx.fillRect(x, y - 2, 1, 6);
+      ctx.fillRect(x, y, 1, 1);
+      ctx.fillStyle = warm ? 'rgba(255,225,190,0.45)' : 'rgba(220,236,255,0.45)';
+      ctx.fillRect(x - 1, y, 3, 1);
+      ctx.fillRect(x, y - 1, 1, 3);
     }
     return this.finish(key, canvas, true);
   }

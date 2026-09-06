@@ -9,7 +9,7 @@ import type { Materials } from './Materials';
 import { STYLES, TILE_M } from './Materials';
 import type { TextureFactory } from './TextureFactory';
 import { GLOW_U, MARK_UV } from './TextureFactory';
-import { BAND, GeoBuilder, appendBuilding, appendBuildingDetail, appendStreetLevel, landmarkGeometries } from './BuildingGeometry';
+import { BAND, GeoBuilder, appendBuilding, appendBuildingDetail, appendStreetLevel, bandHeight, landmarkGeometries } from './BuildingGeometry';
 import type { WallSign } from './BuildingGeometry';
 import { Random } from '../core/Random';
 import { PropRenderer } from './CityRendererProps';
@@ -170,11 +170,29 @@ export class CityRenderer {
     return true;
   }
 
+  /**
+   * Bits (FACE_BIT order: +Z, +X, -Z, -X) of the faces whose wall stands within STREET.bandMaxSetback of the block
+   * edge, i.e. the faces a street can see. Facade relief and arcade columns go only there: the inner faces of a
+   * 3x3 block look at the neighbouring building's back wall.
+   */
+  private streetFaces(b: Building, blockIdx: number): number {
+    if (blockIdx < 0) return 0;
+    const blk = this.city.blocks[blockIdx];
+    const m = STREET.bandMaxSetback;
+    let mask = 0;
+    if (blk.z1 - (b.z + b.d / 2) <= m) mask |= 1;
+    if (blk.x1 - (b.x + b.w / 2) <= m) mask |= 2;
+    if ((b.z - b.d / 2) - blk.z0 <= m) mask |= 4;
+    if ((b.x - b.w / 2) - blk.x0 <= m) mask |= 8;
+    return mask;
+  }
+
   private buildBuildings(): void {
     const builders: Record<string, GeoBuilder> = {};
-    // Roof trim (parapets, clutter, crowns) is one plain mesh kept out of the shadow pass; every glow part of every
-    // builder lands in one glow mesh; the ground-floor bands are two textured meshes (shopfront / downtown plinth).
-    const trim = new GeoBuilder(), glow = new GeoBuilder(), shopBand = new GeoBuilder(), plinthBand = new GeoBuilder();
+    // Roof trim (cornices, clutter, crowns) is one plain mesh kept out of the shadow pass; every glow part of every
+    // builder lands in one glow mesh; the ground-floor bands are two textured meshes (shopfront / downtown plinth);
+    // the shop awnings are one striped-canvas mesh.
+    const trim = new GeoBuilder(), glow = new GeoBuilder(), shopBand = new GeoBuilder(), plinthBand = new GeoBuilder(), awning = new GeoBuilder();
     trim.setGlowSink(glow);
     for (let i = 0; i < STYLES.length; i++) { builders[STYLES[i]] = new GeoBuilder(); builders[STYLES[i]].setGlowSink(glow); }
     const list = this.city.buildings;
@@ -185,22 +203,27 @@ export class CityRenderer {
     const rng = new Random(this.city.seed ^ 0x5eed);
     for (let i = 0; i < list.length; i++) {
       const b = list[i];
-      appendBuilding(builders[b.style], b);
-      appendBuildingDetail(builders[b.style], trim, b, rng, this.wallSigns);
-      if (this.wantsStreetLevel(b, blockOf[b.id])) {
-        const plinth = b.district === 'downtown';
-        appendStreetLevel(builders[b.style], plinth ? plinthBand : shopBand, b, rng, plinth);
-      }
+      const blockIdx = blockOf[b.id];
+      const street = this.wantsStreetLevel(b, blockIdx);
+      const plinth = b.district === 'downtown';
+      const mask = this.streetFaces(b, blockIdx);
+      // A shop arcade recesses the ground floor: the windowed walls start at the arcade ceiling (inside the cap).
+      const bandTop = street ? bandHeight(b, plinth) : 0;
+      appendBuilding(builders[b.style], b, street && !plinth ? bandTop - 0.3 : undefined);
+      appendBuildingDetail(builders[b.style], trim, b, rng, this.wallSigns, mask, bandTop);
+      if (street) appendStreetLevel(builders[b.style], plinth ? plinthBand : shopBand, b, rng, plinth, awning, mask);
     }
     for (let i = 0; i < STYLES.length; i++) {
       const gb = builders[STYLES[i]];
       if (gb.vertexCount === 0) continue;
       this.addGeo(gb.build(), this.materials.building[STYLES[i]], true, true);
     }
-    if (trim.vertexCount > 0) this.addGeo(trim.build(), this.materials.plain, false, true);
+    // Thin trims never receive: a cornice shadowing its own soffit turns into shadow acne at grazing sun.
+    if (trim.vertexCount > 0) this.addGeo(trim.build(), this.materials.plain, false, false);
     if (glow.vertexCount > 0) this.addGeo(glow.build(), this.materials.glow, false, true);
     if (shopBand.vertexCount > 0) this.addGeo(shopBand.build(), this.materials.shopfront, false, true);
     if (plinthBand.vertexCount > 0) this.addGeo(plinthBand.build(), this.materials.plinth, false, true);
+    if (awning.vertexCount > 0) this.addGeo(awning.build(), this.materials.awning, true, true);
   }
 
   /** Painted wall signs collected by the building detail pass, drawn with the neon atlas. */
