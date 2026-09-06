@@ -267,6 +267,38 @@ export class Renderer {
   get drawCalls(): number { return this._drawCalls; }
   get triangles(): number { return this._triangles; }
 
+  /**
+   * Debug aid (window.__GAME_SCENE__): per-object triangle estimate for the colour pass (camera frustum) and the sun
+   * shadow pass (shadow camera frustum), heaviest first. Allocates; never called from the frame loop.
+   */
+  sceneBreakdown(): { name: string; tris: number; shadowTris: number; instances: number }[] {
+    const cam = this.camera;
+    cam.updateMatrixWorld();
+    const camFrustum = new THREE.Frustum().setFromProjectionMatrix(new THREE.Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse));
+    let shadowFrustum: THREE.Frustum | null = null;
+    this.scene.traverse((o) => {
+      if (shadowFrustum || !(o instanceof THREE.DirectionalLight) || !o.castShadow) return;
+      const sc = o.shadow.camera;
+      sc.updateMatrixWorld();
+      shadowFrustum = new THREE.Frustum().setFromProjectionMatrix(new THREE.Matrix4().multiplyMatrices(sc.projectionMatrix, sc.matrixWorldInverse));
+    });
+    const rows: { name: string; tris: number; shadowTris: number; instances: number }[] = [];
+    this.scene.traverse((o) => {
+      if (!(o instanceof THREE.Mesh) || !o.visible) return;
+      const g = o.geometry as THREE.BufferGeometry;
+      const per = (g.index ? g.index.count : g.getAttribute('position').count) / 3;
+      const inst = o instanceof THREE.InstancedMesh ? o.count : 1;
+      const tris = Math.round(per * inst);
+      const inCam = o.frustumCulled ? camFrustum.intersectsObject(o) : true;
+      const inShadow = o.castShadow && (!o.frustumCulled || !shadowFrustum || shadowFrustum.intersectsObject(o));
+      if (!inCam && !inShadow) return;
+      const name = o.name || (o.material as THREE.Material)?.name || o.type;
+      rows.push({ name, tris: inCam ? tris : 0, shadowTris: inShadow ? tris : 0, instances: inst });
+    });
+    rows.sort((a, b) => (b.tris + b.shadowTris) - (a.tris + a.shadowTris));
+    return rows;
+  }
+
   disposeComposer(): void {
     if (!this.composer) return;
     this.composer.dispose();

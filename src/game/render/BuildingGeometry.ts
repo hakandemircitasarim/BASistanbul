@@ -23,6 +23,10 @@ const FLOOR_H = 3.5;
 /** Downtown podium height under a chamfered shaft or an offset tower (three floors on the -0.2 base). */
 const PODIUM_H = 3 * FLOOR_H + 0.2;
 const OCT = Math.PI / 8;
+/** Concentric stepped roofs always use two tiers: a third one on tall towers cost a full extra windowed box each. */
+const TIERS = 2;
+/** Roofs below this height get no parapet walls or clutter: from the street they are never seen, only their edge is. */
+const CLUTTER_MIN_H = 12;
 const tmpColor = new THREE.Color();
 
 /** Accumulates indexed quads/triangles with position, normal, uv and color attributes. Build-time only. */
@@ -118,6 +122,31 @@ export class GeoBuilder {
     b.quad(x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, -1, 0, 0, u, v, u, v, u, v, u, v);
     b.quad(x0, y1, z1, x1, y1, z1, x1, y1, z0, x0, y1, z0, 0, 1, 0, u, v, u, v, u, v, u, v);
     if (bottom) b.quad(x0, y0, z0, x1, y0, z0, x1, y0, z1, x0, y0, z1, 0, -1, 0, u, v, u, v, u, v, u, v);
+  }
+
+  /**
+   * Hollow rectangular frame (parapet wall): outer faces, inner faces and the top only — 12 quads against the
+   * 20 of four separate boxes, and the hidden faces at the corners and the base are never emitted.
+   */
+  frame(x0: number, y0: number, z0: number, x1: number, y1: number, z1: number, t: number, color: number): void {
+    const u = 0.25, v = ROOF_V;
+    this.setColor(color);
+    const ix0 = x0 + t, ix1 = x1 - t, iz0 = z0 + t, iz1 = z1 - t;
+    // Outer faces.
+    this.quad(x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1, 0, 0, 1, u, v, u, v, u, v, u, v);
+    this.quad(x1, y0, z0, x0, y0, z0, x0, y1, z0, x1, y1, z0, 0, 0, -1, u, v, u, v, u, v, u, v);
+    this.quad(x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, 1, 0, 0, u, v, u, v, u, v, u, v);
+    this.quad(x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, -1, 0, 0, u, v, u, v, u, v, u, v);
+    // Inner faces (normals point into the roof).
+    this.quad(ix1, y0, iz1, ix0, y0, iz1, ix0, y1, iz1, ix1, y1, iz1, 0, 0, -1, u, v, u, v, u, v, u, v);
+    this.quad(ix0, y0, iz0, ix1, y0, iz0, ix1, y1, iz0, ix0, y1, iz0, 0, 0, 1, u, v, u, v, u, v, u, v);
+    this.quad(ix1, y0, iz0, ix1, y0, iz1, ix1, y1, iz1, ix1, y1, iz0, -1, 0, 0, u, v, u, v, u, v, u, v);
+    this.quad(ix0, y0, iz1, ix0, y0, iz0, ix0, y1, iz0, ix0, y1, iz1, 1, 0, 0, u, v, u, v, u, v, u, v);
+    // Top ring.
+    this.quad(x0, y1, z1, x1, y1, z1, x1, y1, iz1, x0, y1, iz1, 0, 1, 0, u, v, u, v, u, v, u, v);
+    this.quad(x0, y1, iz0, x1, y1, iz0, x1, y1, z0, x0, y1, z0, 0, 1, 0, u, v, u, v, u, v, u, v);
+    this.quad(x0, y1, iz1, ix0, y1, iz1, ix0, y1, iz0, x0, y1, iz0, 0, 1, 0, u, v, u, v, u, v, u, v);
+    this.quad(ix1, y1, iz1, x1, y1, iz1, x1, y1, iz0, ix1, y1, iz0, 0, 1, 0, u, v, u, v, u, v, u, v);
   }
 
   /** Single quad with the plain-strip UV (vertex color only); the normal comes from the winding. */
@@ -274,8 +303,7 @@ export function massingOf(b: Building): Massing {
       if (b.facing === 0) m.tz1 = z1 - back; else if (b.facing === 2) m.tz0 = z0 + back; else if (b.facing === 1) m.tx1 = x1 - back; else m.tx0 = x0 + back;
     } else {
       m.kind = 'tiers';
-      const tiers = b.h > 40 ? 3 : 2;
-      const inset = Math.min(b.w, b.d) * 0.14 * (tiers - 1);
+      const inset = Math.min(b.w, b.d) * 0.14 * (TIERS - 1);
       m.tx0 = x0 + inset; m.tx1 = x1 - inset; m.tz0 = z0 + inset; m.tz1 = z1 - inset;
     }
     return m;
@@ -327,12 +355,11 @@ export function appendBuilding(gb: GeoBuilder, b: Building): void {
   const x0 = b.x - b.w / 2, x1 = b.x + b.w / 2, z0 = b.z - b.d / 2, z1 = b.z + b.d / 2;
   const m = massingOf(b);
   if (m.kind === 'tiers') {
-    const tiers = b.h > 40 ? 3 : 2;
-    const fr = tiers === 3 ? [0.55, 0.3, 0.15] : [0.65, 0.35];
+    const fr = [0.65, 0.35];
     let y = BASE_Y;
     let inset = 0;
-    for (let t = 0; t < tiers; t++) {
-      const y1 = t === tiers - 1 ? b.h : y + b.h * fr[t];
+    for (let t = 0; t < TIERS; t++) {
+      const y1 = t === TIERS - 1 ? b.h : y + b.h * fr[t];
       gb.boxWindows(x0 + inset, y, z0 + inset, x1 - inset, y1, z1 - inset, wall, roof, uOff, vOff);
       if (b.style === 'artdeco') gb.boxPlain(x0 + inset - 0.4, y1 - 0.5, z0 + inset - 0.4, x1 - inset + 0.4, y1, z1 - inset + 0.4, roof);
       y = y1;
@@ -533,6 +560,9 @@ export function appendStreetLevel(styleGb: GeoBuilder, bandGb: GeoBuilder, b: Bu
   const span = along - 1.2;
   const px = (t: number, o: number): number => b.x + tx * t + nx * o;
   const pz = (t: number, o: number): number => b.z + tz * t + nz * o;
+  // Fabric in open air over the door: the ground occlusion ramp does not apply to it.
+  const ao = styleGb.bakeAo;
+  styleGb.bakeAo = false;
   for (let i = 0; i < segs; i++) {
     const t0 = -span / 2 + (span * i) / segs, t1 = -span / 2 + (span * (i + 1)) / segs;
     const c = i % 2 === 0 ? pal[0] : pal[1];
@@ -541,6 +571,7 @@ export function appendStreetLevel(styleGb: GeoBuilder, bandGb: GeoBuilder, b: Bu
     styleGb.plainQuad(px(t0, wall + depth), yOut, pz(t0, wall + depth), px(t1, wall + depth), yOut, pz(t1, wall + depth),
       px(t1, wall + depth), yOut - hang, pz(t1, wall + depth), px(t0, wall + depth), yOut - hang, pz(t0, wall + depth), c, true);
   }
+  styleGb.bakeAo = ao;
 }
 
 /** Coping band around a roof edge: 0.3 m overhang, 0.6 m deep, a shade darker than the wall so the roofline reads as a solid edge. */
@@ -548,27 +579,27 @@ function parapetBand(gb: GeoBuilder, x0: number, z0: number, x1: number, z1: num
   gb.boxPlain(x0 - 0.3, top - 0.6, z0 - 0.3, x1 + 0.3, top - 0.02, z1 + 0.3, darken(wall, 0.85));
 }
 
-/** Low parapet walls standing on the coping (skipped on tiny roofs). */
+/** Low parapet walls standing on the coping: one hollow frame (skipped on tiny roofs and on roofs too low to be seen). */
 function parapetWalls(gb: GeoBuilder, x0: number, z0: number, x1: number, z1: number, top: number, ph: number, cap: number): void {
-  if (x1 - x0 <= 4 || z1 - z0 <= 4) return;
-  const t = 0.4;
-  gb.boxPlain(x0 - 0.25, top - 0.15, z0 - 0.25, x1 + 0.25, top + ph, z0 + t, cap);
-  gb.boxPlain(x0 - 0.25, top - 0.15, z1 - t, x1 + 0.25, top + ph, z1 + 0.25, cap);
-  gb.boxPlain(x0 - 0.25, top - 0.15, z0 + t, x0 + t, top + ph, z1 - t, cap);
-  gb.boxPlain(x1 - t, top - 0.15, z0 + t, x1 + 0.25, top + ph, z1 - t, cap);
+  if (x1 - x0 <= 4 || z1 - z0 <= 4 || top < CLUTTER_MIN_H) return;
+  gb.frame(x0 - 0.25, top - 0.15, z0 - 0.25, x1 + 0.25, top + ph, z1 + 0.25, 0.65, cap);
 }
 
-/** Plant room / AC enclosure with a louvre screen (two dark slats around it). */
+/** Plant room / AC enclosure with a louvre screen (one dark slat band around it). */
 function plantBox(gb: GeoBuilder, x0: number, y0: number, z0: number, x1: number, y1: number, z1: number, color: number): void {
   gb.boxPlain(x0, y0, z0, x1, y1, z1, color);
   const slat = darken(color, 0.55), o = 0.06;
-  const ya = y0 + (y1 - y0) * 0.35, yb = y0 + (y1 - y0) * 0.65;
-  gb.boxPlain(x0 - o, ya - 0.08, z0 - o, x1 + o, ya + 0.08, z1 + o, slat);
-  gb.boxPlain(x0 - o, yb - 0.08, z0 - o, x1 + o, yb + 0.08, z1 + o, slat);
+  const ya = y0 + (y1 - y0) * 0.5;
+  gb.boxPlain(x0 - o, ya - 0.1, z0 - o, x1 + o, ya + 0.1, z1 + o, slat);
 }
 
-/** Roof clutter, parapets, pilasters, ledges, crowns and blank-wall sign panels for one building (all plain-strip geometry). */
-export function appendBuildingDetail(gb: GeoBuilder, b: Building, rng: Random, signs: WallSign[]): void {
+/**
+ * Roof clutter, parapets, pilasters, ledges, crowns and blank-wall sign panels for one building. Textured tiers,
+ * facade dressing and sign panels go to `gb` (the building's style mesh, casts shadows); parapets, roof clutter
+ * and crowns go to `trim` (one city-wide plain mesh that stays out of the shadow pass — nothing on a roof throws a
+ * shadow the street can see). Glow parts of both land in whatever glow sink the builders share.
+ */
+export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Building, rng: Random, signs: WallSign[]): void {
   const x0 = b.x - b.w / 2, x1 = b.x + b.w / 2, z0 = b.z - b.d / 2, z1 = b.z + b.d / 2;
   const roof = darken(b.color, ROOF_DARKEN);
   const wall = lighten(b.color, WALL_LIGHTEN);
@@ -587,10 +618,10 @@ export function appendBuildingDetail(gb: GeoBuilder, b: Building, rng: Random, s
   if (kind === 'twin') {
     // Two more tiers, each pulled back from the street and the sides; the crown then sits on the top one.
     const t1 = h + 2 * FLOOR_H;
-    parapetBand(gb, x0, z0, x1, z1, h, wall);
+    parapetBand(trim, x0, z0, x1, z1, h, wall);
     twinRect(b, 1, mm);
     gb.boxWindows(mm.tx0, h, mm.tz0, mm.tx1, t1, mm.tz1, wall, roof, uOff, vOff);
-    parapetBand(gb, mm.tx0, mm.tz0, mm.tx1, mm.tz1, t1, wall);
+    parapetBand(trim, mm.tx0, mm.tz0, mm.tx1, mm.tz1, t1, wall);
     twinRect(b, 2, mm);
     gb.boxWindows(mm.tx0, t1, mm.tz0, mm.tx1, top, mm.tz1, wall, roof, uOff, vOff);
     rx0 = mm.tx0; rx1 = mm.tx1; rz0 = mm.tz0; rz1 = mm.tz1;
@@ -603,11 +634,10 @@ export function appendBuildingDetail(gb: GeoBuilder, b: Building, rng: Random, s
     let wx0 = x0, wx1 = x1, wz0 = z0, wz1 = z1;
     if (alongX) { if (left) wx1 = x0 + aw; else wx0 = x1 - aw; if (b.facing === 0) wz0 = z1 - dw; else wz1 = z0 + dw; }
     else { if (left) wz1 = z0 + aw; else wz0 = z1 - aw; if (b.facing === 1) wx0 = x1 - dw; else wx1 = x0 + dw; }
-    parapetBand(gb, x0, z0, x1, z1, h, wall);
-    parapetWalls(gb, x0, z0, x1, z1, h, ph, cap);
+    parapetBand(trim, x0, z0, x1, z1, h, wall);
+    parapetWalls(trim, x0, z0, x1, z1, h, ph, cap);
     gb.boxWindows(wx0, h, wz0, wx1, wingH, wz1, wall, roof, uOff, vOff);
-    parapetBand(gb, wx0, wz0, wx1, wz1, wingH, wall);
-    parapetWalls(gb, wx0, wz0, wx1, wz1, wingH, ph, cap);
+    parapetBand(trim, wx0, wz0, wx1, wz1, wingH, wall);
     // Clutter goes on the lower roof, away from the wing.
     if (alongX) { if (b.facing === 0) rz1 = wz0; else rz0 = wz1; } else if (b.facing === 1) rx1 = wx0; else rx0 = wx1;
   } else if (kind === 'box' && roofVariant === 2 && b.w > 12 && b.d > 12 && b.roofKind === 'flat') {
@@ -616,74 +646,69 @@ export function appendBuildingDetail(gb: GeoBuilder, b: Building, rng: Random, s
     let px0 = b.x - pw / 2, pz0 = b.z - pd / 2;
     if (b.facing === 0) pz0 = z0 + 1.2; else if (b.facing === 2) pz0 = z1 - 1.2 - pd; else if (b.facing === 1) px0 = x0 + 1.2; else px0 = x1 - 1.2 - pw;
     gb.boxWindows(px0, h, pz0, px0 + pw, h + FLOOR_H, pz0 + pd, wall, roof, uOff, vOff);
-    parapetBand(gb, px0, pz0, px0 + pw, pz0 + pd, h + FLOOR_H, wall);
-    parapetBand(gb, x0, z0, x1, z1, h, wall);
-    parapetWalls(gb, x0, z0, x1, z1, h, ph, cap);
+    parapetBand(trim, px0, pz0, px0 + pw, pz0 + pd, h + FLOOR_H, wall);
+    parapetBand(trim, x0, z0, x1, z1, h, wall);
+    parapetWalls(trim, x0, z0, x1, z1, h, ph, cap);
     if (b.facing === 0) rz0 = pz0 + pd; else if (b.facing === 2) rz1 = pz0; else if (b.facing === 1) rx0 = px0 + pw; else rx1 = px0;
   } else if (kind === 'octagon') {
     // Chamfered shaft: a coping ring on the podium edge and on the shaft top.
-    parapetBand(gb, x0, z0, x1, z1, PODIUM_H, wall);
+    parapetBand(trim, x0, z0, x1, z1, PODIUM_H, wall);
     const rx = (b.w / 2 - 0.4) / Math.cos(OCT), rz = (b.d / 2 - 0.4) / Math.cos(OCT);
-    gb.cylinder(b.x, b.z, rx + 0.3, rz + 0.3, h - 0.6, h - 0.02, 8, darken(wall, 0.85), false, darken(wall, 0.85), GLOW_U.none, OCT);
+    trim.cylinder(b.x, b.z, rx + 0.3, rz + 0.3, h - 0.6, h - 0.02, 8, darken(wall, 0.85), false, darken(wall, 0.85), GLOW_U.none, OCT);
     const k = 0.62;
     rx0 = b.x - (b.w / 2) * k; rx1 = b.x + (b.w / 2) * k; rz0 = b.z - (b.d / 2) * k; rz1 = b.z + (b.d / 2) * k;
   } else if (kind === 'podium') {
-    parapetBand(gb, x0, z0, x1, z1, PODIUM_H, wall);
-    parapetWalls(gb, x0, z0, x1, z1, PODIUM_H, ph, cap);
-    parapetBand(gb, rx0, rz0, rx1, rz1, h, wall);
+    parapetBand(trim, x0, z0, x1, z1, PODIUM_H, wall);
+    parapetWalls(trim, x0, z0, x1, z1, PODIUM_H, ph, cap);
+    parapetBand(trim, rx0, rz0, rx1, rz1, h, wall);
   } else if (kind === 'setback') {
-    parapetBand(gb, x0, z0, x1, z1, stepY, wall);
-    parapetBand(gb, rx0, rz0, rx1, rz1, h, wall);
-    parapetWalls(gb, rx0, rz0, rx1, rz1, h, ph, cap);
+    parapetBand(trim, x0, z0, x1, z1, stepY, wall);
+    parapetBand(trim, rx0, rz0, rx1, rz1, h, wall);
+    parapetWalls(trim, rx0, rz0, rx1, rz1, h, ph, cap);
   } else if (b.roofKind !== 'spire') {
-    parapetBand(gb, rx0, rz0, rx1, rz1, top, wall);
-    parapetWalls(gb, rx0, rz0, rx1, rz1, top, ph, cap);
+    parapetBand(trim, rx0, rz0, rx1, rz1, top, wall);
+    parapetWalls(trim, rx0, rz0, rx1, rz1, top, ph, cap);
   }
   const rw = rx1 - rx0, rd = rz1 - rz0;
   const crown = top > 42 && b.roofKind !== 'spire';
 
-  // --- Roof clutter -----------------------------------------------------------------------------
-  if (b.roofKind !== 'spire' && rw > 9 && rd > 9 && !crown) {
-    const n = rng.int(2, 4);
+  // --- Roof clutter (one or two pieces; roofs under CLUTTER_MIN_H are never seen from the street) ----------------
+  if (b.roofKind !== 'spire' && rw > 9 && rd > 9 && !crown && top >= CLUTTER_MIN_H) {
+    const n = rng.int(1, 2);
     for (let i = 0; i < n; i++) {
       const cx = rng.range(rx0 + 2.2, rx1 - 2.2), cz = rng.range(rz0 + 2.2, rz1 - 2.2);
       const kindR = rng.int(0, 3);
       if (kindR === 0) {
         // Water tank on a short cradle.
-        gb.boxPlain(cx - 1.15, top, cz - 1.15, cx + 1.15, top + 0.65, cz + 1.15, 0x5f5a55);
-        gb.cylinder(cx, cz, 1.2, 1.2, top + 0.65, top + 3.1, 8, 0x8a6742, false, 0x6d5238);
+        trim.boxPlain(cx - 1.15, top, cz - 1.15, cx + 1.15, top + 0.65, cz + 1.15, 0x5f5a55);
+        trim.cylinder(cx, cz, 1.2, 1.2, top + 0.65, top + 3.1, 6, 0x8a6742, false, 0x6d5238);
       } else if (kindR === 1) {
-        const m = rng.int(1, 2);
-        for (let k = 0; k < m; k++) {
-          const ox = cx + k * 2.2;
-          if (ox + 0.95 > rx1) break;
-          gb.boxPlain(ox - 0.95, top, cz - 0.65, ox + 0.95, top + 0.95, cz + 0.65, 0xacb2b8);
-          gb.boxPlain(ox - 0.7, top + 0.95, cz - 0.45, ox + 0.7, top + 1.05, cz + 0.45, 0x8b9198);
-        }
+        // Pair of AC condensers.
+        trim.boxPlain(cx - 0.95, top, cz - 0.65, cx + 0.95, top + 0.95, cz + 0.65, 0xacb2b8);
+        if (cx + 3.15 <= rx1) trim.boxPlain(cx + 1.25, top, cz - 0.65, cx + 3.15, top + 0.95, cz + 0.65, 0xacb2b8);
       } else if (kindR === 2) {
         // Roof access box with a door.
-        gb.boxPlain(cx - 1.5, top, cz - 1.25, cx + 1.5, top + 2.5, cz + 1.25, lighten(roof, 0.3));
-        gb.boxPlain(cx - 0.55, top, cz + 1.25, cx + 0.55, top + 1.8, cz + 1.4, 0x39332c);
+        trim.boxPlain(cx - 1.5, top, cz - 1.25, cx + 1.5, top + 2.5, cz + 1.25, lighten(roof, 0.3));
+        trim.plainQuad(cx - 0.55, top, cz + 1.26, cx + 0.55, top, cz + 1.26, cx + 0.55, top + 1.8, cz + 1.26, cx - 0.55, top + 1.8, cz + 1.26, 0x39332c);
       } else {
-        gb.cylinder(cx, cz, 0.36, 0.36, top, top + 1.5, 6, 0x9aa0a6, false, 0x767c82);
-        gb.cylinder(cx + 1.3, cz + 0.9, 0.28, 0.28, top, top + 1.05, 6, 0x9aa0a6, false, 0x767c82);
+        trim.cylinder(cx, cz, 0.36, 0.36, top, top + 1.5, 5, 0x9aa0a6, false, 0x767c82);
       }
     }
   }
   // Plant / AC enclosure on one roof in three.
-  if (b.roofKind !== 'spire' && rw > 8 && rd > 8 && !crown && rng.chance(1 / 3)) {
+  if (b.roofKind !== 'spire' && rw > 8 && rd > 8 && !crown && top >= CLUTTER_MIN_H && rng.chance(1 / 3)) {
     const cx = rng.range(rx0 + 2.5, rx1 - 2.5), cz = rng.range(rz0 + 2.2, rz1 - 2.2);
-    plantBox(gb, cx - 1.5, top, cz - 1.25, cx + 1.5, top + 2, cz + 1.25, 0x9a948c);
+    plantBox(trim, cx - 1.5, top, cz - 1.25, cx + 1.5, top + 2, cz + 1.25, 0x9a948c);
   }
   if (top > 26 && top <= 42 && b.roofKind !== 'spire' && rng.chance(0.5)) {
     const ax = (rx0 + rx1) / 2 + rng.range(-rw * 0.22, rw * 0.22), az = (rz0 + rz1) / 2 + rng.range(-rd * 0.22, rd * 0.22);
     const mastTop = top + rng.range(5, 13);
-    gb.bar(ax, top, az, ax, mastTop, az, 0.34, 0xb0b4ba);
-    for (let k = 0; k < 3; k++) {
-      const y = top + (mastTop - top) * (0.42 + k * 0.18);
-      gb.bar(ax - 1.2, y, az, ax + 1.2, y, az, 0.2, 0xb0b4ba);
+    trim.bar(ax, top, az, ax, mastTop, az, 0.34, 0xb0b4ba);
+    for (let k = 0; k < 2; k++) {
+      const y = top + (mastTop - top) * (0.45 + k * 0.25);
+      trim.bar(ax - 1.2, y, az, ax + 1.2, y, az, 0.2, 0xb0b4ba);
     }
-    gb.boxPlain(ax - 0.2, mastTop, az - 0.2, ax + 0.2, mastTop + 0.55, az + 0.2, 0xff2418, false, GLOW_U.red);
+    trim.boxPlain(ax - 0.2, mastTop, az - 0.2, ax + 0.2, mastTop + 0.55, az + 0.2, 0xff2418, false, GLOW_U.red);
   }
 
   // --- Facade dressing --------------------------------------------------------------------------
@@ -691,13 +716,13 @@ export function appendBuildingDetail(gb: GeoBuilder, b: Building, rng: Random, s
     // Vertical pilaster strips running the full shaft.
     const yb = BAND.plinthH + 0.3, yt = h - 1.4, t = 0.3, hw = 0.6, col = lighten(b.color, 0.5);
     if (yt > yb + 4) {
-      const nX = Math.max(1, Math.round(b.w / 8) - 1);
+      const nX = Math.min(3, Math.max(1, Math.round(b.w / 8) - 1));
       for (let i = 1; i <= nX; i++) {
         const px = x0 + (b.w * i) / (nX + 1);
         gb.boxPlain(px - hw, yb, z0 - t, px + hw, yt, z0, col);
         gb.boxPlain(px - hw, yb, z1, px + hw, yt, z1 + t, col);
       }
-      const nZ = Math.max(1, Math.round(b.d / 8) - 1);
+      const nZ = Math.min(3, Math.max(1, Math.round(b.d / 8) - 1));
       for (let i = 1; i <= nZ; i++) {
         const pz = z0 + (b.d * i) / (nZ + 1);
         gb.boxPlain(x0 - t, yb, pz - hw, x0, yt, pz + hw, col);
@@ -706,24 +731,25 @@ export function appendBuildingDetail(gb: GeoBuilder, b: Building, rng: Random, s
     }
   }
   if (crown) {
-    // Crown: a 1.2 m overhanging slab under the roof edge, a deep accent band that glows at night, a mechanical
+    // Crown: a 1.2 m overhanging slab under the roof edge, a 1.4 m accent band that glows at night (taller bands bloom
+    // into slabs from across the city), a mechanical
     // penthouse with a louvre screen on the roof, and a spire on one tower in four.
     const slab = lighten(b.color, 0.32), accent = darken(b.accent, 0.72), glow = glowCellFor(b.accent);
     if (kind === 'octagon') {
       const rx = (b.w / 2 - 0.4) / Math.cos(OCT), rz = (b.d / 2 - 0.4) / Math.cos(OCT);
-      gb.cylinder(b.x, b.z, rx + 1.2, rz + 1.2, top - 1.1, top - 0.02, 8, slab, false, slab, GLOW_U.none, OCT);
-      gb.cylinder(b.x, b.z, rx + 0.5, rz + 0.5, top - 3.6, top - 1.1, 8, accent, false, null, glow, OCT);
+      trim.cylinder(b.x, b.z, rx + 1.2, rz + 1.2, top - 1.1, top - 0.02, 8, slab, false, slab, GLOW_U.none, OCT);
+      trim.cylinder(b.x, b.z, rx + 0.5, rz + 0.5, top - 2.5, top - 1.1, 8, accent, false, null, glow, OCT);
     } else {
-      gb.boxPlain(rx0 - 1.2, top - 1.1, rz0 - 1.2, rx1 + 1.2, top - 0.02, rz1 + 1.2, slab);
-      gb.boxPlain(rx0 - 0.5, top - 3.6, rz0 - 0.5, rx1 + 0.5, top - 1.1, rz1 + 0.5, accent, false, glow);
+      trim.boxPlain(rx0 - 1.2, top - 1.1, rz0 - 1.2, rx1 + 1.2, top - 0.02, rz1 + 1.2, slab);
+      trim.boxPlain(rx0 - 0.5, top - 2.5, rz0 - 0.5, rx1 + 0.5, top - 1.1, rz1 + 0.5, accent, false, glow);
     }
     const mw = rw * 0.4, md = rd * 0.4, mx = (rx0 + rx1) / 2, mz = (rz0 + rz1) / 2;
-    if (mw > 3 && md > 3) plantBox(gb, mx - mw / 2, top, mz - md / 2, mx + mw / 2, top + 4, mz + md / 2, darken(b.color, 0.7));
+    if (mw > 3 && md > 3) plantBox(trim, mx - mw / 2, top, mz - md / 2, mx + mw / 2, top + 4, mz + md / 2, darken(b.color, 0.7));
     if (b.id % 4 === 2) {
       const sh = Math.max(10, top * 0.14);
-      gb.bar(mx, top + 4, mz, mx, top + 4 + sh, mz, 0.7, 0xb0b4ba);
-      gb.bar(mx, top + 4 + sh, mz, mx, top + 4 + sh + 3, mz, 0.3, 0xd0d4da);
-      gb.boxPlain(mx - 0.25, top + 6.9 + sh, mz - 0.25, mx + 0.25, top + 7.5 + sh, mz + 0.25, 0xff2418, false, GLOW_U.red);
+      trim.bar(mx, top + 4, mz, mx, top + 4 + sh, mz, 0.7, 0xb0b4ba);
+      trim.bar(mx, top + 4 + sh, mz, mx, top + 4 + sh + 3, mz, 0.3, 0xd0d4da);
+      trim.boxPlain(mx - 0.25, top + 6.9 + sh, mz - 0.25, mx + 0.25, top + 7.5 + sh, mz + 0.25, 0xff2418, false, GLOW_U.red);
     }
   }
   if (b.style === 'artdeco' && !downtown) {

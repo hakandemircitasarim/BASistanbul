@@ -1,7 +1,8 @@
 // Track B tests: DayNightSystem clock/sun/night factor/AI lights, building UVs in meters, landmark parts, sky keys. Track B.
 import { test, expect, approx, createHeadless } from './harness';
 import { DayNightSystem, DAY_TUNING } from '../../src/game/systems/DayNightSystem';
-import { buildingGeometry, landmarkGeometries } from '../../src/game/render/BuildingGeometry';
+import { BAND, GeoBuilder, appendBuildingDetail, appendStreetLevel, buildingGeometry, landmarkGeometries, massingOf } from '../../src/game/render/BuildingGeometry';
+import { Random } from '../../src/game/core/Random';
 import { SKY_KEYS } from '../../src/game/render/SkySystem';
 import { Vehicle } from '../../src/game/entities/Vehicle';
 import { SPECS } from '../../src/game/entities/VehicleSpecs';
@@ -94,6 +95,37 @@ test('BuildingGeometry: side UVs are in meters (u = width/16, v = height/28), ro
   let maxY = 0;
   for (let i = 0; i < spire.attributes.position.count; i++) maxY = Math.max(maxY, spire.attributes.position.getY(i));
   expect(maxY > 56, 'spire rises above the box');
+});
+
+test('BuildingGeometry: street level = band box in the band builder + cornice/awnings in the style builder; trim stays separate and cheap', () => {
+  const style = new GeoBuilder(), band = new GeoBuilder(), rng = new Random(3);
+  const shop = sampleBuilding({ district: 'suburb', style: 'residential', h: 14.2, w: 16, d: 12 });
+  appendStreetLevel(style, band, shop, rng, false);
+  expect(band.vertexCount === 16, `shop band = 4 faces (got ${band.vertexCount / 4} quads)`);
+  // Band v spans exactly 0..1 over the band height, and the band tops out at SHOP_BAND_H.
+  const bg = band.build();
+  let maxY = 0, maxV = 0;
+  for (let i = 0; i < bg.attributes.position.count; i++) { maxY = Math.max(maxY, bg.attributes.position.getY(i)); maxV = Math.max(maxV, bg.attributes.uv.getY(i)); }
+  approx(maxY, BAND.shopH, 1e-6, 'band height = SHOP_BAND_H');
+  approx(maxV, 1, 1e-6, 'band v spans 0..1');
+  // Cornice (5 quads) + 4 two-sided awning segments x 2 quads x 2 sides = 16 quads.
+  expect(style.vertexCount === (5 + 16) * 4, `cornice + awnings = 21 quads (got ${style.vertexCount / 4})`);
+  const plinthStyle = new GeoBuilder(), plinth = new GeoBuilder();
+  appendStreetLevel(plinthStyle, plinth, sampleBuilding({}), rng, true);
+  expect(plinth.vertexCount === 16 && plinthStyle.vertexCount === 20, 'downtown plinth: band + cornice, no awnings');
+  // Detail pass: roof trim goes to the trim builder, the style builder only gets textured tiers / facade dressing.
+  const gb = new GeoBuilder(), trim = new GeoBuilder();
+  const low = sampleBuilding({ id: 4, district: 'suburb', style: 'concrete', h: 10.7, w: 20, d: 16 });
+  appendBuildingDetail(gb, trim, low, new Random(1), []);
+  expect(massingOf(low).kind === 'box', 'low flat suburb building is a box');
+  expect(trim.vertexCount > 0 && trim.vertexCount <= 20 * 4, `roof under 12 m: coping band only, no walls or clutter (got ${trim.vertexCount / 4} quads)`);
+  const tall = sampleBuilding({ id: 8, district: 'suburb', style: 'concrete', h: 21.2, w: 24, d: 20 });
+  const gb2 = new GeoBuilder(), trim2 = new GeoBuilder();
+  appendBuildingDetail(gb2, trim2, tall, new Random(1), []);
+  expect(trim2.vertexCount / 4 >= 5 + 12 && trim2.vertexCount / 4 <= 80, `tall roof: coping + parapet frame + at most two clutter pieces (got ${trim2.vertexCount / 4} quads)`);
+  // Stepped roofs are capped at two tiers whatever the height.
+  const stepped = buildingGeometry(sampleBuilding({ id: 2, roofKind: 'stepped', h: 70.2, style: 'glass' }));
+  expect(stepped.attributes.position.count === 2 * 20, `two tiers = 2 window boxes (got ${stepped.attributes.position.count / 20})`);
 });
 
 test('BuildingGeometry: every landmark kind yields parts; the ferris wheel has a rotating hub part', () => {

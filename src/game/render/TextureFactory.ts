@@ -181,6 +181,188 @@ export class TextureFactory {
   }
 
   /**
+   * Per-pixel two-tone grain: every texel is nudged by +-amp, light flecks pulled warm and dark flecks pulled cool
+   * (tone), which is how sand, cement and bitumen aggregate read at arm's length. Written through ImageData because a
+   * 1024 px tile is a million texels and fillRect per fleck would take seconds. Follow with blur3 so the grain sits at
+   * 2-3 px and averages out in the first mip instead of shimmering.
+   */
+  private grain(ctx: CanvasRenderingContext2D, W: number, H: number, rng: Random, amp: number, tone: number): void {
+    const img = ctx.getImageData(0, 0, W, H);
+    const d = img.data;
+    const a = amp * 255;
+    for (let i = 0; i < d.length; i += 4) {
+      const n = (rng.next() - 0.5) * 2 * a;
+      d[i] += n * (1 + tone);
+      d[i + 1] += n;
+      d[i + 2] += n * (1 - tone);
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+
+  /** Aggregate specks: dark stones and a few pale quartz chips, 2-4 px, kept away from a wrap seam by nothing (they tile fine). */
+  private specks(ctx: CanvasRenderingContext2D, W: number, H: number, rng: Random, dark: number, light: number, size: number): void {
+    for (let i = 0; i < dark; i++) {
+      const s = rng.range(size * 0.6, size * 1.4);
+      ctx.fillStyle = rgba(14, 12, 10, rng.range(0.16, 0.34));
+      ctx.fillRect(rng.range(0, W), rng.range(0, H), s, s * rng.range(0.6, 1.2));
+    }
+    for (let i = 0; i < light; i++) {
+      const s = rng.range(size * 0.5, size);
+      ctx.fillStyle = rgba(230, 222, 205, rng.range(0.08, 0.2));
+      ctx.fillRect(rng.range(0, W), rng.range(0, H), s, s);
+    }
+  }
+
+  /**
+   * Crack polylines: a wandering dark hairline with a lighter, offset edge (the lip the light catches), and an
+   * occasional branch. Kept inside a margin so nothing crosses the wrap seam. `scale` is px per design px (1 at 512).
+   */
+  private cracks(ctx: CanvasRenderingContext2D, W: number, H: number, rng: Random, n: number, scale: number, darkA: number, lightA: number, margin = 0.06): void {
+    const walk = (x: number, y: number, ang: number, steps: number, len: number): [number, number][] => {
+      const pts: [number, number][] = [[x, y]];
+      for (let k = 0; k < steps; k++) {
+        ang += rng.range(-0.7, 0.7);
+        x += Math.cos(ang) * len * rng.range(0.6, 1.4);
+        y += Math.sin(ang) * len * rng.range(0.6, 1.4);
+        x = Math.min(W * (1 - margin), Math.max(W * margin, x));
+        y = Math.min(H * (1 - margin), Math.max(H * margin, y));
+        pts.push([x, y]);
+      }
+      return pts;
+    };
+    const stroke = (pts: [number, number][], ox: number, oy: number, w: number, style: string): void => {
+      ctx.strokeStyle = style;
+      ctx.lineWidth = w;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0] + ox, pts[0][1] + oy);
+      for (let k = 1; k < pts.length; k++) ctx.lineTo(pts[k][0] + ox, pts[k][1] + oy);
+      ctx.stroke();
+    };
+    for (let i = 0; i < n; i++) {
+      const pts = walk(rng.range(W * margin, W * (1 - margin)), rng.range(H * margin, H * (1 - margin)), rng.range(0, Math.PI * 2), rng.int(6, 14), 9 * scale);
+      // Lit lip: a wider light stroke offset down-right, then the dark fissure over it.
+      stroke(pts, 0.8 * scale, 0.8 * scale, 1.9 * scale, rgba(255, 244, 228, lightA));
+      stroke(pts, 0, 0, 1.15 * scale, rgba(8, 6, 4, darkA));
+      if (rng.chance(0.45)) {
+        const k = rng.int(1, pts.length - 2);
+        const br = walk(pts[k][0], pts[k][1], rng.range(0, Math.PI * 2), rng.int(3, 6), 7 * scale);
+        stroke(br, 0.7 * scale, 0.7 * scale, 1.5 * scale, rgba(255, 244, 228, lightA * 0.8));
+        stroke(br, 0, 0, 0.9 * scale, rgba(8, 6, 4, darkA * 0.9));
+      }
+    }
+  }
+
+  /**
+   * Erodes a painted-marking layer (drawn on a cleared canvas): chips punched out along the edges and a scatter of
+   * missing flakes inside, ~5-8% of the area, so lane paint reads as worn thermoplastic rather than a vector overlay.
+   * `rects` are the painted rectangles (x, y, w, h) the edge chips follow.
+   */
+  private wearPaint(ctx: CanvasRenderingContext2D, rng: Random, rects: number[][], scale: number): void {
+    ctx.save();
+    ctx.globalCompositeOperation = 'destination-out';
+    for (let i = 0; i < rects.length; i++) {
+      const [x, y, w, h] = rects[i];
+      const area = w * h;
+      // Edge nibbles: small ellipses straddling each of the four edges.
+      const perim = 2 * (w + h);
+      const edgeN = Math.round(perim / (6 * scale));
+      for (let k = 0; k < edgeN; k++) {
+        const t = rng.range(0, perim);
+        let ex: number, ey: number;
+        if (t < w) { ex = x + t; ey = y; } else if (t < w + h) { ex = x + w; ey = y + (t - w); } else if (t < 2 * w + h) { ex = x + (t - w - h); ey = y + h; } else { ex = x; ey = y + (t - 2 * w - h); }
+        const r = rng.range(0.6, 1.7) * scale;
+        ctx.fillStyle = rgba(0, 0, 0, rng.range(0.5, 1));
+        ctx.beginPath();
+        ctx.ellipse(ex, ey, r, r * rng.range(0.5, 1.5), rng.range(0, Math.PI), 0, Math.PI * 2);
+        ctx.fill();
+      }
+      // Interior flakes: about 6% of the area.
+      const flakeN = Math.round((area * 0.05) / (5 * scale * scale));
+      for (let k = 0; k < flakeN; k++) {
+        const r = rng.range(0.6, 1.8) * scale;
+        ctx.fillStyle = rgba(0, 0, 0, rng.range(0.35, 0.9));
+        ctx.beginPath();
+        ctx.ellipse(x + rng.range(0, w), y + rng.range(0, h), r, r * rng.range(0.5, 1.4), rng.range(0, Math.PI), 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  }
+
+  /** Cast-iron manhole cover: bitumen seal ring, machined rim, dished lid with a radial tread and two lifting slots. Also paints its roughness (r). */
+  private manhole(ctx: CanvasRenderingContext2D, r: CanvasRenderingContext2D | null, rng: Random, cx: number, cy: number, rad: number): void {
+    // Tar seal around the frame.
+    ctx.fillStyle = rgba(10, 9, 8, 0.5);
+    ctx.beginPath(); ctx.arc(cx, cy, rad * 1.22, 0, Math.PI * 2); ctx.fill();
+    // Frame rim: light on the sun side (top-left), dark below.
+    ctx.fillStyle = '#5c5a56';
+    ctx.beginPath(); ctx.arc(cx, cy, rad * 1.08, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = rgba(255, 250, 240, 0.28);
+    ctx.beginPath(); ctx.arc(cx - rad * 0.03, cy - rad * 0.03, rad * 1.05, Math.PI * 0.9, Math.PI * 1.9); ctx.lineTo(cx, cy); ctx.fill();
+    ctx.fillStyle = rgba(0, 0, 0, 0.5);
+    ctx.beginPath(); ctx.arc(cx, cy, rad, 0, Math.PI * 2); ctx.fill();
+    // Lid.
+    const lid = ctx.createRadialGradient(cx - rad * 0.25, cy - rad * 0.25, rad * 0.1, cx, cy, rad * 0.92);
+    lid.addColorStop(0, '#4c4b48');
+    lid.addColorStop(1, '#2f2e2c');
+    ctx.fillStyle = lid;
+    ctx.beginPath(); ctx.arc(cx, cy, rad * 0.92, 0, Math.PI * 2); ctx.fill();
+    // Radial tread: alternating raised wedges, and two concentric rings.
+    const wedges = 24;
+    for (let k = 0; k < wedges; k++) {
+      const a0 = (k / wedges) * Math.PI * 2, a1 = ((k + 0.5) / wedges) * Math.PI * 2;
+      ctx.fillStyle = rgba(255, 245, 230, 0.09);
+      ctx.beginPath(); ctx.arc(cx, cy, rad * 0.86, a0, a1); ctx.arc(cx, cy, rad * 0.32, a1, a0, true); ctx.closePath(); ctx.fill();
+    }
+    ctx.strokeStyle = rgba(0, 0, 0, 0.45);
+    ctx.lineWidth = Math.max(1, rad * 0.05);
+    for (const k of [0.86, 0.6, 0.32]) { ctx.beginPath(); ctx.arc(cx, cy, rad * k, 0, Math.PI * 2); ctx.stroke(); }
+    ctx.strokeStyle = rgba(255, 245, 230, 0.14);
+    for (const k of [0.83, 0.57, 0.29]) { ctx.beginPath(); ctx.arc(cx, cy, rad * k, Math.PI * 0.95, Math.PI * 1.85); ctx.stroke(); }
+    // Lifting slots.
+    ctx.fillStyle = '#0c0b0a';
+    const sw = rad * 0.18, sh = rad * 0.08;
+    ctx.fillRect(cx - sw / 2, cy - rad * 0.7 - sh / 2, sw, sh);
+    ctx.fillRect(cx - sw / 2, cy + rad * 0.7 - sh / 2, sw, sh);
+    // Rust bloom off the rim.
+    ctx.fillStyle = rgba(120, 70, 30, 0.12 + rng.next() * 0.1);
+    ctx.beginPath(); ctx.arc(cx + rad * 0.5, cy + rad * 0.9, rad * 0.5, 0, Math.PI * 2); ctx.fill();
+    if (r) {
+      r.fillStyle = grey(0.55);
+      r.beginPath(); r.arc(cx, cy, rad * 1.08, 0, Math.PI * 2); r.fill();
+    }
+  }
+
+  /** Kerb-side storm drain: concrete surround, dark recess with cast slots; paints its roughness (r) too. */
+  private drain(ctx: CanvasRenderingContext2D, r: CanvasRenderingContext2D | null, x: number, y: number, w: number, h: number, scale: number): void {
+    ctx.fillStyle = rgba(8, 7, 6, 0.45);
+    ctx.fillRect(x - 5 * scale, y - 5 * scale, w + 10 * scale, h + 10 * scale);
+    ctx.fillStyle = '#7d7a72';
+    ctx.fillRect(x - 3 * scale, y - 3 * scale, w + 6 * scale, h + 6 * scale);
+    ctx.fillStyle = rgba(255, 250, 240, 0.22);
+    ctx.fillRect(x - 3 * scale, y - 3 * scale, w + 6 * scale, 1.2 * scale);
+    ctx.fillStyle = '#1a1917';
+    ctx.fillRect(x, y, w, h);
+    ctx.fillStyle = '#4a4946';
+    const bars = Math.max(3, Math.round(w / (6 * scale)));
+    for (let k = 0; k < bars; k++) {
+      const bx = x + ((k + 0.5) / bars) * w;
+      ctx.fillRect(bx - 1.2 * scale, y, 2.4 * scale, h);
+      ctx.fillStyle = rgba(255, 250, 240, 0.18);
+      ctx.fillRect(bx - 1.2 * scale, y, 0.8 * scale, h);
+      ctx.fillStyle = '#4a4946';
+    }
+    ctx.fillStyle = rgba(0, 0, 0, 0.5);
+    ctx.fillRect(x, y, w, 1.5 * scale);
+    if (r) {
+      r.fillStyle = grey(0.5);
+      r.fillRect(x - 3 * scale, y - 3 * scale, w + 6 * scale, h + 6 * scale);
+    }
+  }
+
+  /**
    * Weathering pass over a finished facade tile: grime washing down from the sills, soft dirt blotches and a little
    * colour drift. Clean flat panels are the thing that dates a procedural city most, and because the normal and
    * roughness maps are derived from this albedo the streaks show up in the shading too, not just the colour.
@@ -229,7 +411,10 @@ export class TextureFactory {
     // P = pixels per "design pixel": every hand-placed size below is written for the old 256 x 512 layout.
     const W = 512, H = 1024, P = 2;
     const rng = new Random(seed * 7919 + style.length);
-    const m = this.canvas(W, H), e = this.canvas(W, H), r = this.canvas(W / 2, H / 2);
+    // The emissive and roughness maps only carry pane-sized shapes, so both are drawn at half resolution (same
+    // coordinates, scaled context): that halves their memory without softening anything the eye can pick out.
+    const m = this.canvas(W, H), e = this.canvas(W / 2, H / 2), r = this.canvas(W / 2, H / 2);
+    e.ctx.scale(0.5, 0.5);
     r.ctx.scale(0.5, 0.5);
     const wall = style === 'glass' ? 0x9fb4c8 : style === 'concrete' ? 0xb8b8b4 : style === 'artdeco' ? 0xd8d0c0 : style === 'neon' ? 0xe8e0e8 : 0xd4cfc4;
     m.ctx.fillStyle = hex(wall);
@@ -243,6 +428,16 @@ export class TextureFactory {
     const cols = 4, rows = 8;
     const cw = W / cols, rh = (H - ROOF_STRIP_PX) / rows;
     const top = ROOF_STRIP_PX;
+    // Colour-temperature banding every 3-4 floors (rendered floors against plastered ones, a change of contractor,
+    // a later extension) so a 20-storey wall is not one flat tint. Faint enough to read as material, not stripes.
+    const bandRows = 3 + (seed % 2);
+    for (let row = 0; row < rows; row++) {
+      const warmBand = Math.floor((row + seed) / bandRows) % 2 === 0;
+      m.ctx.fillStyle = warmBand ? rgba(255, 222, 182, 0.09) : rgba(192, 206, 234, 0.08);
+      m.ctx.fillRect(0, top + row * rh, W, rh);
+      m.ctx.fillStyle = warmBand ? rgba(255, 255, 255, 0.03) : rgba(0, 0, 0, 0.03);
+      m.ctx.fillRect(0, top + row * rh, W, rh);
+    }
     // Style-specific facade dressing drawn before the glazing.
     if (style === 'artdeco') {
       // Vertical fluting between window columns.
@@ -283,8 +478,47 @@ export class TextureFactory {
       if (w >= h) m.ctx.fillRect(x, y, w, 1); else m.ctx.fillRect(x, y, 1, h);
       e.ctx.fillStyle = '#000';
       e.ctx.fillRect(x, y, w, h);
-      r.ctx.fillStyle = grey(0.7);
+      r.ctx.fillStyle = grey(0.6);
       r.ctx.fillRect(x, y, w, h);
+    };
+    // Frame with depth: an f px lighter frame around the opening with a lit top edge, a dark reveal (fake
+    // occlusion) along the top and left of the glass, and optionally a sill below with a light top edge and a
+    // shadow line beneath it. Frames are painted rough (0.6) beside the 0.1 glass and cut out of the emissive.
+    const reveal = (gx: number, gy: number, gw: number, gh: number, f: number, frameCol: string, sill: boolean, revealA: number): void => {
+      const x0 = gx - f, w0 = gw + 2 * f;
+      for (const c of [m.ctx, e.ctx, r.ctx]) {
+        c.fillStyle = c === m.ctx ? frameCol : c === e.ctx ? '#000' : grey(0.6);
+        c.fillRect(x0, gy - f, w0, f);
+        c.fillRect(x0, gy, f, gh);
+        c.fillRect(gx + gw, gy, f, gh);
+        if (!sill) c.fillRect(x0, gy + gh, w0, f);
+      }
+      m.ctx.fillStyle = rgba(255, 255, 255, 0.32);
+      m.ctx.fillRect(x0, gy - f, w0, 1);
+      m.ctx.fillRect(x0, gy - f, 1, gh + (sill ? f : 2 * f));
+      m.ctx.fillStyle = rgba(0, 0, 0, 0.22);
+      m.ctx.fillRect(gx + gw + f - 1, gy - f, 1, gh + (sill ? f : 2 * f));
+      m.ctx.fillStyle = rgba(0, 0, 0, revealA);
+      m.ctx.fillRect(gx, gy, gw, 3);
+      m.ctx.fillRect(gx, gy, 3, gh);
+      m.ctx.fillStyle = rgba(0, 0, 0, revealA * 0.5);
+      m.ctx.fillRect(gx, gy + 3, gw, 2);
+      m.ctx.fillRect(gx + 3, gy, 2, gh);
+      if (sill) {
+        const sy = gy + gh, sx = x0 - 2, sw = w0 + 4;
+        m.ctx.fillStyle = tint(wall, 0.42);
+        m.ctx.fillRect(sx, sy, sw, 5);
+        m.ctx.fillStyle = rgba(255, 255, 255, 0.5);
+        m.ctx.fillRect(sx, sy, sw, 1);
+        m.ctx.fillStyle = rgba(0, 0, 0, 0.32);
+        m.ctx.fillRect(sx, sy + 5, sw, 3);
+        m.ctx.fillStyle = rgba(0, 0, 0, 0.1);
+        m.ctx.fillRect(sx, sy + 8, sw, 3);
+        e.ctx.fillStyle = '#000';
+        e.ctx.fillRect(sx, sy, sw, 8);
+        r.ctx.fillStyle = grey(0.7);
+        r.ctx.fillRect(sx, sy, sw, 5);
+      }
     };
     for (let row = 0; row < rows; row++) {
       const y0 = top + row * rh;
@@ -365,7 +599,8 @@ export class TextureFactory {
         grad.addColorStop(1, 'rgba(0,0,0,0.06)');
         m.ctx.fillStyle = grad;
         m.ctx.fillRect(gx, gy, gw, gh);
-        r.ctx.fillStyle = grey(blinds ? 0.55 : 0.18);
+        // Glazing is glass whatever sits behind it: 0.1, a shade more with blinds pressed to the pane.
+        r.ctx.fillStyle = grey(blinds ? 0.15 : 0.1);
         r.ctx.fillRect(gx, gy, gw, gh);
         // Night: a lit pane is brightest at the ceiling and falls off to the floor; hue and level vary per pane.
         if (rng.chance(rowLit)) {
@@ -392,43 +627,40 @@ export class TextureFactory {
             e.ctx.fillRect(gx, gy + gh * rng.range(0.1, 0.5), gw, 3);
           }
         }
-        // Frames and mullions (cut black out of the emissive too).
+        // Frames, reveals, sills and mullions (all cut black out of the emissive too).
         if (style === 'glass') {
+          // Curtain wall: slim aluminium frame, shallow reveal, spandrel instead of a sill.
           const dk = rgba(150, 176, 200, 0.7), lt = rgba(224, 236, 246, 0.8);
           frame(gx + gw / 2 - 2, gy, 4, gh, dk, lt);
-          frame(gx - 2, gy, 4, gh, dk, lt);
+          reveal(gx, gy, gw, gh, 3, rgba(200, 214, 226, 0.95), false, 0.2);
         } else if (style === 'neon') {
           const dk = rgba(20, 26, 34, 0.7), lt = rgba(120, 130, 140, 0.7);
           for (let k = 1; k < 4; k++) frame(gx + (gw * k) / 4 - 2, gy, 4, gh, dk, lt);
+          reveal(gx, gy, gw, gh, 3, rgba(44, 48, 56, 0.95), !ground, 0.3);
         } else if (style === 'concrete') {
-          // Deep reveal: shadow along the top and left of the punched opening.
-          m.ctx.fillStyle = rgba(0, 0, 0, 0.35);
-          m.ctx.fillRect(gx - 2 * P, gy - 2 * P, gw + 4 * P, 3 * P);
-          m.ctx.fillRect(gx - 2 * P, gy - 2 * P, 3 * P, gh + 4 * P);
-          m.ctx.fillStyle = tint(wall, 0.3);
-          m.ctx.fillRect(gx - 2 * P, gy + gh, gw + 4 * P, 3 * P);
+          // Deep punched opening: precast frame, a strong reveal shadow, a sill.
           frame(gx + gw / 2 - 2, gy, 4, gh, rgba(40, 44, 50, 0.8), rgba(150, 150, 146, 0.8));
+          reveal(gx, gy, gw, gh, 4, tint(wall, 0.14), !ground, 0.42);
         } else if (style === 'artdeco') {
-          m.ctx.fillStyle = tint(wall, 0.45);
-          m.ctx.fillRect(gx - 3 * P, gy - 3 * P, gw + 6 * P, 3 * P);
-          m.ctx.fillRect(gx - 3 * P, gy + gh, gw + 6 * P, 4 * P);
           frame(gx + gw / 2 - 2, gy, 4, gh, rgba(60, 60, 70, 0.7), rgba(180, 176, 168, 0.8));
+          reveal(gx, gy, gw, gh, 4, tint(wall, 0.45), !ground, 0.3);
         } else if (!ground) {
-          // Residential: white frame, sill and an occasional shutter.
-          m.ctx.fillStyle = rgba(250, 248, 244, 0.9);
-          m.ctx.fillRect(gx - 3 * P, gy - 3 * P, gw + 6 * P, 3 * P);
-          m.ctx.fillRect(gx - 3 * P, gy + gh, gw + 6 * P, 4 * P);
+          // Residential: white frame, sill and an occasional shutter (under the reveal so it is shadowed too).
           frame(gx + gw / 2 - 2, gy, 4, gh, rgba(236, 232, 226, 0.9), rgba(255, 255, 255, 0.9));
           if (rng.chance(0.3)) {
             m.ctx.fillStyle = rgba(120, 150, 130, 0.85);
             m.ctx.fillRect(gx, gy, gw * 0.45, gh);
+            m.ctx.fillStyle = rgba(0, 0, 0, 0.18);
+            for (let yy = gy + 4; yy < gy + gh - 2; yy += 6) m.ctx.fillRect(gx + 2, yy, gw * 0.45 - 4, 2);
             e.ctx.fillStyle = '#000';
             e.ctx.fillRect(gx, gy, gw * 0.45, gh);
-            r.ctx.fillStyle = grey(0.8);
+            r.ctx.fillStyle = grey(0.7);
             r.ctx.fillRect(gx, gy, gw * 0.45, gh);
           }
+          reveal(gx, gy, gw, gh, 4, rgba(250, 248, 244, 0.92), true, 0.3);
         } else {
           frame(gx + gw / 2 - 2, gy, 4, gh, rgba(40, 44, 50, 0.8), rgba(150, 150, 146, 0.8));
+          reveal(gx, gy, gw, gh, 4, rgba(52, 56, 62, 0.92), false, 0.3);
         }
       }
     }
@@ -648,8 +880,11 @@ export class TextureFactory {
     this.grime(m.ctx, W, H, rng, H * 0.6, 0);
     const map = this.finish(key + ':map', m.canvas, true, true, true);
     const emissive = this.finish(key + ':emi', e.canvas, true, true, true);
-    const normal = this.normalFromLuminance(key + ':nrm', m.canvas, 5.5);
-    const rough = this.roughFromLuminance(key + ':rgh', m.canvas, 0.1, 0.92);
+    // Relief and roughness only need the mullion / pier steps: derive both from a half-res copy.
+    const half = this.canvas(W / 2, H / 2);
+    half.ctx.drawImage(m.canvas, 0, 0, W / 2, H / 2);
+    const normal = this.normalFromLuminance(key + ':nrm', half.canvas, 5.5);
+    const rough = this.roughFromLuminance(key + ':rgh', half.canvas, 0.1, 0.92);
     return { map, emissive, normal, rough };
   }
 
@@ -729,8 +964,11 @@ export class TextureFactory {
     this.grime(m.ctx, W, H, rng, H * 0.6, 0);
     const map = this.finish(key + ':map', m.canvas, true, true, true);
     const emissive = this.finish(key + ':emi', e.canvas, true, true, true);
-    const normal = this.normalFromLuminance(key + ':nrm', m.canvas, 5.5);
-    const rough = this.roughFromLuminance(key + ':rgh', m.canvas, 0.1, 0.92);
+    // Relief and roughness only need the mullion / pier steps: derive both from a half-res copy.
+    const half = this.canvas(W / 2, H / 2);
+    half.ctx.drawImage(m.canvas, 0, 0, W / 2, H / 2);
+    const normal = this.normalFromLuminance(key + ':nrm', half.canvas, 5.5);
+    const rough = this.roughFromLuminance(key + ':rgh', half.canvas, 0.1, 0.92);
     return { map, emissive, normal, rough };
   }
 
@@ -750,104 +988,174 @@ export class TextureFactory {
     return t;
   }
 
-  /** Shared asphalt base: dark warm bitumen with a soft aggregate mottle, fine flecks softened by a 1 px blur. */
-  private asphalt(ctx: CanvasRenderingContext2D, S: number, rng: Random): void {
-    ctx.fillStyle = '#2a2826';
+  /**
+   * Shared asphalt base at any tile size: dark warm bitumen, broad tonal mottle, a fine two-tone grain and larger dark
+   * aggregate specks softened by a 3 x 3 blur so they sit at stone size (2-4 cm at 1024 px / 14 m) and average out in
+   * the first mip. Fills the roughness canvas (r) with a near-flat 1.0 base with a little variation.
+   */
+  private asphalt(ctx: CanvasRenderingContext2D, r: CanvasRenderingContext2D | null, S: number, rng: Random): void {
+    const k = S / 512;
+    ctx.fillStyle = '#2c2a27';
     ctx.fillRect(0, 0, S, S);
-    this.mottle(ctx, S, S, rng, 40, 30, 90, 0.06, 4000, 0.1, true);
+    this.mottle(ctx, S, S, rng, 70, 30 * k, 100 * k, 0.06, 0, 0, true);
+    this.grain(ctx, S, S, rng, 0.055, 0.3);
+    this.specks(ctx, S, S, rng, Math.round(2600 * k * k), Math.round(700 * k * k), 2.2 * k);
     this.blur3(ctx, S, S);
+    if (r) {
+      r.fillStyle = grey(1);
+      r.fillRect(0, 0, S, S);
+      // Polished wheel paths and oily patches are a touch smoother than fresh aggregate.
+      this.mottle(r, S, S, rng, 30, 40 * k, 120 * k, 0.05, 0, 0, false);
+    }
   }
 
-  /** Repair patch: an irregular polygon of slightly different asphalt with a soft edge (three fills, shrinking). */
-  private patch(ctx: CanvasRenderingContext2D, rng: Random, cx: number, cy: number, radius: number, dark: boolean): void {
+  /** Repair patch: an irregular polygon of slightly different asphalt with a soft edge (three fills, shrinking) and a tar-sealed outline. */
+  private patch(ctx: CanvasRenderingContext2D, rng: Random, cx: number, cy: number, radius: number, dark: boolean, scale = 1): void {
     const n = rng.int(6, 8);
     const ang: number[] = [], rad: number[] = [];
     for (let k = 0; k < n; k++) { ang.push((k / n) * Math.PI * 2 + rng.range(-0.2, 0.2)); rad.push(radius * rng.range(0.6, 1)); }
-    for (let pass = 0; pass < 3; pass++) {
-      const s = 1 - pass * 0.07;
+    const path = (s: number): void => {
       ctx.beginPath();
       for (let k = 0; k < n; k++) {
         const x = cx + Math.cos(ang[k]) * rad[k] * s, y = cy + Math.sin(ang[k]) * rad[k] * s * 0.7;
         if (k === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
       }
       ctx.closePath();
+    };
+    for (let pass = 0; pass < 3; pass++) {
+      path(1 - pass * 0.07);
       ctx.fillStyle = dark ? rgba(0, 0, 0, 0.06) : rgba(255, 250, 240, 0.035);
       ctx.fill();
     }
+    path(1);
+    ctx.strokeStyle = rgba(6, 5, 4, 0.5);
+    ctx.lineWidth = 2.2 * scale;
+    ctx.lineJoin = 'round';
+    ctx.stroke();
   }
 
-  /** Asphalt tile (ROAD_TILE_M x ROAD_TILE_M m): dashed white lane separators at +-3.5 m, double yellow center, patches and wear. u = across, v = along. */
+  /**
+   * Draws the lane paint of a tile into a cleared layer, wears it, then composites it onto the asphalt and, at a fixed
+   * grey, onto the roughness canvas (paint is smoother than aggregate). `draw` paints the markings and returns their
+   * rectangles for the edge wear.
+   */
+  private paintLayer(ctx: CanvasRenderingContext2D, r: CanvasRenderingContext2D | null, S: number, rng: Random, draw: (p: CanvasRenderingContext2D) => number[][]): void {
+    const layer = this.canvas(S, S);
+    layer.ctx.clearRect(0, 0, S, S);
+    const rects = draw(layer.ctx);
+    this.wearPaint(layer.ctx, rng, rects, S / 512);
+    // Thermoplastic sits proud of the road and picks up a dusting of tyre grime.
+    layer.ctx.save();
+    layer.ctx.globalCompositeOperation = 'source-atop';
+    this.mottle(layer.ctx, S, S, rng, 40, 20 * (S / 512), 90 * (S / 512), 0.14, 0, 0, true);
+    layer.ctx.restore();
+    ctx.drawImage(layer.canvas, 0, 0);
+    if (r) {
+      layer.ctx.save();
+      layer.ctx.globalCompositeOperation = 'source-in';
+      layer.ctx.fillStyle = grey(0.65);
+      layer.ctx.fillRect(0, 0, S, S);
+      layer.ctx.restore();
+      r.drawImage(layer.canvas, 0, 0);
+    }
+  }
+
+  /** Finishes a painted roughness canvas at half resolution (roughness needs far less detail than the albedo or relief). */
+  private finishRoughHalf(key: string, src: HTMLCanvasElement): THREE.CanvasTexture {
+    const half = this.canvas(src.width / 2, src.height / 2);
+    half.ctx.drawImage(src, 0, 0, src.width / 2, src.height / 2);
+    return this.finish(key, half.canvas, false);
+  }
+
+  /**
+   * Asphalt tile (ROAD_TILE_M x ROAD_TILE_M m, 1024 px = 73 px/m): dashed white lane separators at +-3.5 m, double
+   * yellow centre line, worn paint, repair patches, tar seams, crack polylines, a manhole in the inner lane and a
+   * kerb-side drain. u = across, v = along. Also builds the road roughness map (cached as road:rgh) while drawing.
+   */
   road(): THREE.CanvasTexture {
     const key = 'road';
     const c = this.cache.get(key) as THREE.CanvasTexture | undefined;
     if (c) return c;
-    const S = 512;
+    const S = 1024, k = S / 512;
     const { canvas, ctx } = this.canvas(S, S);
+    const r = this.canvas(S, S).ctx;
     const rng = new Random(11);
-    this.asphalt(ctx, S, rng);
-    // Two repair patches (kept away from the edges so the tile still wraps) and a few tar seams.
-    this.patch(ctx, rng, rng.range(130, 220), rng.range(120, 390), rng.range(50, 90), true);
-    this.patch(ctx, rng, rng.range(300, 390), rng.range(120, 390), rng.range(40, 80), rng.chance(0.5));
-    ctx.strokeStyle = rgba(18, 16, 14, 0.4);
-    ctx.lineWidth = 2;
-    for (let i = 0; i < 7; i++) {
-      const x = rng.range(60, S - 60), y = rng.range(60, S - 60);
-      ctx.beginPath();
-      ctx.moveTo(x, y);
-      ctx.lineTo(x + rng.range(-60, 60), y + rng.range(-60, 60));
-      ctx.stroke();
-    }
+    this.asphalt(ctx, r, S, rng);
     const px = S / ROAD_TILE_M;
     const cx = S / 2;
+    // Two repair patches (kept away from the edges so the tile still wraps) and a few tar seams.
+    this.patch(ctx, rng, rng.range(130, 220) * k, rng.range(120, 390) * k, rng.range(50, 90) * k, true, k);
+    this.patch(ctx, rng, rng.range(300, 390) * k, rng.range(120, 390) * k, rng.range(40, 80) * k, rng.chance(0.5), k);
+    ctx.strokeStyle = rgba(12, 10, 8, 0.45);
+    ctx.lineWidth = 2.4 * k;
+    ctx.lineCap = 'round';
+    for (let i = 0; i < 6; i++) {
+      const x = rng.range(60, S / k - 60) * k, y = rng.range(60, S / k - 60) * k;
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.lineTo(x + rng.range(-60, 60) * k, y + rng.range(-60, 60) * k);
+      ctx.stroke();
+    }
     // Darker tyre tracks in the wheel paths, plus faint full-height streaks so the surface reads as driven along.
     ctx.fillStyle = rgba(0, 0, 0, 0.1);
     for (const off of [-5.4, -1.9, 1.9, 5.4]) ctx.fillRect(cx + off * px - 0.5 * px, 0, 1.0 * px, S);
     for (let i = 0; i < 26; i++) {
       const light = rng.chance(0.4), v = light ? 255 : 0;
       ctx.fillStyle = rgba(v, v, v, rng.range(0.02, 0.05));
-      ctx.fillRect(rng.range(0, S), 0, rng.range(1, 4), S);
+      ctx.fillRect(rng.range(0, S), 0, rng.range(1, 4) * k, S);
     }
-    ctx.fillStyle = '#c9ab3c';
-    ctx.fillRect(cx - 0.35 * px, 0, 0.15 * px, S);
-    ctx.fillRect(cx + 0.2 * px, 0, 0.15 * px, S);
-    ctx.fillStyle = '#c8c8c2';
-    for (let side = -1; side <= 1; side += 2) {
-      const x = cx + side * 3.5 * px - 0.08 * px;
-      for (let y = 0; y < S; y += 3 * px) ctx.fillRect(x, y, 0.16 * px, 1.5 * px);
-    }
-    // Faded paint: scratch the markings a little.
-    this.noise(ctx, S, S, rng, 450, 8, 0.08, false);
+    // Cracks: alligator cracking in the wheel paths and a couple of long transverse ones.
+    this.cracks(ctx, S, S, rng, 5, k, 0.45, 0.05);
+    // Manhole in the inner lane, drain against one kerb.
+    this.manhole(ctx, r, rng, cx + (rng.chance(0.5) ? 1 : -1) * rng.range(1.6, 2.4) * px, rng.range(0.2, 0.8) * S, 0.34 * px);
+    const dSide = rng.chance(0.5) ? 0.35 * px : S - 0.35 * px - 0.36 * px;
+    this.drain(ctx, r, dSide, rng.range(0.15, 0.85) * S, 0.36 * px, 0.62 * px, k);
+    this.paintLayer(ctx, r, S, rng, (p) => {
+      const rects: number[][] = [];
+      p.fillStyle = '#d0b043';
+      for (const x of [cx - 0.35 * px, cx + 0.2 * px]) { p.fillRect(x, 0, 0.15 * px, S); rects.push([x, 0, 0.15 * px, S]); }
+      p.fillStyle = '#d6d6cf';
+      for (let side = -1; side <= 1; side += 2) {
+        const x = cx + side * 3.5 * px - 0.08 * px;
+        for (let y = 0; y < S; y += 3 * px) { p.fillRect(x, y, 0.16 * px, 1.5 * px); rects.push([x, y, 0.16 * px, 1.5 * px]); }
+      }
+      return rects;
+    });
+    this.finishRoughHalf(key + ':rgh', r.canvas);
     return this.finish(key, canvas, true);
   }
 
-  /** Intersection tile: asphalt with zebra crossings and stop bars along all four edges. */
+  /** Intersection tile (1024 px): asphalt with worn zebra crossings and stop bars along all four edges. */
   crosswalk(): THREE.CanvasTexture {
     const key = 'crosswalk';
     const c = this.cache.get(key) as THREE.CanvasTexture | undefined;
     if (c) return c;
-    const S = 512;
+    const S = 1024, k = S / 512;
     const { canvas, ctx } = this.canvas(S, S);
     const rng = new Random(23);
-    this.asphalt(ctx, S, rng);
-    this.patch(ctx, rng, rng.range(150, 360), rng.range(150, 360), rng.range(50, 90), true);
-    this.patch(ctx, rng, rng.range(150, 360), rng.range(150, 360), rng.range(40, 70), false);
+    this.asphalt(ctx, null, S, rng);
+    this.patch(ctx, rng, rng.range(150, 360) * k, rng.range(150, 360) * k, rng.range(50, 90) * k, true, k);
+    this.patch(ctx, rng, rng.range(150, 360) * k, rng.range(150, 360) * k, rng.range(40, 70) * k, false, k);
+    this.cracks(ctx, S, S, rng, 4, k, 0.45, 0.05, 0.2);
     const px = S / ROAD_TILE_M;
+    this.manhole(ctx, null, rng, S / 2 + rng.range(-1.5, 1.5) * px, S / 2 + rng.range(-1.5, 1.5) * px, 0.34 * px);
     const band = 2.4 * px, m = 0.6 * px, stripe = 0.6 * px, gap = 0.5 * px;
-    ctx.fillStyle = '#c4c4bc';
-    for (let x = 1.4 * px; x < S - 1.4 * px; x += stripe + gap) {
-      ctx.fillRect(x, m, stripe, band);
-      ctx.fillRect(x, S - m - band, stripe, band);
-      ctx.fillRect(m, x, band, stripe);
-      ctx.fillRect(S - m - band, x, band, stripe);
-    }
-    // Stop bars just inside the zebra on the approach halves.
-    const sb = 0.45 * px, sy = m + band + 0.35 * px;
-    ctx.fillStyle = '#bcbcb4';
-    ctx.fillRect(S / 2 + 0.2 * px, sy, S / 2 - 1.4 * px, sb);
-    ctx.fillRect(1.4 * px, S - sy - sb, S / 2 - 1.6 * px, sb);
-    ctx.fillRect(sy, 1.4 * px, sb, S / 2 - 1.6 * px);
-    ctx.fillRect(S - sy - sb, S / 2 + 0.2 * px, sb, S / 2 - 1.4 * px);
-    this.noise(ctx, S, S, rng, 375, 8, 0.07, false);
+    this.paintLayer(ctx, null, S, rng, (p) => {
+      const rects: number[][] = [];
+      p.fillStyle = '#d2d2ca';
+      for (let x = 1.4 * px; x < S - 1.4 * px; x += stripe + gap) {
+        p.fillRect(x, m, stripe, band); rects.push([x, m, stripe, band]);
+        p.fillRect(x, S - m - band, stripe, band); rects.push([x, S - m - band, stripe, band]);
+        p.fillRect(m, x, band, stripe); rects.push([m, x, band, stripe]);
+        p.fillRect(S - m - band, x, band, stripe); rects.push([S - m - band, x, band, stripe]);
+      }
+      // Stop bars just inside the zebra on the approach halves.
+      const sb = 0.45 * px, sy = m + band + 0.35 * px;
+      p.fillStyle = '#c8c8c0';
+      const bars = [[S / 2 + 0.2 * px, sy, S / 2 - 1.4 * px, sb], [1.4 * px, S - sy - sb, S / 2 - 1.6 * px, sb], [sy, 1.4 * px, sb, S / 2 - 1.6 * px], [S - sy - sb, S / 2 + 0.2 * px, sb, S / 2 - 1.4 * px]];
+      for (const b of bars) { p.fillRect(b[0], b[1], b[2], b[3]); rects.push(b); }
+      return rects;
+    });
     return this.finish(key, canvas, true);
   }
 
@@ -896,98 +1204,135 @@ export class TextureFactory {
   }
 
   /**
-   * Concrete paving tile (8 m): running-bond 2 m x 1 m slabs with a single dark joint, a few special slabs (granite,
-   * drain grate, tactile strip) and grime. The bottom 2% of the rows (v 0..0.02) is a kerb-stone band: CityRenderer's
-   * curb boxes map exactly that strip onto the kerb sides, so kerb and pavement share one texture and one grid.
+   * Concrete paving tile (8 m, 1024 px = 128 px/m): running-bond 2 m x 1 m slabs, each with its own colour
+   * temperature and tone, a 3 px joint with a lit lip, expansion joints every fourth course, chipped corners, the odd
+   * replaced (darker, newer) slab, a few special slabs (granite, drain grate, tactile strip), cracks and grime. The
+   * bottom 2% of the rows (v 0..0.02) is a kerb-stone band: CityRenderer's curb boxes map exactly that strip onto the
+   * kerb sides, so kerb and pavement share one texture and one grid. Also builds the roughness map (sidewalk:rgh).
    */
   sidewalk(): THREE.CanvasTexture {
     const key = 'sidewalk';
     const c = this.cache.get(key) as THREE.CanvasTexture | undefined;
     if (c) return c;
-    const S = 512, PM = S / 8; // 64 px per metre
+    const S = 1024, PM = S / 8, k = S / 512; // 128 px per metre
     const { canvas, ctx } = this.canvas(S, S);
+    const r = this.canvas(S, S).ctx;
     const rng = new Random(31);
-    ctx.fillStyle = '#b8b1a4';
+    ctx.fillStyle = '#b9b2a5';
     ctx.fillRect(0, 0, S, S);
-    this.mottle(ctx, S, S, rng, 36, 24, 70, 0.05, 3000, 0.03, true);
+    r.fillStyle = grey(0.95);
+    r.fillRect(0, 0, S, S);
+    // Cement: broad mottle, a fine sandy grain and a sparse scatter of aggregate showing through the trowelled top.
+    this.mottle(ctx, S, S, rng, 40, 24 * k, 80 * k, 0.05, 0, 0, true);
+    this.grain(ctx, S, S, rng, 0.035, 0.25);
+    this.specks(ctx, S, S, rng, 900, 500, 1.6 * k);
+    this.blur3(ctx, S, S);
     const SW = 2 * PM, SH = PM, rows = 8, cols = 4;
+    const kb = Math.round(S * 0.02);
     // Special slabs: (row, col, kind) - kept off the kerb row.
     const special: { r: number; c: number; kind: number }[] = [];
-    for (let k = 0; k < 4; k++) special.push({ r: rng.int(0, rows - 2), c: rng.int(0, cols - 1), kind: k });
+    for (let kk = 0; kk < 4; kk++) special.push({ r: rng.int(0, rows - 2), c: rng.int(0, cols - 1), kind: kk });
     for (let j = 0; j < rows; j++) {
       const off = (j % 2) * (SW / 2);
       const y = j * SH;
       for (let i = -1; i < cols; i++) {
         const x = i * SW + off;
-        // Per-slab tonal jitter.
-        const k = rng.range(-0.02, 0.02);
-        ctx.fillStyle = k > 0 ? rgba(255, 255, 255, k * 2) : rgba(0, 0, 0, -k * 2);
+        // Per-slab tone and colour temperature: pours from different days never match.
+        const lum = rng.range(-0.035, 0.035);
+        ctx.fillStyle = lum > 0 ? rgba(255, 255, 255, lum * 2) : rgba(0, 0, 0, -lum * 2);
+        ctx.fillRect(x, y, SW, SH);
+        const warm = rng.range(-1, 1);
+        ctx.fillStyle = warm > 0 ? rgba(255, 226, 190, warm * 0.09) : rgba(190, 206, 232, -warm * 0.09);
         ctx.fillRect(x, y, SW, SH);
         const sp = special.find((s) => s.r === j && s.c === ((i + cols) % cols));
         if (sp && i >= 0) {
           if (sp.kind === 0 || sp.kind === 3) {
-            // Darker granite slab with a light sparkle.
+            // Darker granite slab: flecked, slightly smoother.
             ctx.fillStyle = rgba(60, 58, 60, 0.45);
             ctx.fillRect(x, y, SW, SH);
-            for (let g = 0; g < 60; g++) { ctx.fillStyle = rgba(255, 255, 255, rng.range(0.05, 0.18)); ctx.fillRect(x + rng.range(0, SW), y + rng.range(0, SH), 1, 1); }
+            for (let g = 0; g < 240; g++) { ctx.fillStyle = rgba(255, 255, 255, rng.range(0.05, 0.18)); ctx.fillRect(x + rng.range(0, SW), y + rng.range(0, SH), 2, 2); }
+            r.fillStyle = grey(0.72);
+            r.fillRect(x, y, SW, SH);
           } else if (sp.kind === 1) {
-            // Drain grate: a dark recess with slots.
-            const gw = 0.6 * PM, gh = 0.36 * PM, gx = x + SW / 2 - gw / 2, gy = y + SH / 2 - gh / 2;
-            ctx.fillStyle = '#3a3835';
-            ctx.fillRect(gx - 2, gy - 2, gw + 4, gh + 4);
-            ctx.fillStyle = '#15130f';
-            for (let s = 3; s < gw - 3; s += 6) ctx.fillRect(gx + s, gy + 2, 3, gh - 4);
+            // Drain grate set into the slab.
+            const gw = 0.6 * PM, gh = 0.36 * PM;
+            this.drain(ctx, r, x + SW / 2 - gw / 2, y + SH / 2 - gh / 2, gw, gh, k);
           } else {
             // Tactile strip: rows of raised domes, light on top with a shadow below.
-            for (let yy = y + 6; yy < y + SH - 4; yy += 8) {
-              for (let xx = x + 6; xx < x + SW - 4; xx += 8) {
+            for (let yy = y + 12; yy < y + SH - 8; yy += 16) {
+              for (let xx = x + 12; xx < x + SW - 8; xx += 16) {
                 ctx.fillStyle = rgba(0, 0, 0, 0.28);
-                ctx.fillRect(xx, yy + 1, 4, 3);
+                ctx.beginPath(); ctx.ellipse(xx + 4, yy + 5, 5, 4, 0, 0, Math.PI * 2); ctx.fill();
                 ctx.fillStyle = rgba(255, 250, 240, 0.4);
-                ctx.fillRect(xx, yy, 4, 2);
+                ctx.beginPath(); ctx.ellipse(xx + 3.5, yy + 3, 4.5, 3.5, 0, 0, Math.PI * 2); ctx.fill();
               }
             }
           }
+        } else if (i >= 0 && j < rows - 1 && rng.chance(0.07)) {
+          // Replaced slab: newer, darker, cleaner pour with a crisp edge.
+          ctx.fillStyle = rgba(58, 54, 50, 0.32);
+          ctx.fillRect(x, y, SW, SH);
+          r.fillStyle = grey(0.82);
+          r.fillRect(x, y, SW, SH);
         }
-        // Vertical joint at the slab's left edge (single dark line, no light lip).
-        ctx.fillStyle = rgba(0, 0, 0, 0.26);
-        ctx.fillRect(x, y, 2, SH);
+        // Chipped corners: a small spall at one or two corners, dark with a lit lip.
+        if (rng.chance(0.3)) {
+          const cxk = rng.chance(0.5) ? x : x + SW, cyk = rng.chance(0.5) ? y : y + SH;
+          const sx = cxk === x ? 1 : -1, sy = cyk === y ? 1 : -1;
+          const a = rng.range(5, 13) * k, b = rng.range(5, 13) * k;
+          ctx.fillStyle = rgba(255, 246, 232, 0.35);
+          ctx.beginPath(); ctx.moveTo(cxk, cyk); ctx.lineTo(cxk + sx * (a + 1.5 * k), cyk); ctx.lineTo(cxk, cyk + sy * (b + 1.5 * k)); ctx.closePath(); ctx.fill();
+          ctx.fillStyle = rgba(30, 26, 22, 0.4);
+          ctx.beginPath(); ctx.moveTo(cxk, cyk); ctx.lineTo(cxk + sx * a, cyk); ctx.lineTo(cxk + sx * a * 0.55, cyk + sy * b * 0.6); ctx.lineTo(cxk, cyk + sy * b); ctx.closePath(); ctx.fill();
+        }
+        // Vertical joint at the slab's left edge: dark groove with a lit lip on the far side.
+        ctx.fillStyle = rgba(0, 0, 0, 0.34);
+        ctx.fillRect(x, y, 3, SH);
+        ctx.fillStyle = rgba(255, 250, 240, 0.14);
+        ctx.fillRect(x + 3, y, 1, SH);
+        r.fillStyle = grey(1);
+        r.fillRect(x, y, 3, SH);
       }
-      // Horizontal joint.
-      ctx.fillStyle = rgba(0, 0, 0, 0.26);
-      ctx.fillRect(0, y, S, 2);
+      // Horizontal joint; every fourth course is a sealed expansion joint (wider, with a dark filler line).
+      const expansion = j % 4 === 0;
+      ctx.fillStyle = rgba(0, 0, 0, expansion ? 0.3 : 0.34);
+      ctx.fillRect(0, y, S, expansion ? 6 : 3);
+      if (expansion) { ctx.fillStyle = rgba(10, 8, 6, 0.5); ctx.fillRect(0, y + 2, S, 2); }
+      ctx.fillStyle = rgba(255, 250, 240, 0.14);
+      ctx.fillRect(0, y + (expansion ? 6 : 3), S, 1);
+      r.fillStyle = grey(1);
+      r.fillRect(0, y, S, expansion ? 6 : 3);
     }
-    // Hairline cracks across a few slabs.
-    ctx.strokeStyle = rgba(0, 0, 0, 0.18);
-    ctx.lineWidth = 1;
-    for (let i = 0; i < 5; i++) {
-      let x = rng.range(40, S - 40), y = rng.range(40, S - 60);
-      ctx.beginPath();
-      ctx.moveTo(x, y);
-      for (let k = 0; k < 4; k++) { x += rng.range(-14, 14); y += rng.range(-14, 14); ctx.lineTo(x, y); }
-      ctx.stroke();
-    }
+    // Hairline cracks across a few slabs (kept above the kerb band).
+    this.cracks(ctx, S, S, rng, 4, k * 0.7, 0.3, 0.08, 0.05);
     // Grime blotches (damp, gum, rust) kept off the edges so the tile still wraps.
-    for (let i = 0; i < 12; i++) {
-      const r = rng.range(14, 50), x = rng.range(r, S - r), y = rng.range(r, S - r - 12);
-      const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+    for (let i = 0; i < 14; i++) {
+      const rad = rng.range(14, 50) * k, x = rng.range(rad, S - rad), y = rng.range(rad, S - rad - kb);
+      const g = ctx.createRadialGradient(x, y, 0, x, y, rad);
       const warm = rng.chance(0.4);
       g.addColorStop(0, warm ? rgba(96, 74, 46, 0.06 + rng.next() * 0.06) : rgba(30, 32, 36, 0.05 + rng.next() * 0.06));
       g.addColorStop(1, rgba(0, 0, 0, 0));
       ctx.fillStyle = g;
-      ctx.fillRect(x - r, y - r, r * 2, r * 2);
+      ctx.fillRect(x - rad, y - rad, rad * 2, rad * 2);
+    }
+    // Gum spots: small dark discs, the signature of a real pavement.
+    for (let i = 0; i < 40; i++) {
+      ctx.fillStyle = rgba(20, 18, 16, rng.range(0.18, 0.35));
+      ctx.beginPath(); ctx.arc(rng.range(0, S), rng.range(0, S - kb - 4), rng.range(1.5, 3.5) * k, 0, Math.PI * 2); ctx.fill();
     }
     // Kerb-stone band: v 0..0.02 -> the bottom 2% of rows. Lighter grey stone, dark chamfer line along its top,
     // a joint every metre.
-    const kb = Math.round(S * 0.02);
     ctx.fillStyle = '#b9b7b1';
     ctx.fillRect(0, S - kb, S, kb);
     ctx.fillStyle = rgba(0, 0, 0, 0.35);
-    ctx.fillRect(0, S - kb, S, 1);
+    ctx.fillRect(0, S - kb, S, 2);
     ctx.fillStyle = rgba(255, 255, 255, 0.18);
-    ctx.fillRect(0, S - kb + 1, S, 1);
+    ctx.fillRect(0, S - kb + 2, S, 2);
     ctx.fillStyle = rgba(0, 0, 0, 0.3);
-    for (let x = 0; x < S; x += PM) ctx.fillRect(x, S - kb, 1, kb);
+    for (let x = 0; x < S; x += PM) ctx.fillRect(x, S - kb, 2, kb);
+    r.fillStyle = grey(0.9);
+    r.fillRect(0, S - kb, S, kb);
+    this.finishRoughHalf(key + ':rgh', r.canvas);
     return this.finish(key, canvas, true);
   }
 
@@ -1000,9 +1345,11 @@ export class TextureFactory {
     const rng = new Random(41);
     ctx.fillStyle = '#dcc48e';
     ctx.fillRect(0, 0, S, S);
-    this.mottle(ctx, S, S, rng, 30, 16, 60, 0.06, 1500, 0.04, true);
-    this.noise(ctx, S, S, rng, 750, 6, 0.06, false);
-    this.noise(ctx, S, S, rng, 750, 6, 0.08, true);
+    // Dry sand: broad wind-sorted tone patches, a fine grain and a few shell / pebble specks, blurred to grain size.
+    this.mottle(ctx, S, S, rng, 30, 16, 60, 0.06, 0, 0, true);
+    this.grain(ctx, S, S, rng, 0.05, 0.3);
+    this.specks(ctx, S, S, rng, 120, 160, 1.6);
+    this.blur3(ctx, S, S);
     ctx.strokeStyle = rgba(160, 130, 80, 0.18);
     ctx.lineWidth = 2;
     for (let i = 0; i < 8; i++) {
@@ -1335,6 +1682,46 @@ export class TextureFactory {
     return this.finish(key, canvas, true, false);
   }
 
+  /**
+   * Striped awning canvas (256 x 128, tiles both ways): two-tone stripes along u with a woven grain, a sun-faded top
+   * and a grubby hem. Kept near-neutral (cream and a mid grey) so the geometry's vertex colour sets the awning's
+   * hue: a saturated tint gives colour / dark-colour stripes, a pale tint keeps it near cream / grey.
+   */
+  awningTex(): THREE.CanvasTexture {
+    const key = 'awning';
+    const c = this.cache.get(key) as THREE.CanvasTexture | undefined;
+    if (c) return c;
+    const W = 256, H = 128;
+    const { canvas, ctx } = this.canvas(W, H);
+    const rng = new Random(1123);
+    const stripes = 8, sw = W / stripes;
+    for (let i = 0; i < stripes; i++) {
+      ctx.fillStyle = i % 2 === 0 ? '#f4efe4' : '#8d857a';
+      ctx.fillRect(i * sw, 0, sw, H);
+      // Stitched stripe seam: a hairline shadow and a lighter thread beside it.
+      ctx.fillStyle = rgba(0, 0, 0, 0.16);
+      ctx.fillRect(i * sw, 0, 1, H);
+      ctx.fillStyle = rgba(255, 255, 255, 0.18);
+      ctx.fillRect(i * sw + 1, 0, 1, H);
+    }
+    // Weave: a 2 px warp/weft grid at low alpha, then a fine grain, blurred so it reads as cloth rather than a screen.
+    ctx.fillStyle = rgba(0, 0, 0, 0.06);
+    for (let y = 0; y < H; y += 3) ctx.fillRect(0, y, W, 1);
+    ctx.fillStyle = rgba(255, 255, 255, 0.05);
+    for (let x = 0; x < W; x += 3) ctx.fillRect(x, 0, 1, H);
+    this.grain(ctx, W, H, rng, 0.05, 0.1);
+    this.blur3(ctx, W, H);
+    // Sun fade at the top (v = 1) and a grubby, damp hem at the bottom (v = 0).
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, rgba(255, 250, 240, 0.16));
+    g.addColorStop(0.5, rgba(255, 250, 240, 0));
+    g.addColorStop(0.85, rgba(40, 32, 24, 0));
+    g.addColorStop(1, rgba(40, 32, 24, 0.2));
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+    return this.finish(key, canvas, true);
+  }
+
   /** Palm trunk bark (64 x 256, tiles both ways): fibrous brown with chevron leaf-scar bands, a light ridge over a dark shadow. */
   palmBark(): THREE.CanvasTexture {
     const key = 'bark';
@@ -1378,12 +1765,12 @@ export class TextureFactory {
     return this.finish(key, canvas, true);
   }
 
-  /** Roughness for the asphalt: the painted markings are smoother than the aggregate around them. */
+  /** Roughness for the asphalt: painted by road() itself (aggregate 1.0, paint 0.65, iron 0.55 - times the material's 0.85). */
   roadRough(): THREE.CanvasTexture {
     return this.groundRough('road', 0.62, 1);
   }
 
-  /** Tangent-space relief derived from a ground albedo: slab joints, the kerb chamfer, lane-paint edges. */
+  /** Tangent-space relief derived from a ground albedo: slab joints, the kerb chamfer, cracks, lane-paint edges. */
   groundNormal(name: 'sidewalk' | 'plaza' | 'road', strength: number): THREE.CanvasTexture {
     const key = name + ':nrm';
     const hit = this.cache.get(key) as THREE.CanvasTexture | undefined;
@@ -1393,12 +1780,15 @@ export class TextureFactory {
     return this.normalFromLuminance(key, src, strength);
   }
 
-  /** Roughness derived from a ground albedo's luminance, remapped into lo..hi. */
+  /**
+   * Ground roughness map. road() and sidewalk() paint theirs directly while drawing (so paint and iron come out
+   * smoother than aggregate, not the other way round); the plaza's is still derived from luminance, remapped into lo..hi.
+   */
   groundRough(name: 'sidewalk' | 'plaza' | 'road', lo: number, hi: number): THREE.CanvasTexture {
     const key = name + ':rgh';
+    const src = this[name]().image as HTMLCanvasElement | undefined;
     const hit = this.cache.get(key) as THREE.CanvasTexture | undefined;
     if (hit) return hit;
-    const src = this[name]().image as HTMLCanvasElement | undefined;
     if (!src || !src.width) return this.finish(key, this.canvas(4, 4).canvas, false);
     return this.roughFromLuminance(key, src, lo, hi);
   }

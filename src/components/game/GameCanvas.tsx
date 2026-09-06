@@ -10,7 +10,7 @@ import type { GamePhase } from '@/game/core/Types';
 export interface GameDebugInfo extends DebugStats { phase: GamePhase; playerX: number; playerZ: number; errors: string[] }
 
 declare global {
-  interface Window { __GAME_DEBUG__?: () => GameDebugInfo }
+  interface Window { __GAME_DEBUG__?: () => GameDebugInfo; __GAME_SCENE__?: () => unknown }
 }
 
 function LoadingOverlay() {
@@ -66,6 +66,7 @@ export default function GameCanvas({ children }: { children?: ReactNode }) {
       const w = current.world;
       return { ...current.getDebugStats(), phase: w.phase, playerX: w.player.curr.x, playerZ: w.player.curr.z, errors: errors.slice() };
     };
+    window.__GAME_SCENE__ = () => (current.renderer ? current.renderer.sceneBreakdown() : null);
 
     return () => {
       window.removeEventListener('error', onError);
@@ -76,6 +77,7 @@ export default function GameCanvas({ children }: { children?: ReactNode }) {
         current.dispose();
         if (engineRef.current === current) engineRef.current = null;
         if (window.__GAME_DEBUG__) delete window.__GAME_DEBUG__;
+        if (window.__GAME_SCENE__) delete window.__GAME_SCENE__;
       }, 0);
     };
   }, [store]);

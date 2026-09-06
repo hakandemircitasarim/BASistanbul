@@ -135,10 +135,16 @@ function trunkGeometry(seed: number): THREE.BufferGeometry {
 /**
  * Adds a back face to every triangle without flipping its normal: the copy has reversed winding but keeps the
  * sky-facing normal, so a frond seen from below is shaded like foliage instead of going black at midday (which is
- * what THREE.DoubleSide does, since it negates the normal on back faces).
+ * what THREE.DoubleSide does, since it negates the normal on back faces). The copy is the leaf's underside, so its
+ * vertex colour is pulled darker and a little cooler (`underside`): a frond then has two tones, top and shadow side,
+ * instead of reading as one flat paper cut-out.
  */
-function withBackFaces(g: THREE.BufferGeometry): THREE.BufferGeometry {
+function withBackFaces(g: THREE.BufferGeometry, underside = 1): THREE.BufferGeometry {
   const back = g.clone();
+  const col = back.attributes.color as THREE.BufferAttribute | undefined;
+  if (col && underside !== 1) {
+    for (let i = 0; i < col.count; i++) col.setXYZ(i, col.getX(i) * underside, col.getY(i) * underside * 0.97, col.getZ(i) * underside * 0.92);
+  }
   const idx = back.getIndex();
   if (idx) {
     const a = idx.array as ArrayLike<number>;
@@ -183,7 +189,7 @@ function frondsGeometry(topX: number, topY: number, seed: number): THREE.BufferG
     g.translate(topX, topY, 0);
     const v = rng.range(0.82, 1);
     tintRGB(g, v, v, v * 0.96);
-    const both = withBackFaces(g);
+    const both = withBackFaces(g, 0.66);
     g.dispose();
     parts.push(both);
   }
@@ -192,7 +198,7 @@ function frondsGeometry(topX: number, topY: number, seed: number): THREE.BufferG
     const g = frond(len, W * 0.7, rng.range(1.6, 1.9), (i / 4) * Math.PI * 2 + rng.range(-0.4, 0.4), 0.5, 0, 1, 2);
     g.translate(topX, topY - 0.15, 0);
     tintRGB(g, 0.5, 0.4, 0.26);
-    const both = withBackFaces(g);
+    const both = withBackFaces(g, 0.78);
     g.dispose();
     parts.push(both);
   }
@@ -236,7 +242,7 @@ function hydrantGeometry(): THREE.BufferGeometry {
 }
 
 /** Draw radius per prop kind: past this the prop is a couple of pixels, so it is left out of the instance buffer. */
-export const PROP_RANGE = { palm: 200, lamp: 240, bench: 170, hydrant: 140, bin: 130, sign: 175, shelter: 210, bollard: 120, repackMove: 15 } as const;
+export const PROP_RANGE = { palm: 165, lamp: 240, bench: 170, hydrant: 140, bin: 130, sign: 175, shelter: 210, bollard: 120, repackMove: 15 } as const;
 
 /** Seeds of the two palm variants; palms alternate between them by index. */
 const PALM_SEEDS = [1201, 2417] as const;

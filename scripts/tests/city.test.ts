@@ -158,6 +158,30 @@ test('sidewalks: loops, crossings, promenade, lookups', () => {
   expect(crossed > 0, 'nextNode crosses sometimes');
 });
 
+test('city: parking lots sit inside their blocks, hold the spawn spots and never overlap a building', () => {
+  const c = city().city;
+  const lots = c.lots ?? [];
+  expect(lots.length >= 60 && lots.length <= 160, `60-160 empty lots (got ${lots.length})`);
+  let spawnLot = false;
+  const sp = c.points.playerSpawn;
+  for (const l of lots) {
+    const blk = c.blocks[l.blockRow * 10 + l.blockCol];
+    expect(blk.col === l.blockCol && blk.row === l.blockRow && blk.kind === 'buildings', 'lot block index resolves to a buildings block');
+    expect(l.x - l.w / 2 >= blk.x0 + 2 - 1e-6 && l.x + l.w / 2 <= blk.x1 - 2 + 1e-6 && l.z - l.d / 2 >= blk.z0 + 2 - 1e-6 && l.z + l.d / 2 <= blk.z1 - 2 + 1e-6, 'lot inside the block inset');
+    expect(l.w >= 20 && l.d >= 20, `lot at least 20 m (got ${l.w.toFixed(1)} x ${l.d.toFixed(1)})`);
+    for (const id of blk.buildings) {
+      const b = c.buildings[id];
+      const sep = Math.max(Math.abs(b.x - l.x) - (b.w + l.w) / 2, Math.abs(b.z - l.z) - (b.d + l.d) / 2);
+      expect(sep >= -1e-6, `building ${id} does not overlap the lot (sep ${sep.toFixed(2)})`);
+    }
+    if (Math.hypot(l.x - sp.x, l.z - sp.z) < 40) spawnLot = true;
+  }
+  expect(spawnLot, 'a lot lies within 40 m of the spawn');
+  let inLot = 0;
+  for (const s of c.parkedSpots) for (const l of lots) if (Math.abs(s.x - l.x) <= l.w / 2 && Math.abs(s.z - l.z) <= l.d / 2) { inLot++; break; }
+  expect(inLot >= 10, `parked spots use the lots (got ${inLot})`);
+});
+
 test('validateCity(generateCity()) is empty', () => {
   const problems = validateCity(city());
   if (problems.length) console.log('    ' + problems.slice(0, 15).join('\n    '));

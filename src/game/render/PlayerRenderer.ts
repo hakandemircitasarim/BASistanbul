@@ -1,164 +1,512 @@
-// Player character (orange shirt, jeans, skin head, swinging limbs) synced from the Player entity; hidden while driving. Track C.
+// Player character: one skinned mesh (11 bones) sculpted from lathe tubes, an ellipsoid head with a face and a wrapped
+// hair cap. Knees and elbows bend in the walk cycle, the torso breathes and the hips sway. Also exports the sculpting
+// helpers PedRenderer builds its instanced crowd from. Track C.
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
 import type { World } from '../world/World';
 import type { Transform } from '../core/Types';
 import { createTransform, lerpTransform } from '../core/Transform';
-import { damp } from '../core/math';
+import { clamp, damp, smoothstep } from '../core/math';
+import { DAY_TUNING } from '../systems/DayNightSystem';
 import { ContactShadows, groundYAt } from './ContactShadows';
 
 const SHIRT = 0xff7a00;
-const SLEEVE = 0xe86e00;
+const COLLAR = 0xd95f00;
+const SLEEVE = 0xf07000;
 const JEANS = 0x2a4d9c;
-const BELT = 0x1d3468;
+const BELT = 0x1d2a45;
 const SKIN = 0xe3b48f;
 const HAIR = 0x2a1d17;
+const EYE = 0x1a1410;
 const SHOE = 0x1b1b20;
 const SHADOW_R = 0.56;
 const SHADOW_LIFT = 0.03;
 
-/**
- * Body proportions in metres, measured from the ground. The character is a stack of tapered, bevelled boxes: the
- * taper (narrow waist, narrow jaw, calf thinner than thigh) is what stops it reading as a pile of cubes, and each
- * limb is merged into one geometry so the whole figure is six draw calls.
- */
-const BODY = {
-  hipY: 0.85,
-  torsoH: 0.61, shoulderW: 0.46, shoulderD: 0.29, waistK: 0.72,
-  beltH: 0.1, beltW: 0.39, beltD: 0.27,
-  neckY: 1.46, neckH: 0.08, neckW: 0.12,
-  headY: 1.53, headH: 0.27, headW: 0.235, headD: 0.245, jawK: 0.82,
-  hairH: 0.115, hairGrow: 1.06, backHairH: 0.2,
-  shoulderY: 1.4, shoulderX: 0.278,
-  upperArmH: 0.28, upperArmW: 0.115, foreArmH: 0.25, foreArmW: 0.098, handH: 0.13, handW: 0.105,
-  hipX: 0.115, thighH: 0.45, thighW: 0.2, shinH: 0.4, shinW: 0.165,
-  shoeH: 0.11, shoeW: 0.17, shoeD: 0.3, shoeFwd: 0.05,
-} as const;
+// ---------------------------------------------------------------------------------------------------------------------
+// Shared sculpting helpers (also used by PedRenderer). All builders return non-indexed geometry with position, normal
+// and color attributes only, so any mix of them merges into one draw call.
+// ---------------------------------------------------------------------------------------------------------------------
+
+/** One cross-section of a lathe tube: elliptical radii and an optional centre offset. Listed bottom to top. */
+export interface Ring { y: number; rx: number; rz: number; x?: number; z?: number }
 
 const scratchColor = new THREE.Color();
+const scratchV = new THREE.Vector3();
 
-/** Bevelled box with an optional taper: x/z are scaled from `botK` at the bottom face to 1 at the top. */
-function bevel(w: number, h: number, d: number, botK = 1): THREE.BufferGeometry {
-  const r = Math.min(0.07, Math.min(w, Math.min(h, d)) * 0.3);
-  const g = new RoundedBoxGeometry(w, h, d, 1, r);
-  if (botK !== 1) {
-    const pos = g.attributes.position as THREE.BufferAttribute;
-    for (let i = 0; i < pos.count; i++) {
-      const t = Math.min(1, Math.max(0, pos.getY(i) / h + 0.5));
-      const k = botK + (1 - botK) * t;
-      pos.setX(i, pos.getX(i) * k);
-      pos.setZ(i, pos.getZ(i) * k);
+/**
+ * Smooth-shaded parametric sheet: `rows` x `cols` samples, columns closed around the axis when `wrap` is set.
+ * `flip` reverses the winding for sheets whose rows run the other way (a cap sampled pole-down, a lid seen from above).
+ */
+export function surface(rows: number, cols: number, wrap: boolean, flip: boolean,
+  fn: (i: number, j: number, out: THREE.Vector3) => void): THREE.BufferGeometry {
+  const v = scratchV;
+  const pos = new Float32Array(rows * cols * 3);
+  for (let i = 0; i < rows; i++) {
+    for (let j = 0; j < cols; j++) {
+      fn(i, j, v);
+      const k = (i * cols + j) * 3;
+      pos[k] = v.x; pos[k + 1] = v.y; pos[k + 2] = v.z;
     }
-    g.computeVertexNormals();
   }
+  const idx: number[] = [];
+  const span = wrap ? cols : cols - 1;
+  for (let i = 0; i < rows - 1; i++) {
+    for (let j = 0; j < span; j++) {
+      const a = i * cols + j, b = i * cols + ((j + 1) % cols), c = a + cols, d = b + cols;
+      if (flip) idx.push(a, c, b, b, c, d);
+      else idx.push(a, b, c, b, d, c);
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  const out = g.toNonIndexed();
+  g.dispose();
+  return out;
+}
+
+function disc(r: Ring, radial: number, up: boolean): THREE.BufferGeometry {
+  return surface(2, radial, true, up, (i, j, out) => {
+    const a = (j / radial) * Math.PI * 2;
+    const k = i === 0 ? 0 : 1;
+    out.set((r.x ?? 0) + r.rx * Math.sin(a) * k, r.y, (r.z ?? 0) + r.rz * Math.cos(a) * k);
+  });
+}
+
+/** Lathe tube through `rings` (bottom to top) with optional flat lids; smooth normals so it reads as a rounded limb. */
+export function tube(rings: Ring[], radial: number, capTop: boolean, capBot: boolean): THREE.BufferGeometry {
+  const side = surface(rings.length, radial, true, false, (i, j, out) => {
+    const r = rings[i], a = (j / radial) * Math.PI * 2;
+    out.set((r.x ?? 0) + r.rx * Math.sin(a), r.y, (r.z ?? 0) + r.rz * Math.cos(a));
+  });
+  if (!capTop && !capBot) return side;
+  const parts = [side];
+  if (capTop) parts.push(disc(rings[rings.length - 1], radial, true));
+  if (capBot) parts.push(disc(rings[0], radial, false));
+  return fuseBare(parts);
+}
+
+/** Ellipsoid skull: a sphere pulled in below the centre line so the jaw is narrower than the brow. */
+export function skull(cy: number, rx: number, ry: number, rz: number, segs: number, rings: number, jawK: number): THREE.BufferGeometry {
+  const g = new THREE.SphereGeometry(1, segs, rings);
+  const pos = g.attributes.position as THREE.BufferAttribute;
+  for (let i = 0; i < pos.count; i++) {
+    const y = pos.getY(i);
+    const k = 1 - (1 - jawK) * Math.max(0, -y);
+    pos.setXYZ(i, pos.getX(i) * k * rx, cy + y * ry, pos.getZ(i) * k * rz);
+  }
+  g.computeVertexNormals();
+  const out = g.toNonIndexed();
+  g.dispose();
+  out.deleteAttribute('uv');
+  return out;
+}
+
+/** Depth of the skull surface at (x, y): where eyes, brows and the nose sit so they are proud of the face. */
+export function faceZ(x: number, y: number, cy: number, rx: number, ry: number, rz: number, jawK: number): number {
+  const ny = (y - cy) / ry;
+  const k = 1 - (1 - jawK) * Math.max(0, -ny);
+  const t = 1 - (x / (rx * k)) * (x / (rx * k)) - ny * ny;
+  return rz * k * Math.sqrt(Math.max(0, t));
+}
+
+/**
+ * Hair cap wrapped over an ellipsoid: polar extent varies with azimuth (short over the brow = fringe, long at the nape)
+ * and a lip ring tucks the edge in toward the skull so the fringe reads as a thick layer, not a paper edge.
+ */
+export function hairCap(cy: number, rx: number, ry: number, rz: number, segs: number, rows: number, front: number, side: number, back: number, lip: number): THREE.BufferGeometry {
+  return surface(rows + (lip > 0 ? 1 : 0), segs, true, true, (i, j, out) => {
+    const a = (j / segs) * Math.PI * 2;
+    const f = (1 - Math.cos(a)) * 0.5;
+    const max = f < 0.5 ? front + (side - front) * (f * 2) : side + (back - side) * ((f - 0.5) * 2);
+    const isLip = i >= rows;
+    const th = isLip ? max + lip : (max * i) / (rows - 1);
+    const k = isLip ? 0.965 : 1;
+    out.set(rx * k * Math.sin(th) * Math.sin(a), cy + ry * k * Math.cos(th), rz * k * Math.sin(th) * Math.cos(a));
+  });
+}
+
+/** Non-indexed box without uvs (eyes, brows, straps). */
+export function block(w: number, h: number, d: number): THREE.BufferGeometry {
+  const g = new THREE.BoxGeometry(w, h, d);
+  const out = g.toNonIndexed();
+  g.dispose();
+  out.deleteAttribute('uv');
+  return out;
+}
+
+/** Bevelled box (shoes, bag) without uvs. */
+export function rounded(w: number, h: number, d: number, r: number, segs = 2): THREE.BufferGeometry {
+  const g = new RoundedBoxGeometry(w, h, d, segs, r);
+  g.deleteAttribute('uv');
   return g;
 }
 
-/** Paints a whole part one colour, so limbs of different colours can share a single vertex-coloured material. */
-function paint(g: THREE.BufferGeometry, hex: number): THREE.BufferGeometry {
-  scratchColor.setHex(hex);
-  const n = g.attributes.position.count;
+/**
+ * Shoe as a rounded loaf: elliptical cross-sections from heel to toe (toe wider and lower), flat-ish sole, no box edges.
+ * Origin at the ankle on the sole, toe toward +z; `s` scales the figure.
+ */
+export function shoe(s: number, radial: number): THREE.BufferGeometry {
+  const sec = [
+    { z: -0.09, rx: 0.052, ry: 0.036 }, { z: -0.03, rx: 0.064, ry: 0.046 }, { z: 0.06, rx: 0.068, ry: 0.04 }, { z: 0.15, rx: 0.052, ry: 0.024 },
+  ];
+  const side = surface(sec.length, radial, true, false, (i, j, out) => {
+    const c = sec[i], a = ((j + 0.5) / radial) * Math.PI * 2;
+    out.set(c.rx * s * Math.sin(a), c.ry * s * (1 - Math.cos(a)) * 0.98, (c.z + 0.02) * s);
+  });
+  const cap = (k: number, flip: boolean): THREE.BufferGeometry => surface(2, radial, true, flip, (i, j, out) => {
+    const c = sec[k], a = ((j + 0.5) / radial) * Math.PI * 2, q = i === 0 ? 0 : 1;
+    out.set(c.rx * s * Math.sin(a) * q, c.ry * s * (1 - Math.cos(a) * q) * 0.98, (c.z + 0.02) * s);
+  });
+  return fuseBare([side, cap(0, false), cap(sec.length - 1, true)]);
+}
+
+/** Four-sided pyramid pointing along +z and tilted down by `tilt`: the nose. */
+export function nose(r: number, len: number, tilt: number): THREE.BufferGeometry {
+  const g = new THREE.ConeGeometry(r, len, 4);
+  g.rotateY(Math.PI / 4);
+  g.rotateX(Math.PI / 2 + tilt);
+  const out = g.toNonIndexed();
+  g.dispose();
+  out.deleteAttribute('uv');
+  return out;
+}
+
+/** Small ellipsoid (ears). */
+export function blob(rx: number, ry: number, rz: number, segs = 6, rings = 5): THREE.BufferGeometry {
+  const g = new THREE.SphereGeometry(1, segs, rings);
+  g.scale(rx, ry, rz);
+  const out = g.toNonIndexed();
+  g.dispose();
+  out.deleteAttribute('uv');
+  return out;
+}
+
+/** Writes a colour per vertex from a callback (gradients, bands). */
+export function paintFn(g: THREE.BufferGeometry, fn: (x: number, y: number, z: number, out: THREE.Color) => void): THREE.BufferGeometry {
+  const pos = g.attributes.position as THREE.BufferAttribute;
+  const n = pos.count;
   const c = new Float32Array(n * 3);
-  for (let i = 0; i < n; i++) { c[i * 3] = scratchColor.r; c[i * 3 + 1] = scratchColor.g; c[i * 3 + 2] = scratchColor.b; }
+  for (let i = 0; i < n; i++) {
+    fn(pos.getX(i), pos.getY(i), pos.getZ(i), scratchColor);
+    c[i * 3] = scratchColor.r; c[i * 3 + 1] = scratchColor.g; c[i * 3 + 2] = scratchColor.b;
+  }
   g.setAttribute('color', new THREE.BufferAttribute(c, 3));
   return g;
 }
 
-/** Merges painted parts into one geometry (all inputs are non-indexed RoundedBoxGeometry, so the merge is valid). */
-function fuse(parts: THREE.BufferGeometry[]): THREE.BufferGeometry {
+/** Paints a whole part one colour. */
+export function paint(g: THREE.BufferGeometry, hex: number): THREE.BufferGeometry {
+  return paintFn(g, (_x, _y, _z, out) => out.setHex(hex));
+}
+
+/** Adds a constant single-float attribute (variant masks, colour-mode flags). */
+export function fillAttr(g: THREE.BufferGeometry, name: string, value: number): THREE.BufferGeometry {
+  const n = g.attributes.position.count;
+  const a = new Float32Array(n);
+  a.fill(value);
+  g.setAttribute(name, new THREE.BufferAttribute(a, 1));
+  return g;
+}
+
+/**
+ * Rotates everything below `pivotY` about the x axis through (0, pivotY, 0), blending in over `blend` metres so a
+ * tube bends at a joint instead of snapping. Used to pre-bend pedestrian knees and elbows in geometry.
+ */
+export function bendBelow(g: THREE.BufferGeometry, pivotY: number, angle: number, blend: number): THREE.BufferGeometry {
+  const pos = g.attributes.position as THREE.BufferAttribute;
+  const nor = g.attributes.normal as THREE.BufferAttribute;
+  for (let i = 0; i < pos.count; i++) {
+    const y = pos.getY(i);
+    if (y >= pivotY + blend) continue;
+    const t = clamp((pivotY + blend - y) / (blend * 2), 0, 1);
+    const th = angle * t, c = Math.cos(th), s = Math.sin(th);
+    const dy = y - pivotY, dz = pos.getZ(i);
+    pos.setY(i, pivotY + dy * c - dz * s);
+    pos.setZ(i, dy * s + dz * c);
+    const ny = nor.getY(i), nz = nor.getZ(i);
+    nor.setY(i, ny * c - nz * s);
+    nor.setZ(i, ny * s + nz * c);
+  }
+  return g;
+}
+
+function fuseBare(parts: THREE.BufferGeometry[]): THREE.BufferGeometry {
   const merged = mergeGeometries(parts, false);
+  if (!merged) throw new Error('character geometry merge failed (attribute mismatch)');
   for (let i = 0; i < parts.length; i++) parts[i].dispose();
   return merged;
 }
 
-/** Torso from the hip up: tapered shirt, belt and neck. Local origin sits at the hip so the lean pivots there. */
-function torsoGeometry(): THREE.BufferGeometry {
-  const B = BODY;
-  const shirt = bevel(B.shoulderW, B.torsoH, B.shoulderD, B.waistK);
-  shirt.translate(0, B.torsoH / 2, 0);
-  const belt = bevel(B.beltW, B.beltH, B.beltD);
-  belt.translate(0, B.beltH / 2 - 0.01, 0);
-  const neck = bevel(B.neckW, B.neckH + 0.03, B.neckW);
-  neck.translate(0, B.neckY - B.hipY + B.neckH / 2 - 0.03, 0);
-  return fuse([paint(shirt, SHIRT), paint(belt, BELT), paint(neck, SKIN)]);
+/** Merges finished (painted, attributed) parts into one geometry. */
+export function fuse(parts: THREE.BufferGeometry[]): THREE.BufferGeometry {
+  return fuseBare(parts);
 }
 
-/** Head: a jaw-tapered skull with a hair cap over the crown and a shorter panel down the back. */
-function headGeometry(): THREE.BufferGeometry {
-  const B = BODY;
-  const skull = bevel(B.headW, B.headH, B.headD, B.jawK);
-  const cap = bevel(B.headW * B.hairGrow, B.hairH, B.headD * B.hairGrow, 0.99);
-  cap.translate(0, B.headH / 2 - B.hairH * 0.35, 0);
-  // Hair wraps the back of the skull down to the nape; without it the head reads as a bald skin block from behind,
-  // which is the angle the third-person camera spends all its time at.
-  const back = bevel(B.headW * 0.98, B.backHairH, B.headD * 0.4);
-  back.translate(0, B.headH * 0.06, -B.headD * 0.35);
-  return fuse([paint(skull, SKIN), paint(cap, HAIR), paint(back, HAIR)]);
+/** Interpolates the ring radii of a tube at height y (for props that have to hug the torso). */
+export function ringAt(rings: Ring[], y: number, out: Ring): Ring {
+  if (y <= rings[0].y) { Object.assign(out, rings[0]); return out; }
+  for (let i = 1; i < rings.length; i++) {
+    const a = rings[i - 1], b = rings[i];
+    if (y <= b.y) {
+      const t = (y - a.y) / Math.max(1e-6, b.y - a.y);
+      out.y = y; out.rx = a.rx + (b.rx - a.rx) * t; out.rz = a.rz + (b.rz - a.rz) * t;
+      out.x = (a.x ?? 0) + ((b.x ?? 0) - (a.x ?? 0)) * t; out.z = (a.z ?? 0) + ((b.z ?? 0) - (a.z ?? 0)) * t;
+      return out;
+    }
+  }
+  Object.assign(out, rings[rings.length - 1]);
+  return out;
 }
 
-/** Arm hanging from the shoulder: sleeve, bare forearm, hand. Local origin at the shoulder joint. */
-function armGeometry(): THREE.BufferGeometry {
-  const B = BODY;
-  const sleeve = bevel(B.upperArmW, B.upperArmH, B.upperArmW, 0.9);
-  sleeve.translate(0, -B.upperArmH / 2, 0);
-  const fore = bevel(B.foreArmW, B.foreArmH, B.foreArmW, 0.92);
-  fore.translate(0, -B.upperArmH - B.foreArmH / 2 + 0.02, 0);
-  const hand = bevel(B.handW, B.handH, B.handW * 0.85);
-  hand.translate(0, -B.upperArmH - B.foreArmH - B.handH / 2 + 0.04, 0);
-  return fuse([paint(sleeve, SLEEVE), paint(fore, SKIN), paint(hand, SKIN)]);
+/**
+ * Body profiles in metres from the ground for a 1.8 m figure, scaled by `s`. The torso is a barrel (widest at the chest,
+ * narrower at waist and neck) that ends in a trapezius slope; limbs swell at the deltoid/thigh/calf and pinch at wrist
+ * and ankle. Rings closer than 5 mm double up so colour bands (belt, hem, sleeve cuff) stay crisp.
+ */
+export const PROFILE = {
+  hipY: 0.86, crotchY: 0.74, kneeY: 0.47, shoulderY: 1.40, shoulderX: 0.222, elbowY: 1.14, neckY: 1.50,
+  headCY: 1.665, headRX: 0.113, headRY: 0.135, headRZ: 0.123, jawK: 0.8, hipX: 0.11,
+  beltLo: 0.86, beltHi: 0.90, collarY: 1.464, sleeveY: 1.253,
+} as const;
+
+function scaled(rings: Ring[], s: number): Ring[] {
+  return rings.map((r) => ({ y: r.y * s, rx: r.rx * s, rz: r.rz * s, x: (r.x ?? 0) * s, z: (r.z ?? 0) * s }));
 }
 
-/** Leg hanging from the hip: thigh, calf, shoe. Local origin at the hip joint. */
-function legGeometry(): THREE.BufferGeometry {
-  const B = BODY;
-  const thigh = bevel(B.thighW, B.thighH, B.thighW * 1.12, 0.86);
-  thigh.translate(0, -B.thighH / 2, 0);
-  const shin = bevel(B.shinW, B.shinH, B.shinW * 1.1, 0.88);
-  shin.translate(0, -B.thighH - B.shinH / 2 + 0.02, 0);
-  const shoe = bevel(B.shoeW, B.shoeH, B.shoeD);
-  shoe.translate(0, -B.thighH - B.shinH - B.shoeH / 2 + 0.06, B.shoeFwd);
-  return fuse([paint(thigh, JEANS), paint(shin, JEANS), paint(shoe, SHOE)]);
+export function torsoRings(s: number): Ring[] {
+  return scaled([
+    { y: 0.74, rx: 0.165, rz: 0.115 },
+    { y: 0.80, rx: 0.18, rz: 0.125 },
+    { y: 0.858, rx: 0.19, rz: 0.13 },
+    { y: 0.862, rx: 0.198, rz: 0.138 },
+    { y: 0.90, rx: 0.198, rz: 0.138 },
+    { y: 0.904, rx: 0.188, rz: 0.128 },
+    { y: 0.98, rx: 0.185, rz: 0.125 },
+    { y: 1.08, rx: 0.195, rz: 0.132 },
+    { y: 1.20, rx: 0.215, rz: 0.142, z: 0.006 },
+    { y: 1.30, rx: 0.23, rz: 0.138 },
+    { y: 1.385, rx: 0.25, rz: 0.13, z: -0.006 },
+    { y: 1.425, rx: 0.215, rz: 0.115 },
+    { y: 1.45, rx: 0.14, rz: 0.095 },
+    { y: 1.462, rx: 0.105, rz: 0.085 },
+    { y: 1.466, rx: 0.09, rz: 0.078 },
+    { y: 1.50, rx: 0.082, rz: 0.072 },
+  ], s);
+}
+
+/** Arm hanging straight down, centred on x = 0 (translate to the shoulder); the sleeve ends just above the elbow. */
+export function armRings(s: number): Ring[] {
+  return scaled([
+    { y: 0.79, rx: 0.035, rz: 0.025 },
+    { y: 0.84, rx: 0.046, rz: 0.03 },
+    { y: 0.90, rx: 0.042, rz: 0.028 },
+    { y: 0.92, rx: 0.038, rz: 0.036 },
+    { y: 1.03, rx: 0.048, rz: 0.046 },
+    { y: 1.14, rx: 0.05, rz: 0.05 },
+    { y: 1.25, rx: 0.052, rz: 0.05 },
+    { y: 1.255, rx: 0.06, rz: 0.058 },
+    { y: 1.33, rx: 0.068, rz: 0.066 },
+    { y: 1.385, rx: 0.07, rz: 0.068 },
+    { y: 1.415, rx: 0.048, rz: 0.05 },
+  ], s);
+}
+
+/** Leg centred on x = 0 (translate to the hip): thigh, knee pinch, calf swell, ankle. */
+export function legRings(s: number): Ring[] {
+  return scaled([
+    { y: 0.07, rx: 0.048, rz: 0.054 },
+    { y: 0.14, rx: 0.052, rz: 0.058 },
+    { y: 0.28, rx: 0.068, rz: 0.076 },
+    { y: 0.40, rx: 0.076, rz: 0.086 },
+    { y: 0.47, rx: 0.074, rz: 0.08 },
+    { y: 0.54, rx: 0.08, rz: 0.088 },
+    { y: 0.66, rx: 0.092, rz: 0.102 },
+    { y: 0.78, rx: 0.1, rz: 0.112 },
+    { y: 0.87, rx: 0.098, rz: 0.108 },
+  ], s);
+}
+
+/** Neck stub from inside the skull down into the collar. */
+export function neckRings(s: number): Ring[] {
+  return scaled([{ y: 1.46, rx: 0.062, rz: 0.06 }, { y: 1.53, rx: 0.058, rz: 0.056 }, { y: 1.6, rx: 0.064, rz: 0.062 }], s);
+}
+
+export type HeadRole = 'skin' | 'hair' | 'eye' | 'brow';
+
+/** Head parts for a figure scaled by `s`: skull, ears, nose (skin); eyes; brows; hair cap. Colouring is the caller's. */
+export function headParts(s: number, segs: number, rings: number, hairRows: number, emit: (role: HeadRole, g: THREE.BufferGeometry) => void): void {
+  const P = PROFILE;
+  const cy = P.headCY * s, rx = P.headRX * s, ry = P.headRY * s, rz = P.headRZ * s, jaw = P.jawK;
+  emit('skin', skull(cy, rx, ry, rz, segs, rings, jaw));
+  // Ears.
+  for (const side of [-1, 1]) {
+    const ear = blob(rx * 0.16, ry * 0.24, rz * 0.18, segs > 10 ? 6 : 4, segs > 10 ? 5 : 3);
+    ear.translate(side * rx * 0.97, cy - ry * 0.02, -rz * 0.05);
+    emit('skin', ear);
+  }
+  // Nose: pyramid on the centre line, tip tilted down.
+  const ns = nose(rx * 0.15, rz * 0.34, 0.45);
+  const nz = faceZ(0, cy - ry * 0.06, cy, rx, ry, rz, jaw);
+  ns.translate(0, cy - ry * 0.08, nz + rz * 0.06);
+  emit('skin', ns);
+  // Eyes: dark blocks set just proud of the face so the head has an unmistakable front.
+  for (const side of [-1, 1]) {
+    const ex = side * rx * 0.38, ey = cy + ry * 0.12;
+    const eye = block(rx * 0.27, ry * 0.15, rz * 0.14);
+    eye.translate(ex, ey, faceZ(ex, ey, cy, rx, ry, rz, jaw) - rz * 0.04);
+    emit('eye', eye);
+    const by = cy + ry * 0.3, bx = side * rx * 0.4;
+    const brow = block(rx * 0.36, ry * 0.08, rz * 0.12);
+    brow.rotateZ(side * 0.18);
+    brow.translate(bx, by, faceZ(bx, by, cy, rx, ry, rz, jaw) - rz * 0.05);
+    emit('brow', brow);
+  }
+  emit('hair', hairCap(cy + ry * 0.02, rx * 1.075 + 0.003, ry * 1.09, rz * 1.075 + 0.003, segs, hairRows, 1.1, 1.7, 2.25, 0.14));
+}
+
+/** Night factor from the clock alone (the renderer has no sun vector to hand): fades in around lights-on, out at lights-off. */
+export function nightFromHour(hour: number): number {
+  const h = ((hour % 24) + 24) % 24;
+  const on = smoothstep(DAY_TUNING.lightsOnHour - 0.25, DAY_TUNING.lightsOnHour + 0.75, h);
+  const off = 1 - smoothstep(DAY_TUNING.lightsOffHour - 0.5, DAY_TUNING.lightsOffHour + 0.5, h);
+  return Math.max(on, off);
+}
+
+/** Uniforms shared by the character materials: rim strength and colour (cool by day, dimmed at night). */
+export interface RimUniforms { uRim: { value: number }; uRimColor: { value: THREE.Color } }
+
+export function makeRimUniforms(): RimUniforms {
+  return { uRim: { value: 0.35 }, uRimColor: { value: new THREE.Color(0.62, 0.76, 1.0) } };
+}
+
+/** Rim strength for a night factor: the cool sky rim only makes sense under a sky; at night it drops to a hint. */
+export function setRimNight(u: RimUniforms, night: number): void {
+  u.uRim.value = 0.35 * (1 - 0.72 * night);
+}
+
+/** Fresnel rim folded into the indirect diffuse term: lifts silhouettes off the background without a second pass. */
+export const RIM_FRAGMENT = `#include <lights_fragment_end>
+{
+  float rimK = pow( 1.0 - saturate( dot( geometryNormal, geometryViewDir ) ), 3.0 ) * uRim;
+  reflectedLight.indirectDiffuse += rimK * uRimColor * ( 0.35 + 0.65 * diffuseColor.rgb );
+}`;
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Player rig
+// ---------------------------------------------------------------------------------------------------------------------
+
+const HIPS = 0, SPINE = 1, HEAD = 2, SH_L = 3, EL_L = 4, SH_R = 5, EL_R = 6, HIP_L = 7, KNEE_L = 8, HIP_R = 9, KNEE_R = 10;
+const BONES = 11;
+const RADIAL = 12;
+
+/** Skin weights by height: full `boneA` above yA, full `boneB` below yB, blended between (smooth joints). */
+function skin(g: THREE.BufferGeometry, boneA: number, boneB: number, yA: number, yB: number): THREE.BufferGeometry {
+  const pos = g.attributes.position as THREE.BufferAttribute;
+  const n = pos.count;
+  const idx = new Uint16Array(n * 4);
+  const w = new Float32Array(n * 4);
+  for (let i = 0; i < n; i++) {
+    const y = pos.getY(i);
+    const t = boneA === boneB ? 1 : clamp((y - yB) / Math.max(1e-6, yA - yB), 0, 1);
+    idx[i * 4] = boneA; idx[i * 4 + 1] = boneB;
+    w[i * 4] = t; w[i * 4 + 1] = 1 - t;
+  }
+  g.setAttribute('skinIndex', new THREE.BufferAttribute(idx, 4));
+  g.setAttribute('skinWeight', new THREE.BufferAttribute(w, 4));
+  return g;
+}
+
+function playerGeometry(): THREE.BufferGeometry {
+  const P = PROFILE;
+  const parts: THREE.BufferGeometry[] = [];
+  // Torso: jeans below the belt, belt, shirt with a darker hem climbing to full colour at the chest, collar band.
+  const torso = paintFn(tube(torsoRings(1), RADIAL, true, true), (_x, y, _z, out) => {
+    if (y < P.beltLo) out.setHex(JEANS).multiplyScalar(0.9 + 0.1 * smoothstep(P.crotchY, P.beltLo, y));
+    else if (y < P.beltHi + 0.002) out.setHex(BELT);
+    else if (y < P.collarY) out.setHex(SHIRT).multiplyScalar(0.64 + 0.36 * smoothstep(P.beltHi, 1.24, y));
+    else out.setHex(COLLAR);
+  });
+  parts.push(skin(torso, SPINE, HIPS, 0.98, 0.84));
+  parts.push(skin(paint(tube(neckRings(1), 8, false, false), SKIN), HEAD, SPINE, 1.57, 1.47));
+  headParts(1, 14, 10, 7, (role, g) => {
+    const hex = role === 'skin' ? SKIN : role === 'eye' ? EYE : HAIR;
+    parts.push(skin(paint(g, hex), HEAD, HEAD, 0, 0));
+  });
+  for (const side of [-1, 1]) {
+    const arm = paintFn(tube(armRings(1), RADIAL, false, true), (_x, y, _z, out) => {
+      if (y >= P.sleeveY) out.setHex(SLEEVE).multiplyScalar(0.88 + 0.12 * smoothstep(P.sleeveY, 1.36, y));
+      else out.setHex(SKIN);
+    });
+    arm.translate(side * P.shoulderX, 0, 0);
+    parts.push(skin(arm, side < 0 ? SH_L : SH_R, side < 0 ? EL_L : EL_R, 1.19, 1.09));
+    const leg = paintFn(tube(legRings(1), RADIAL, false, true), (_x, y, _z, out) => {
+      out.setHex(JEANS).multiplyScalar(0.86 + 0.14 * smoothstep(0.07, 0.5, y));
+    });
+    leg.translate(side * P.hipX, 0, 0);
+    parts.push(skin(leg, side < 0 ? HIP_L : HIP_R, side < 0 ? KNEE_L : KNEE_R, 0.52, 0.42));
+    const foot = paint(shoe(1, 10), SHOE);
+    foot.translate(side * P.hipX, 0, 0);
+    parts.push(skin(foot, side < 0 ? KNEE_L : KNEE_R, side < 0 ? KNEE_L : KNEE_R, 0, 0));
+  }
+  return fuse(parts);
 }
 
 export class PlayerRenderer {
   readonly group = new THREE.Group();
-  private readonly torso: THREE.Mesh;
-  private readonly head: THREE.Mesh;
-  private readonly armL: THREE.Mesh;
-  private readonly armR: THREE.Mesh;
-  private readonly legL: THREE.Mesh;
-  private readonly legR: THREE.Mesh;
+  private readonly mesh: THREE.SkinnedMesh;
+  private readonly bones: THREE.Bone[] = [];
   private readonly shadows: ContactShadows;
-  private readonly mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.72, metalness: 0.04, envMapIntensity: 0.55 });
+  private readonly rim = makeRimUniforms();
+  // Low probe weight: the dark hair otherwise mirrors whatever neon the reflection probe caught (green at night).
+  private readonly mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.8, metalness: 0.03, envMapIntensity: 0.22 });
   private readonly interp: Transform = createTransform();
   private readonly scene: THREE.Scene;
   private swing = 0;
   private airPose = 0;
+  private time = 0;
 
   constructor(scene: THREE.Scene) {
     this.scene = scene;
-    const B = BODY;
-    const mk = (g: THREE.BufferGeometry): THREE.Mesh => {
-      const m = new THREE.Mesh(g, this.mat);
-      m.castShadow = true;
-      return m;
+    const P = PROFILE;
+    this.mat.onBeforeCompile = (shader) => {
+      shader.uniforms.uRim = this.rim.uRim;
+      shader.uniforms.uRimColor = this.rim.uRimColor;
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nuniform float uRim;\nuniform vec3 uRimColor;')
+        .replace('#include <lights_fragment_end>', RIM_FRAGMENT);
     };
-    this.torso = mk(torsoGeometry());
-    this.torso.position.y = B.hipY;
-    this.head = mk(headGeometry());
-    this.head.position.y = B.headY - B.hipY + B.headH / 2;
-    this.armL = mk(armGeometry());
-    this.armL.position.set(-B.shoulderX, B.shoulderY - B.hipY, 0);
-    this.armR = mk(armGeometry());
-    this.armR.position.set(B.shoulderX, B.shoulderY - B.hipY, 0);
-    // Head and arms ride the torso, so a lean carries the whole upper body.
-    this.torso.add(this.head, this.armL, this.armR);
-    this.legL = mk(legGeometry());
-    this.legL.position.set(-B.hipX, B.hipY, 0);
-    this.legR = mk(legGeometry());
-    this.legR.position.set(B.hipX, B.hipY, 0);
-    this.group.add(this.torso, this.legL, this.legR);
+    this.mat.customProgramCacheKey = () => 'characterRim';
+
+    const bone = (parent: THREE.Bone | null, x: number, y: number, z: number): THREE.Bone => {
+      const b = new THREE.Bone();
+      b.position.set(x, y, z);
+      if (parent) parent.add(b);
+      this.bones.push(b);
+      return b;
+    };
+    const hips = bone(null, 0, P.hipY, 0);
+    const spine = bone(hips, 0, 0, 0);
+    bone(spine, 0, P.neckY - P.hipY, 0);
+    const shL = bone(spine, -P.shoulderX, P.shoulderY - P.hipY, 0);
+    bone(shL, 0, P.elbowY - P.shoulderY, 0);
+    const shR = bone(spine, P.shoulderX, P.shoulderY - P.hipY, 0);
+    bone(shR, 0, P.elbowY - P.shoulderY, 0);
+    const hipL = bone(hips, -P.hipX, 0, 0);
+    bone(hipL, 0, P.kneeY - P.hipY, 0);
+    const hipR = bone(hips, P.hipX, 0, 0);
+    bone(hipR, 0, P.kneeY - P.hipY, 0);
+    if (this.bones.length !== BONES) throw new Error('player rig bone count');
+
+    this.mesh = new THREE.SkinnedMesh(playerGeometry(), this.mat);
+    this.mesh.castShadow = true;
+    this.mesh.frustumCulled = false;
+    this.mesh.add(hips);
+    this.mesh.updateMatrixWorld(true);
+    this.mesh.bind(new THREE.Skeleton(this.bones));
+    this.group.add(this.mesh);
     this.group.rotation.order = 'YXZ';
     scene.add(this.group);
     this.shadows = new ContactShadows(scene, 1);
@@ -172,10 +520,12 @@ export class PlayerRenderer {
     if (!g.visible) { this.shadows.end(); return; }
     lerpTransform(this.interp, p.prev, p.curr, alpha);
     const dt = Math.min(frameDt, 0.1);
+    this.time += dt;
     const sc = Math.max(0.01, p.spawnFade);
     g.position.set(this.interp.x, this.interp.y, this.interp.z);
     g.rotation.y = this.interp.yaw;
     g.scale.set(sc, sc, sc);
+    setRimNight(this.rim, nightFromHour(world.time.hour));
 
     this.shadows.add(this.interp.x, groundYAt(this.interp.x, this.interp.z) + SHADOW_LIFT, this.interp.z,
       SHADOW_R, p.alive ? SHADOW_R : SHADOW_R * 1.8, this.interp.yaw, sc);
@@ -184,34 +534,56 @@ export class PlayerRenderer {
     if (!p.alive) {
       g.rotation.x = -Math.PI / 2;
       g.position.y += 0.25;
-      this.setSwing(0, 0);
+      this.setPose(0, 0, 0);
       return;
     }
     g.rotation.x = 0;
     const targetAmp = p.moving ? (p.sprinting ? 0.95 : 0.6) : 0;
     this.swing = damp(this.swing, targetAmp, 10, dt);
     this.airPose = damp(this.airPose, p.grounded ? 0 : 1, 12, dt);
-    this.setSwing(Math.sin(p.animPhase) * this.swing, this.airPose);
+    this.setPose(p.animPhase, this.swing, this.airPose);
   }
 
-  private setSwing(s: number, air: number): void {
-    const lean = air;
-    this.legL.rotation.x = s * (1 - air) + 0.55 * air;
-    this.legR.rotation.x = -s * (1 - air) - 0.15 * air;
+  /**
+   * Walk cycle. Hips swing the legs (sin), the knee folds while the leg swings forward (foot off the ground) and is
+   * straight through the stance; arms counter-swing with a permanent elbow bend that deepens on the forward reach.
+   */
+  private setPose(phase: number, amp: number, air: number): void {
+    const B = this.bones;
+    const P = PROFILE;
+    const sn = Math.sin(phase), cs = Math.cos(phase);
+    const s = sn * amp;
+    const ground = 1 - air;
+    B[HIP_L].rotation.x = s * ground + 0.55 * air;
+    B[HIP_R].rotation.x = -s * ground - 0.15 * air;
+    B[KNEE_L].rotation.x = (0.08 + 1.05 * Math.max(0, -cs)) * amp * ground + 0.9 * air;
+    B[KNEE_R].rotation.x = (0.08 + 1.05 * Math.max(0, cs)) * amp * ground + 0.4 * air;
     // Arms rest slightly away from the body when still, swing opposite the legs when moving, reach up in the air.
-    const idle = 0.12 * (1 - Math.min(1, Math.abs(s) * 4));
-    this.armL.rotation.x = -s * 0.8 * (1 - air) - 2.4 * air;
-    this.armR.rotation.x = s * 0.8 * (1 - air) - 2.4 * air;
-    this.armL.rotation.z = idle;
-    this.armR.rotation.z = -idle;
-    this.torso.rotation.x = 0.08 * Math.abs(s) + 0.12 * lean;
-    this.head.rotation.x = -0.05 * Math.abs(s);
+    const spread = 0.1 + 0.05 * (1 - Math.min(1, Math.abs(s) * 4));
+    B[SH_L].rotation.x = -s * 0.8 * ground - 2.4 * air;
+    B[SH_R].rotation.x = s * 0.8 * ground - 2.4 * air;
+    B[SH_L].rotation.z = -spread;
+    B[SH_R].rotation.z = spread;
+    B[EL_L].rotation.x = -(0.35 + 0.4 * Math.max(0, s)) * ground - 1.1 * air;
+    B[EL_R].rotation.x = -(0.35 + 0.4 * Math.max(0, -s)) * ground - 1.1 * air;
+    // Hips tilt and twist with the stride, shoulders counter-twist; a bounce at twice the stride frequency.
+    const hips = B[HIPS], spine = B[SPINE];
+    hips.rotation.z = 0.05 * s;
+    hips.rotation.y = -0.07 * s;
+    hips.position.y = P.hipY + 0.025 * amp * (0.5 - 0.5 * Math.cos(phase * 2));
+    spine.rotation.y = 0.14 * s;
+    spine.rotation.z = -0.04 * s;
+    spine.rotation.x = 0.08 * Math.abs(s) + 0.12 * air;
+    // Idle breathing: the chest swells a touch and the head lifts with it.
+    const breath = (0.5 + 0.5 * Math.sin(this.time * 1.8)) * (1 - Math.min(1, amp * 2));
+    spine.scale.set(1 + 0.012 * breath, 1 + 0.005 * breath, 1 + 0.022 * breath);
+    B[HEAD].rotation.x = -0.05 * Math.abs(s) - 0.02 * breath;
   }
 
   dispose(): void {
     this.scene.remove(this.group);
-    const parts = [this.torso, this.head, this.armL, this.armR, this.legL, this.legR];
-    for (let i = 0; i < parts.length; i++) parts[i].geometry.dispose();
+    this.mesh.geometry.dispose();
+    this.mesh.skeleton.dispose();
     this.shadows.dispose();
     this.mat.dispose();
   }

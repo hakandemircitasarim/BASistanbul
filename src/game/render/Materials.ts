@@ -26,6 +26,9 @@ const HDR_BOOST = 2;
 /**
  * Roughness / metalness / sky-probe strength per surface family. Everything lit is MeshStandardMaterial so the PMREM
  * sky probe actually shows up: without a specular term the whole city answers light identically and reads flat.
+ * Rule of thumb: bare metal is the only family with metalness above 0.1 - painted steel is paint, glass is glass -
+ * and the families are spread across the roughness range (glass 0.1, metal 0.35, paint 0.5, asphalt 0.85 with its
+ * lane paint at 0.55 via the map, stone and concrete 0.85-0.95, canvas 0.9) so light behaves differently on each.
  */
 const SURF = {
   building: { roughness: 1, metalness: 0.04, env: 0.75 },
@@ -33,10 +36,11 @@ const SURF = {
   road: { roughnessDay: 0.85, roughnessNight: 0.6, metalness: 0.03, env: 0.45 },
   ground: { roughness: 0.94, metalness: 0, env: 0.35 },
   sand: { roughness: 0.97, metalness: 0, env: 0.25 },
-  metal: { roughness: 0.42, metalness: 0.8, env: 1.0 },
-  paint: { roughness: 0.55, metalness: 0.25, env: 0.8 },
+  metal: { roughness: 0.35, metalness: 0.8, env: 1.0 },
+  paint: { roughness: 0.5, metalness: 0.08, env: 0.8 },
   wood: { roughness: 0.78, metalness: 0, env: 0.4 },
   foliage: { roughness: 0.8, metalness: 0, env: 0.35 },
+  canvas: { roughness: 0.9, metalness: 0, env: 0.3 },
 } as const;
 
 export class Materials {
@@ -50,6 +54,8 @@ export class Materials {
   readonly shopfront: THREE.MeshStandardMaterial;
   /** Ground-floor stone plinth band (downtown): pilasters + recessed lobby glazing. */
   readonly plinth: THREE.MeshStandardMaterial;
+  /** Striped canvas for shop awnings (vertex colour sets the hue, u runs along the stripes' width, v up the drop). */
+  readonly awning: THREE.MeshStandardMaterial;
   readonly road: THREE.MeshStandardMaterial;
   readonly crosswalk: THREE.MeshStandardMaterial;
   /** Painted lane arrows / stop bars laid on the asphalt (alpha-tested decals). */
@@ -108,22 +114,26 @@ export class Materials {
       normalMap: pl.normal, normalScale: new THREE.Vector2(0.9, 0.9), roughnessMap: pl.rough,
       roughness: SURF.building.roughness, metalness: SURF.building.metalness, envMapIntensity: SURF.building.env,
     });
+    this.awning = new THREE.MeshStandardMaterial({ map: tex.awningTex(), vertexColors: true, side: THREE.DoubleSide, roughness: SURF.canvas.roughness, metalness: SURF.canvas.metalness, envMapIntensity: SURF.canvas.env });
+    // The 1024 px ground tiles carry aggregate, cracks and joints; the relief is derived from them at full res (so a
+    // 3 px joint still reads as a groove) and the roughness is painted while drawing (paint and iron smoother than
+    // stone), at half res. Normal strengths are tuned so joints catch a 15:00 sun without the aggregate sparkling.
     const roadMap = tex.road();
     this.road = new THREE.MeshStandardMaterial({
       map: roadMap, roughnessMap: tex.roadRough(), roughness: SURF.road.roughnessDay,
-      normalMap: tex.groundNormal('road', 2.0), normalScale: new THREE.Vector2(0.35, 0.35),
+      normalMap: tex.groundNormal('road', 3.0), normalScale: new THREE.Vector2(0.45, 0.45),
       metalness: SURF.road.metalness, envMapIntensity: SURF.road.env,
     });
-    this.crosswalk = new THREE.MeshStandardMaterial({ map: tex.crosswalk(), roughness: 0.8, metalness: SURF.road.metalness, envMapIntensity: SURF.road.env });
-    this.roadMark = new THREE.MeshStandardMaterial({ roughness: 0.6, metalness: 0.05, envMapIntensity: SURF.road.env, map: tex.roadMarks(), transparent: true, alphaTest: 0.35, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -6 });
+    this.crosswalk = new THREE.MeshStandardMaterial({ map: tex.crosswalk(), roughness: 0.85, metalness: SURF.road.metalness, envMapIntensity: SURF.road.env });
+    this.roadMark = new THREE.MeshStandardMaterial({ roughness: 0.55, metalness: 0.05, envMapIntensity: SURF.road.env, map: tex.roadMarks(), transparent: true, alphaTest: 0.35, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -6 });
     // Ground families get relief + roughness maps so slab joints and the kerb chamfer catch low sun instead of
     // reading as a flat print. Values are deliberately grouped: dark warm asphalt, mid warm pavement, light facades.
-    const walkN = tex.groundNormal('sidewalk', 2.5), walkR = tex.groundRough('sidewalk', 0.8, 1);
-    this.sidewalk = new THREE.MeshStandardMaterial({ map: tex.sidewalk(), color: 0xaea89c, normalMap: walkN, normalScale: new THREE.Vector2(0.5, 0.5), roughnessMap: walkR, roughness: SURF.ground.roughness, metalness: SURF.ground.metalness, envMapIntensity: SURF.ground.env });
+    const walkN = tex.groundNormal('sidewalk', 3.6), walkR = tex.groundRough('sidewalk', 0.8, 1);
+    this.sidewalk = new THREE.MeshStandardMaterial({ map: tex.sidewalk(), color: 0xaea89c, normalMap: walkN, normalScale: new THREE.Vector2(0.6, 0.6), roughnessMap: walkR, roughness: SURF.ground.roughness, metalness: SURF.ground.metalness, envMapIntensity: SURF.ground.env });
     this.sand = new THREE.MeshStandardMaterial({ map: tex.sand(), roughness: SURF.sand.roughness, metalness: 0, envMapIntensity: SURF.sand.env });
     this.grass = new THREE.MeshStandardMaterial({ map: tex.grass(), roughness: SURF.ground.roughness, metalness: 0, envMapIntensity: SURF.ground.env });
     this.plaza = new THREE.MeshStandardMaterial({ map: tex.plaza(), normalMap: tex.groundNormal('plaza', 2.5), normalScale: new THREE.Vector2(0.5, 0.5), roughnessMap: tex.groundRough('plaza', 0.75, 0.98), roughness: 0.86, metalness: 0.05, envMapIntensity: SURF.ground.env });
-    this.pavement = new THREE.MeshStandardMaterial({ map: tex.sidewalk(), normalMap: walkN, normalScale: new THREE.Vector2(0.5, 0.5), roughnessMap: walkR, color: 0xa39c90, roughness: SURF.ground.roughness, metalness: 0.05, envMapIntensity: SURF.ground.env });
+    this.pavement = new THREE.MeshStandardMaterial({ map: tex.sidewalk(), normalMap: walkN, normalScale: new THREE.Vector2(0.6, 0.6), roughnessMap: walkR, color: 0xa39c90, roughness: SURF.ground.roughness, metalness: 0.05, envMapIntensity: SURF.ground.env });
     this.dirt = new THREE.MeshStandardMaterial({ color: 0x5a4e3c, roughness: SURF.ground.roughness, metalness: 0, envMapIntensity: SURF.ground.env });
     const wt = tex.water();
     this.water = new THREE.MeshPhongMaterial({ map: wt, normalMap: tex.waterNormal(), color: 0x9fd8ff, specular: 0xffffff, shininess: 80, transparent: true, opacity: 0.92 });
@@ -137,8 +147,9 @@ export class Materials {
     this.palmTrunk = new THREE.MeshStandardMaterial({ map: bark, color: 0xc9a878, roughness: 0.9, metalness: 0, envMapIntensity: SURF.foliage.env });
     // Front side only: the frond geometry carries its own back faces, whose normals still point at the sky. With
     // DoubleSide three flips the normal on back faces, so at midday every frond seen from below turned black.
-    // Vertex colours tint the dead skirt fronds brown; live fronds carry white.
-    this.palmFrond = new THREE.MeshStandardMaterial({ map: tex.palmFrond(), alphaTest: 0.34, side: THREE.FrontSide, color: 0xb8c8a0, vertexColors: true, roughness: 0.65, metalness: 0, envMapIntensity: SURF.foliage.env });
+    // Vertex colours tint the dead skirt fronds brown and the underside copies darker; live fronds carry white.
+    // A whisper of leaf-coloured emissive stands in for translucency, so a frond against the sky is not a cut-out.
+    this.palmFrond = new THREE.MeshStandardMaterial({ map: tex.palmFrond(), alphaTest: 0.34, side: THREE.FrontSide, color: 0xb8c8a0, vertexColors: true, emissive: 0xb8c8a0, emissiveIntensity: 0.06, roughness: 0.65, metalness: 0, envMapIntensity: SURF.foliage.env });
     // Alpha-to-coverage lets the MSAA resolve feather the leaf edges instead of the hard alpha-test stair-step.
     this.palmFrond.alphaToCoverage = true;
     this.lampPole = new THREE.MeshStandardMaterial({ color: 0x3a3d44, roughness: SURF.metal.roughness, metalness: SURF.metal.metalness, envMapIntensity: SURF.metal.env });
@@ -185,7 +196,7 @@ export class Materials {
   get nightFactor(): number { return this._night; }
 
   glass(): THREE.MeshStandardMaterial {
-    if (!this.glassMat) this.glassMat = new THREE.MeshStandardMaterial({ color: 0x14202e, metalness: 0.95, roughness: 0.08, envMapIntensity: 1.4, transparent: true, opacity: 0.86 });
+    if (!this.glassMat) this.glassMat = new THREE.MeshStandardMaterial({ color: 0x14202e, metalness: 0, roughness: 0.08, envMapIntensity: 1.6, transparent: true, opacity: 0.86 });
     return this.glassMat;
   }
 
@@ -266,7 +277,7 @@ export class Materials {
 
   dispose(): void {
     for (let i = 0; i < STYLES.length; i++) this.building[STYLES[i]].dispose();
-    this.plain.dispose(); this.glow.dispose(); this.shopfront.dispose(); this.plinth.dispose();
+    this.plain.dispose(); this.glow.dispose(); this.shopfront.dispose(); this.plinth.dispose(); this.awning.dispose();
     this.road.dispose(); this.crosswalk.dispose(); this.roadMark.dispose(); this.sidewalk.dispose(); this.sand.dispose();
     this.grass.dispose(); this.plaza.dispose(); this.pavement.dispose(); this.dirt.dispose(); this.water.dispose(); this.foam.dispose();
     this.furniture.dispose(); this.palmTrunk.dispose(); this.palmFrond.dispose(); this.lampPole.dispose(); this.bench.dispose(); this.hydrant.dispose();
