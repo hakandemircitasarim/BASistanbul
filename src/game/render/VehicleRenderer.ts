@@ -1,9 +1,12 @@
 // Instanced vehicle rendering: per-spec merged low-poly bodies (paint + fixed-colour glass/chrome/lamps), rims,
 // light quads, contact shadows, player headlight spotlights. Track C.
 //
-// Every body is merged ONCE at construction from tapered prisms ("slabs"): each prism carries a base vertex colour and a
-// `paintMix` weight, and the patched Physical shader blends the per-instance paint only into the parts with paintMix > 0.
-// That keeps glass dark blue and bumpers grey on a bright yellow taxi while still costing one draw call per spec.
+// Every body is merged ONCE at construction: one smooth lofted shell (a side silhouette and a plan curve sampled at
+// ~14 stations x 18 ring points, with duplicated rings for the belt and drip-rail creases) whose glass, lamps and
+// valances are coloured regions of the same surface, plus a few small parts (pillars, mirrors, handles, grille, plate,
+// arches). Every vertex carries a base colour and a `paintMix` weight, and the patched Physical shader blends the
+// per-instance paint only where paintMix > 0, so glass stays dark and lamps stay red on a bright yellow taxi while the
+// whole spec still costs one draw call.
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
@@ -16,6 +19,8 @@ import type { Transform } from '../core/Types';
 import { createTransform, lerpTransform } from '../core/Transform';
 import { clamp } from '../core/math';
 import { ContactShadows, groundYAt } from './ContactShadows';
+import { surface, tube } from './PlayerRenderer';
+import type { Ring } from './PlayerRenderer';
 
 export const VEHICLE_RENDER = {
   cullDist: 260, clearance: 0.30, wheelRadius: 0.33, wheelWidth: 0.24, lightsPerVehicle: 6, wheelsPerVehicle: 4,
@@ -40,8 +45,10 @@ const GLASS_DEEP = 0x10161f;
 const CHROME = 0x9aa2ac;
 const DARK = 0x33373d;
 const BLACK = 0x1b1d20;
-const LAMP = 0xe6e8dc;
-const TAIL = 0x9c2119;
+const LAMP = 0x97a5b0;
+const LAMP_LENS = 0xeef3f2;
+const TAIL = 0x8c1a12;
+const TAIL_LENS = 0xe0503c;
 const POLICE_BLUE = 0x1638b4;
 const SIGN = 0xf6edd2;
 
@@ -51,19 +58,14 @@ interface PrismDef {
   bz0: number; bz1: number; bw0: number; bw1: number; by0: number; by1?: number;
   /** top face, same layout. */
   tz0: number; tz1: number; tw0: number; tw1: number; ty0: number; ty1?: number;
-  /** centre offset on x (mirrored pairs push ±); `txc` lets the top face lean (raked pillars, shut lines on a tapered flank). */
+  /** centre offset on x (mirrored pairs push ±); `txc` lets the top face lean (raked pillars, strips on a leaning flank). */
   xc?: number; txc?: number;
   col: number;
   /** 0 = authored colour, 1 = fully tinted by the vehicle paint. */
   paint?: number;
   /** Corner radius in unit-cube space (default PRISM_BEVEL); >= PRISM_BEVEL_SOFT gets the finer 2-segment bevel. */
   bevel?: number;
-  /** Longitudinal crown: the top face lifts by this much along the centre line, so a roof gets a crease that splits the light. */
-  crown?: number;
-  /**
-   * Plan-view rounding of the front / back end: the half-width shrinks by this fraction across the bevel ring at that end
-   * (only the ring vertices move, so the flank stays flat and the last ~15 % of the panel curves inward like a real nose).
-   */
+  /** Plan-view rounding of the front / back end (only the bevel-ring vertices move). */
   noseTaper?: number;
   tailTaper?: number;
   /** Force a plain 12-triangle box (hidden or edge-on panels where a bevel would never be seen). */
@@ -72,15 +74,19 @@ interface PrismDef {
 
 const authorColor = new THREE.Color();
 
-/** Bevel on every body panel: sharp cube corners are what read as "boxy"; a small radius catches the light instead. */
+/** Bevel on the few remaining small parts (mirrors, spoiler): a sharp cube corner is what reads as "boxy". */
 const PRISM_BEVEL = 0.085;
 const PRISM_SEGMENTS = 1;
-/** Hull / cabin / roof use a wider, smoother bevel: that soft nose-and-shoulder profile is the modern low-poly signature. */
 const PRISM_BEVEL_SOFT = 0.16;
 const PRISM_SEGMENTS_SOFT = 2;
 
 /** Panels smaller than this stay plain boxes: a bevel would be invisible and 9x the triangles. */
 const PRISM_BEVEL_MIN_SIZE = 0.55;
+
+/** The body material has no maps: dropping uv lets sculpted sheets (no uv) and stock geometries merge into one buffer. */
+function stripUv(g: THREE.BufferGeometry): void {
+  if (g.attributes.uv) g.deleteAttribute('uv');
+}
 
 function prism(p: PrismDef): THREE.BufferGeometry {
   const by1p = p.by1 ?? p.by0;
@@ -103,7 +109,6 @@ function prism(p: PrismDef): THREE.BufferGeometry {
   const txc = p.txc ?? xc;
   const by1 = p.by1 ?? p.by0;
   const ty1 = p.ty1 ?? p.ty0;
-  const crown = p.crown ?? 0;
   const noseTaper = big ? (p.noseTaper ?? 0) : 0;
   const tailTaper = big ? (p.tailTaper ?? 0) : 0;
   const ringZ = 0.5 - bevel;
@@ -119,18 +124,19 @@ function prism(p: PrismDef): THREE.BufferGeometry {
     if (noseTaper > 0 && pz > ringZ) { const e = Math.min(1, (pz - ringZ) / bevel); hw *= 1 - noseTaper * e * e; }
     else if (tailTaper > 0 && pz < -ringZ) { const e = Math.min(1, (-pz - ringZ) / bevel); hw *= 1 - tailTaper * e * e; }
     const z = (p.bz0 * (1 - w) + p.bz1 * w) * (1 - v) + (p.tz0 * (1 - w) + p.tz1 * w) * v;
-    const y = (p.by0 * (1 - w) + by1 * w) * (1 - v) + (p.ty0 * (1 - w) + ty1 * w) * v + crown * (1 - Math.abs(u)) * v;
+    const y = (p.by0 * (1 - w) + by1 * w) * (1 - v) + (p.ty0 * (1 - w) + ty1 * w) * v;
     pos.setXYZ(i, xc * (1 - v) + txc * v + u * hw, y, z);
     colors[i * 3] = authorColor.r; colors[i * 3 + 1] = authorColor.g; colors[i * 3 + 2] = authorColor.b;
     paints[i] = paint;
   }
   g.setAttribute('color', new THREE.BufferAttribute(colors, 3));
   g.setAttribute('paintMix', new THREE.BufferAttribute(paints, 1));
+  stripUv(g);
   g.computeVertexNormals();
   return g;
 }
 
-/** Gives a stock three geometry the vehicle attributes (colour + paintMix) and makes it mergeable with the prisms. */
+/** Gives a stock three geometry the vehicle attributes (colour + paintMix) and makes it mergeable with the shell. */
 function decorate(src: THREE.BufferGeometry, hex: number, paint: number): THREE.BufferGeometry {
   const g = src.index ? src.toNonIndexed() : src;
   if (g !== src) src.dispose();
@@ -144,6 +150,7 @@ function decorate(src: THREE.BufferGeometry, hex: number, paint: number): THREE.
   }
   g.setAttribute('color', new THREE.BufferAttribute(colors, 3));
   g.setAttribute('paintMix', new THREE.BufferAttribute(paints, 1));
+  stripUv(g);
   return g;
 }
 
@@ -169,7 +176,7 @@ function pillar(out: PrismDef[], bz: number, bx: number, y0: number, tz: number,
   });
 }
 
-/** Thin black panel-gap line on a tapered flank: follows the hull's lean from floor half-width `bx` to belt half-width `tx`. */
+/** Thin black panel-gap line on a leaning flank: follows the shell from half-width `bx` at y0 to `tx` at y1. */
 function shutLine(out: PrismDef[], z: number, bx: number, y0: number, tx: number, y1: number): void {
   pair(out, {
     bz0: z - 0.008, bz1: z + 0.008, bw0: 0.012, bw1: 0.012, by0: y0, tz0: z - 0.008, tz1: z + 0.008, tw0: 0.012, tw1: 0.012, ty0: y1,
@@ -177,67 +184,23 @@ function shutLine(out: PrismDef[], z: number, bx: number, y0: number, tx: number
   });
 }
 
-/** Tail-lamp cluster: a rear face block plus a wrap-around lens on the flank, so the lamp reads from three-quarter views. */
-function tailCluster(out: PrismDef[], hl: number, xc: number, hw: number, y0: number, y1: number, flankX: number): void {
-  pair(out, { ...block(-hl - 0.07, -hl + 0.05, hw, y0, y1, TAIL, 0, xc) });
-  pair(out, { ...block(-hl - 0.02, -hl + 0.22, 0.016, y0 + 0.01, y1 - 0.01, TAIL, 0, flankX) });
-}
-
 /** Rear plate recess and a chrome exhaust stub under the bumper. */
-function rearDetails(out: PrismDef[], hl: number, c: number, plateY: number, exhaustX: number): void {
-  out.push(block(-hl - 0.10, -hl + 0.02, 0.19, plateY, plateY + 0.11, SIGN, 0));
-  out.push(block(-hl - 0.12, -hl + 0.10, 0.028, c - 0.02, c + 0.04, CHROME, 0, exhaustX));
+function rearDetails(out: PrismDef[], zFace: number, c: number, plateY: number, exhaustX: number): void {
+  out.push({ ...block(zFace - 0.012, zFace + 0.06, 0.19, plateY, plateY + 0.11, SIGN, 0), plain: true });
+  out.push({ ...block(zFace - 0.05, zFace + 0.16, 0.028, c - 0.02, c + 0.04, CHROME, 0, exhaustX), plain: true });
 }
 
 /**
- * Outer half-width of a prism's flank at world height `y` and depth `z`, including its plan taper: trims (lamp wraps,
- * liveries, handles) are fitted against this so they hug a leaning, rounded flank instead of floating beside it.
+ * A flank-hugging strip (mirrored): its outer face sits `proud` metres off the shell at all four corners, so it follows
+ * the shell's lean, its front/back taper and the plan rounding at the ends. `depth` = how far it reaches into the body.
  */
-function hullHalfWidth(p: PrismDef, y: number, z: number): number {
-  const v = clamp((y - p.by0) / Math.max(0.01, p.ty0 - p.by0), 0, 1);
-  const bz0 = p.bz0 * (1 - v) + p.tz0 * v, bz1 = p.bz1 * (1 - v) + p.tz1 * v;
-  const w = clamp((z - bz0) / Math.max(0.01, bz1 - bz0), 0, 1);
-  let hw = (p.bw0 * (1 - w) + p.bw1 * w) * (1 - v) + (p.tw0 * (1 - w) + p.tw1 * w) * v;
-  const bevel = p.bevel ?? PRISM_BEVEL;
-  const ringZ = 0.5 - bevel;
-  const pz = w - 0.5;
-  if (p.noseTaper && pz > ringZ) { const e = Math.min(1, (pz - ringZ) / bevel); hw *= 1 - p.noseTaper * e * e; }
-  else if (p.tailTaper && pz < -ringZ) { const e = Math.min(1, (-pz - ringZ) / bevel); hw *= 1 - p.tailTaper * e * e; }
-  return hw + (p.xc ?? 0) * (1 - v) + (p.txc ?? p.xc ?? 0) * v;
-}
-
-/**
- * A flank-hugging strip (mirrored): its outer face sits `proud` metres off the hull at all four corners, so it follows
- * the hull's lean, its front/back taper and the plan rounding at the ends. `depth` = how far it reaches into the body.
- */
-function flankStrip(out: PrismDef[], hull: PrismDef, z0: number, z1: number, y0: number, y1: number, proud: number, depth: number, col: number, paint: number): void {
-  const xb0 = hullHalfWidth(hull, y0, z0) + proud, xb1 = hullHalfWidth(hull, y0, z1) + proud;
-  const xt0 = hullHalfWidth(hull, y1, z0) + proud, xt1 = hullHalfWidth(hull, y1, z1) + proud;
+function flankStrip(out: PrismDef[], width: (y: number, z: number) => number, z0: number, z1: number, y0: number, y1: number, proud: number, depth: number, col: number, paint: number): void {
+  const xb0 = width(y0, z0) + proud, xb1 = width(y0, z1) + proud;
+  const xt0 = width(y1, z0) + proud, xt1 = width(y1, z1) + proud;
   const xc = Math.min(xb0, xb1) - depth, txc = Math.min(xt0, xt1) - depth;
   pair(out, {
     bz0: z0, bz1: z1, bw0: xb0 - xc, bw1: xb1 - xc, by0: y0, tz0: z0, tz1: z1, tw0: xt0 - txc, tw1: xt1 - txc, ty0: y1,
     xc, txc, col, paint, plain: true,
-  });
-}
-
-/**
- * Bumper with a darker lower valance: the upper shell is body-coloured-grey plastic that wraps the corners (plan taper),
- * the strip under it is near-black so the car sits on a shadow line instead of ending in a flat slab. `dir` = +1 nose.
- */
-function bumper(out: PrismDef[], hl: number, dir: number, hw: number, y0: number, y1: number, depth: number, wIn: number, wOut: number): void {
-  // The shell reaches 0.42 m back into the hull so its wide bevel (radius ~0.37 m across, ~0.11 m deep) rounds the plan
-  // corners on the same scale as the hull's own nose taper; only the last `depth` metres stand proud of the body.
-  const zi = dir * (hl - 0.42), zo = dir * (hl + depth);
-  const z0 = Math.min(zi, zo), z1 = Math.max(zi, zo);
-  const w0 = dir > 0 ? wIn : wOut, w1 = dir > 0 ? wOut : wIn;
-  out.push({
-    bz0: z0, bz1: z1, bw0: w0, bw1: w1, by0: y0 + 0.06, tz0: z0, tz1: z1, tw0: w0 * 0.985, tw1: w1 * 0.985, ty0: y1,
-    col: DARK, paint: 0, bevel: 0.26,
-  });
-  const vz0 = dir > 0 ? hl - 0.02 : -hl - depth + 0.025, vz1 = dir > 0 ? hl + depth - 0.025 : -hl + 0.02;
-  out.push({
-    bz0: vz0, bz1: vz1, bw0: w0 * 0.93, bw1: w1 * 0.93, by0: y0 - 0.02, tz0: vz0, tz1: vz1, tw0: w0 * 0.93, tw1: w1 * 0.93, ty0: y0 + 0.07,
-    col: BLACK, paint: 0, plain: true,
   });
 }
 
@@ -258,17 +221,187 @@ function mirror(out: PrismDef[], z0: number, z1: number, xGlass: number, y: numb
   pair(out, { ...block(z0 - 0.008, z0 + 0.004, w * 0.8, y + 0.015, y + h - 0.015, GLASS_DEEP, 0, cx) });
 }
 
-/** Wheel centre x = half width - half tyre width + this: the tyre face ends 6 cm inside the spec width (track ~0.93 of it). */
-const WHEEL_INSET = -0.06;
+/** Wheel centre x = half width - half tyre width + this: the tyre face ends 1 cm inside the spec width, flush with the arch lip. */
+const WHEEL_INSET = -0.01;
+/** Shell plan widths are authored against hw * PLAN: the doors stay 5 % inside the arch lips, so the arches read as flares. */
+const PLAN = 0.947;
 const PILLAR_W = 0.09;
 const PILLAR_PROUD = 0.012;
 
+// ---------------------------------------------------------------------------------------------- lofted shell
+
+/** Authored colour + paint weight of one band of shell cells. */
+interface Tone { col: number; paint: number }
+const T = {
+  paint: { col: PAINT, paint: 1 }, dark: { col: PAINT_DARK, paint: 1 }, shade: { col: PAINT_SHADE, paint: 1 },
+  glass: { col: GLASS, paint: 0.15 }, black: { col: BLACK, paint: 0 }, grey: { col: DARK, paint: 0 },
+  tail: { col: TAIL, paint: 0 }, tailLens: { col: TAIL_LENS, paint: 0 }, lamp: { col: LAMP, paint: 0 }, lampLens: { col: LAMP_LENS, paint: 0 },
+} as const satisfies Record<string, Tone>;
+
+/**
+ * Tones of the five cell bands of the shell segment that starts at a station and runs to the next one: `sill` (underside
+ * and rocker), `low` (sill to lower flank), `flank` (lower flank to belt: doors, lamps), `side` (belt to roof edge: glass
+ * or pillars) and `top` (roof edge to centre line: bonnet, screens, roof, boot). `lens` recolours the flank-band vertices
+ * on one end station so a lamp cluster gets a lighter inner lens.
+ */
+interface SegTone { sill: Tone; low: Tone; flank: Tone; side: Tone; top: Tone; lens?: { at: 0 | 1; tone: Tone } }
+const BODY: SegTone = { sill: T.paint, low: T.paint, flank: T.paint, side: T.paint, top: T.paint };
+
+/**
+ * One cross-section of the shell at depth z. The 18-point ring runs bottom centre -> sill -> lower flank -> belt (twice,
+ * for the crease) -> tumblehome mid -> roof edge (twice, drip rail crease) -> top centre and back down the other side.
+ * End faces reuse the neighbouring ring scaled about (0, shrinkY) by `shrink` (0 collapses it to the centre point).
+ */
+interface Station {
+  z: number;
+  yFloor: number; wFloor: number;
+  yLow: number; wLow: number;
+  yBelt: number; wBelt: number;
+  yTop: number; wTop: number;
+  /** The roof edge sits `edge` below yTop; the centre line is lifted by `crown`; `bulge` pushes the tumblehome mid outward. */
+  edge: number; crown: number; bulge: number;
+  shrink?: number; shrinkY?: number;
+  seg: SegTone;
+}
+const RING = 18;
+
+interface StationOpts {
+  yFloor?: number; wFloor?: number; yLow?: number; wLow?: number; edge?: number; crown?: number; bulge?: number; seg?: SegTone;
+}
+
+/** A full ring; defaults: floor at `c`, floor 5 cm narrower than the belt, lower-flank point 42 % of the way up. */
+function station(z: number, c: number, yTop: number, wTop: number, yBelt: number, wBelt: number, o: StationOpts = {}): Station {
+  const yFloor = o.yFloor ?? c;
+  return {
+    z, yFloor, wFloor: o.wFloor ?? wBelt - 0.05, yLow: o.yLow ?? yFloor + (yBelt - yFloor) * 0.42, wLow: o.wLow ?? wBelt - 0.012,
+    yBelt, wBelt, yTop, wTop, edge: o.edge ?? 0.04, crown: o.crown ?? 0.02, bulge: o.bulge ?? 0.02, seg: o.seg ?? BODY,
+  };
+}
+
+/** End-face ring: `base` scaled by k about (0, yC) at depth z. */
+function shrunk(base: Station, z: number, k: number, yC: number, seg: SegTone): Station {
+  return { ...base, z, shrink: k, shrinkY: yC, seg };
+}
+
+const ringPt = { x: 0, y: 0 };
+function ringPoint(s: Station, j: number, out: { x: number; y: number }): void {
+  let side = 1, k = j;
+  if (j > 9) { side = -1; k = RING - j; }
+  let x = 0, y = 0;
+  switch (k) {
+    case 0: y = s.yFloor; break;
+    case 1: x = s.wFloor - 0.09; y = s.yFloor; break;
+    case 2: x = s.wFloor; y = s.yFloor + 0.07; break;
+    case 3: x = s.wLow; y = s.yLow; break;
+    case 4: case 5: x = s.wBelt; y = s.yBelt; break;
+    case 6: {
+      const ex = s.wTop, ey = s.yTop - s.edge;
+      const dx = ex - s.wBelt, dy = ey - s.yBelt;
+      const len = Math.max(1e-4, Math.hypot(dx, dy));
+      x = s.wBelt + dx * 0.55 + (dy / len) * s.bulge;
+      y = s.yBelt + dy * 0.55 - (dx / len) * s.bulge;
+      break;
+    }
+    case 7: case 8: x = s.wTop; y = s.yTop - s.edge; break;
+    default: y = s.yTop + s.crown; break;
+  }
+  x *= side;
+  if (s.shrink !== undefined) {
+    const cy = s.shrinkY ?? (s.yFloor + s.yTop) * 0.5;
+    x *= s.shrink;
+    y = cy + (y - cy) * s.shrink;
+  }
+  out.x = x; out.y = y;
+}
+
+type Band = 'sill' | 'low' | 'flank' | 'side' | 'top';
+/** Band of the ring cell between points j and j+1 (null for the zero-width crease cells). */
+function bandOf(j: number): Band | null {
+  const k = j > 9 ? 17 - j : j;
+  switch (k) {
+    case 0: case 1: return 'sill';
+    case 2: return 'low';
+    case 3: return 'flank';
+    case 5: case 6: return 'side';
+    case 8: case 9: return 'top';
+    default: return null;
+  }
+}
+
+/**
+ * The shell: one smooth sheet through every station, coloured per cell so glass, lamps and valances are regions of the
+ * same surface rather than slabs. Cell order reproduces `surface()` (two triangles a-b-c / b-d-c per cell, rows = stations)
+ * and is verified against the sampled positions, so a change to the helper fails loudly here instead of mis-painting.
+ */
+function loft(stations: Station[]): THREE.BufferGeometry {
+  const rows = stations.length, cols = RING;
+  const g = surface(rows, cols, true, false, (i, j, out) => {
+    ringPoint(stations[i], j, ringPt);
+    out.set(ringPt.x, ringPt.y, stations[i].z);
+  });
+  const pos = g.attributes.position;
+  const n = pos.count;
+  if (n !== (rows - 1) * cols * 6) throw new Error('vehicle loft: unexpected surface() layout');
+  const colors = new Float32Array(n * 3);
+  const paints = new Float32Array(n);
+  for (let k = 0; k < n; k++) {
+    const t = (k / 3) | 0, tri = t & 1, cell = t >> 1, i = (cell / cols) | 0, j = cell % cols, corner = k % 3;
+    const far = tri === 0 ? corner === 2 : corner !== 0;
+    const nextJ = tri === 0 ? corner === 1 : corner !== 2;
+    const gi = far ? i + 1 : i, gj = nextJ ? (j + 1) % cols : j;
+    ringPoint(stations[gi], gj, ringPt);
+    if (Math.abs(pos.getX(k) - ringPt.x) > 1e-5 || Math.abs(pos.getY(k) - ringPt.y) > 1e-5 || Math.abs(pos.getZ(k) - stations[gi].z) > 1e-5) {
+      throw new Error('vehicle loft: surface() cell order changed');
+    }
+    const seg = stations[i].seg;
+    const band = bandOf(j) ?? 'flank';
+    let tone: Tone = seg[band];
+    if (band === 'flank' && seg.lens && (seg.lens.at === 1) === far) tone = seg.lens.tone;
+    authorColor.setHex(tone.col);
+    colors[k * 3] = authorColor.r; colors[k * 3 + 1] = authorColor.g; colors[k * 3 + 2] = authorColor.b;
+    paints[k] = tone.paint;
+  }
+  g.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  g.setAttribute('paintMix', new THREE.BufferAttribute(paints, 1));
+  return g;
+}
+
+/** Outer half-width of the shell at (y, z), interpolated between the two full stations around z. */
+function shellWidth(stations: Station[], y: number, z: number): number {
+  let a: Station | null = null, b: Station | null = null;
+  for (let i = 0; i < stations.length; i++) {
+    const s = stations[i];
+    if (s.shrink !== undefined) continue;
+    if (s.z <= z) a = s;
+    if (s.z >= z && !b) b = s;
+  }
+  if (!a) a = b; if (!b) b = a;
+  if (!a || !b) return 0;
+  const wa = ringWidth(a, y), wb = ringWidth(b, y);
+  const t = b.z > a.z ? clamp((z - a.z) / (b.z - a.z), 0, 1) : 0;
+  return wa + (wb - wa) * t;
+}
+const ringA = { x: 0, y: 0 }, ringB = { x: 0, y: 0 };
+function ringWidth(s: Station, y: number): number {
+  ringPoint(s, 1, ringA);
+  for (let k = 2; k <= 9; k++) {
+    ringPoint(s, k, ringB);
+    if (y <= ringB.y) {
+      const t = clamp((y - ringA.y) / Math.max(1e-4, ringB.y - ringA.y), 0, 1);
+      return ringA.x + (ringB.x - ringA.x) * t;
+    }
+    ringA.x = ringB.x; ringA.y = ringB.y;
+  }
+  return ringA.x;
+}
+
 // ---------------------------------------------------------------------------------------------- per-spec profiles
 
-interface Anchor { x: number; y: number; z: number; w: number; h: number }
+interface Anchor { x: number; y: number; z: number; w: number; h: number; sweep: number }
 /** Half-cylinder wheel arch over one axle (mirrored across x): tube radius, axle x/z and outboard half-width. */
-interface ArchDef { x: number; z: number; r: number; w: number }
+interface ArchDef { x: number; z: number; r: number; w: number; /** x of the black well backing, just proud of the flank. */ wellX: number }
 interface VehicleProfile {
+  stations: Station[];
   parts: PrismDef[];
   arches: ArchDef[];
   head: Anchor;
@@ -285,34 +418,64 @@ interface VehicleProfile {
 }
 
 /** Wheel arches: one fender definition per axle (mirrored across x when the geometry is built). */
-function arches(archOut: ArchDef[], wheelX: number, wheelZ: number, r: number, wide: number): void {
+function arches(archOut: ArchDef[], width: (y: number, z: number) => number, wheelX: number, wheelZ: number, r: number, wide: number): void {
+  const ar = r * ARCH_R, y = VEHICLE_RENDER.wheelRadius;
   for (let i = 0; i < 2; i++) {
     const z = i === 0 ? wheelZ : -wheelZ;
-    archOut.push({ x: wheelX, z, r: r * ARCH_R, w: wide });
+    // The backing sits 6 mm outside the widest bit of flank inside the arch circle (the flank leans out toward the belt).
+    let wellX = 0;
+    for (let k = -2; k <= 2; k++) wellX = Math.max(wellX, width(y + ar * 0.98, z + ar * 0.45 * k), width(y + ar * 0.6, z + ar * 0.45 * k));
+    archOut.push({ x: wheelX, z, r: ar, w: wide, wellX: wellX + 0.006 });
   }
 }
 /** Arch opening radius over the tyre radius (real cars sit around 1.15-1.25; anything bigger reads as a toy). */
 const ARCH_R = 1.22;
+const ARCH_SEG = 16;
+/** Arch lip face this far inside the spec width: 2 cm proud of the widest flank, a real fender flare. */
+const ARCH_INSET = 0.025;
 
 /**
- * Builds one arch fender: a painted open half-tube with an annular lip on the outboard end, plus a black inward-facing
- * half-tube just inside it, so the gap around the tyre reads as a dark wheel well instead of the painted flank behind.
+ * Builds one arch fender: a painted open half-tube with an annular lip on the outboard end, a black inward-facing
+ * half-tube just inside it and a black half-disc backing proud of the flank, so the arch reads as a dark wheel well cut
+ * into the body (the lofted shell itself has no hole) with the rim standing in front of it.
  */
 function archGeometry(a: ArchDef, side: number): THREE.BufferGeometry[] {
   const y = VEHICLE_RENDER.wheelRadius;
-  const tube = new THREE.CylinderGeometry(a.r, a.r, a.w * 2, 10, 1, true, 0, Math.PI);
+  const tube = new THREE.CylinderGeometry(a.r, a.r, a.w * 2, ARCH_SEG, 1, true, 0, Math.PI);
   tube.rotateZ(Math.PI / 2); // axis along x, open half facing +y
   tube.translate(side * a.x, y, a.z);
-  const lip = new THREE.RingGeometry(a.r * 0.86, a.r, 10, 1, 0, Math.PI);
+  const lip = new THREE.RingGeometry(a.r * 0.86, a.r, ARCH_SEG, 1, 0, Math.PI);
   lip.rotateY(side > 0 ? Math.PI / 2 : -Math.PI / 2); // face outboard
   lip.translate(side * (a.x + a.w), y, a.z);
-  const well = new THREE.CylinderGeometry(a.r * 0.97, a.r * 0.97, a.w * 2, 10, 1, true, 0, Math.PI);
+  const well = new THREE.CylinderGeometry(a.r * 0.97, a.r * 0.97, a.w * 2, ARCH_SEG, 1, true, 0, Math.PI);
   well.scale(1, 1, -1); // mirror flips the winding: the visible face is now the inside of the tube
   const wn = well.attributes.normal;
   for (let i = 0; i < wn.count; i++) wn.setXYZ(i, -wn.getX(i), -wn.getY(i), -wn.getZ(i));
   well.rotateZ(Math.PI / 2);
   well.translate(side * a.x, y, a.z);
-  return [decorate(tube, PAINT_DARK, 1), decorate(lip, PAINT_DARK, 1), decorate(well, BLACK, 0)];
+  const back = new THREE.CircleGeometry(a.r * 0.99, ARCH_SEG, 0, Math.PI);
+  back.rotateY(side > 0 ? Math.PI / 2 : -Math.PI / 2); // face outboard
+  back.translate(side * a.wellX, y, a.z);
+  return [decorate(tube, PAINT_DARK, 1), decorate(lip, PAINT_DARK, 1), decorate(well, BLACK, 0), decorate(back, BLACK, 0)];
+}
+
+/** Segment tones of the end faces and their wraps onto the flanks. */
+const REAR_WRAP: SegTone = { ...BODY, flank: T.tail, low: T.dark, sill: T.black };
+const REAR_FACE: SegTone = { sill: T.black, low: T.dark, flank: T.tail, lens: { at: 0, tone: T.tailLens }, side: T.paint, top: T.paint };
+const FRONT_WRAP: SegTone = { ...BODY, flank: T.lamp, low: T.dark, sill: T.black };
+const FRONT_FACE: SegTone = { sill: T.black, low: T.dark, flank: T.lamp, lens: { at: 1, tone: T.lampLens }, side: T.paint, top: T.paint };
+const FAN: SegTone = { sill: T.dark, low: T.dark, flank: T.dark, side: T.dark, top: T.dark };
+
+/**
+ * Light quad anchored on a lamp cluster: centred on the flank band of the end face, a hair in front of the swept face
+ * (which runs from the outer ring at `outer.z` to the shrunk ring at `inner.z`), yawed to follow that sweep.
+ */
+function lampAnchor(outer: Station, inner: Station, dir: number, w: number, h: number): Anchor {
+  const k = inner.shrink ?? 0.5, cy = inner.shrinkY ?? 0;
+  const xo = outer.wBelt, xi = outer.wBelt * k;
+  const yo = (outer.yLow + outer.yBelt) * 0.5, yi = cy + (yo - cy) * k;
+  const zMid = (outer.z + inner.z) * 0.5;
+  return { x: (xo + xi) * 0.5, y: (yo + yi) * 0.5, z: zMid + dir * 0.035, w, h, sweep: Math.atan2(Math.abs(inner.z - outer.z), xo - xi) };
 }
 
 /** Three-box saloon: sloped bonnet, raked glasshouse, boot lip. Shared by sedan / police / taxi. */
@@ -320,85 +483,59 @@ function sedanProfile(s: VehicleSpec, kind: 'sedan' | 'police' | 'taxi'): Vehicl
   const L = s.length, hl = L / 2, hw = s.width / 2, H = s.height;
   const c = VEHICLE_RENDER.clearance;
   const belt = H * 0.62;
-  const glassTop = H - H * 0.07;
+  const roof = H - 0.03;
   const wz = s.wheelbase / 2;
   const wx = hw - VEHICLE_RENDER.wheelWidth * 0.5 + WHEEL_INSET;
+  const hp = hw * PLAN;
   const parts: PrismDef[] = [];
   const archDefs: ArchDef[] = [];
-  const SOFT = PRISM_BEVEL_SOFT;
-  // Hull: wedge-sided, slightly narrower at the floor, nose lower than the boot, plan-rounded at both ends.
-  const hull: PrismDef = {
-    bz0: -hl + 0.06, bz1: hl - 0.10, bw0: hw * 0.90, bw1: hw * 0.83, by0: c, by1: c + 0.05,
-    tz0: -hl, tz1: hl, tw0: hw * 0.93, tw1: hw * 0.86, ty0: belt, ty1: belt - 0.05, col: PAINT, paint: 1, bevel: SOFT,
-    noseTaper: 0.16, tailTaper: 0.09,
-  };
-  parts.push(hull);
-  // Boot lid (separate panel) with a raised lip along its trailing edge.
-  parts.push({
-    bz0: -hl + 0.01, bz1: -L * 0.20, bw0: hw * 0.90, bw1: hw * 0.90, by0: belt - 0.04,
-    tz0: -hl + 0.05, tz1: -L * 0.20, tw0: hw * 0.84, tw1: hw * 0.86, ty0: belt + 0.05, ty1: belt + 0.07, col: PAINT, paint: 1,
-    tailTaper: 0.10,
-  });
-  parts.push(block(-hl + 0.02, -hl + 0.10, hw * 0.80, belt + 0.04, belt + 0.08, PAINT, 1));
-  // Bonnet: falls away toward the nose.
-  parts.push({
-    bz0: L * 0.12, bz1: hl - 0.03, bw0: hw * 0.88, bw1: hw * 0.78, by0: belt - 0.10,
-    tz0: L * 0.12, tz1: hl - 0.02, tw0: hw * 0.86, tw1: hw * 0.74, ty0: belt + 0.06, ty1: belt - 0.09, col: PAINT, paint: 1,
-    bevel: SOFT, noseTaper: 0.18,
-  });
-  // Glasshouse: inset glass band, faintly tinted by the paint, framed by raked A / C pillars and a creased roof.
-  const gz0 = -L * 0.32, gz1 = L * 0.145, gtz0 = -L * 0.255, gtz1 = -L * 0.015;
-  const gbw = hw * 0.84, gtw = hw * 0.72;
-  const glass: PrismDef = {
-    bz0: gz0, bz1: gz1, bw0: gbw - 0.02, bw1: gbw - 0.02, by0: belt - 0.02,
-    tz0: gtz0, tz1: gtz1, tw0: hw * 0.70, tw1: hw * 0.70, ty0: glassTop, col: GLASS, paint: 0.15, bevel: SOFT,
-  };
-  parts.push(glass);
-  pillar(parts, gz1, gbw, belt - 0.01, gtz1, gtw, glassTop + 0.005);
-  pillar(parts, gz0 + PILLAR_W, gbw, belt - 0.01, gtz0 + PILLAR_W, gtw, glassTop + 0.005);
-  // Windscreen / rear window: darker slabs sitting a touch proud of the tinted band.
-  parts.push({
-    bz0: gz1 - 0.06, bz1: gz1 + 0.01, bw0: hw * 0.66, bw1: hw * 0.66, by0: belt + 0.02,
-    tz0: gtz1 - 0.06, tz1: gtz1 + 0.01, tw0: hw * 0.58, tw1: hw * 0.58, ty0: glassTop - 0.03, col: GLASS_DEEP, paint: 0,
-  });
-  parts.push({
-    bz0: gz0 - 0.01, bz1: gz0 + 0.06, bw0: hw * 0.66, bw1: hw * 0.66, by0: belt + 0.02,
-    tz0: gtz0 - 0.01, tz1: gtz0 + 0.06, tw0: hw * 0.60, tw1: hw * 0.60, ty0: glassTop - 0.03, col: GLASS_DEEP, paint: 0,
-  });
-  // Roof panel over the glass band, crowned along the centre line.
-  parts.push({
-    bz0: -L * 0.27, bz1: L * 0.005, bw0: hw * 0.78, bw1: hw * 0.75, by0: glassTop - 0.01,
-    tz0: -L * 0.25, tz1: -L * 0.01, tw0: hw * 0.74, tw1: hw * 0.71, ty0: H - 0.015, col: PAINT, paint: 1, bevel: SOFT, crown: 0.03,
-  });
-  // Rocker panel / sills.
-  flankStrip(parts, hull, -L * 0.33, L * 0.33, c + 0.02, c + 0.16, 0.012, 0.04, DARK, 0.25);
-  arches(archDefs, wx, wz, VEHICLE_RENDER.wheelRadius, hw - 0.04 - wx);
-  // Door shut lines on the flank (front and rear door edges) and a bonnet gap across the cowl.
-  shutLine(parts, L * 0.13, hullHalfWidth(hull, c + 0.17, L * 0.13), c + 0.17, hullHalfWidth(hull, belt - 0.03, L * 0.13), belt - 0.03);
-  shutLine(parts, -L * 0.19, hullHalfWidth(hull, c + 0.17, -L * 0.19), c + 0.17, hullHalfWidth(hull, belt - 0.03, -L * 0.19), belt - 0.03);
-  parts.push({ ...block(L * 0.115, L * 0.115 + 0.016, hw * 0.78, belt + 0.03, belt + 0.075, BLACK, 0), plain: true });
-  // Bumpers (rounded shells proud of the tapered ends, black valance below), grille, plate.
-  bumper(parts, hl, 1, hw, c + 0.02, c + 0.30, 0.11, hw * 0.80, hw * 0.74);
-  bumper(parts, hl, -1, hw, c + 0.02, c + 0.30, 0.10, hw * 0.86, hw * 0.80);
-  parts.push({ ...block(hl - 0.02, hl + 0.08, hw * 0.40, c + 0.32, belt - 0.16, BLACK, 0), plain: true });
-  parts.push({ ...block(hl + 0.02, hl + 0.10, hw * 0.20, c + 0.06, c + 0.22, CHROME, 0), plain: true });
-  // Lamps baked into the shell so they read in daylight; head and tail clusters wrap onto the wings, hugging the hull.
-  pair(parts, { ...block(hl - 0.10, hl + 0.03, hw * 0.15, belt - 0.24, belt - 0.06, LAMP, 0, hw * 0.50) });
-  flankStrip(parts, hull, hl - 0.26, hl + 0.01, belt - 0.23, belt - 0.08, 0.012, 0.06, LAMP, 0);
-  pair(parts, { ...block(-hl - 0.07, -hl + 0.05, hw * 0.21, belt - 0.24, belt - 0.04, TAIL, 0, hw * 0.56) });
-  flankStrip(parts, hull, -hl - 0.01, -hl + 0.24, belt - 0.23, belt - 0.05, 0.012, 0.06, TAIL, 0);
-  rearDetails(parts, hl, c, c + 0.34, hw * 0.55);
-  // Door mirrors on stalks off the glasshouse, door handles as 2 cm chrome bumps on both doors.
-  mirror(parts, L * 0.10, L * 0.16, hullHalfWidth(glass, belt + 0.10, L * 0.13), belt + 0.05, 0.11, 0.05);
-  handle(parts, -L * 0.03, L * 0.04, hullHalfWidth(hull, belt - 0.11, L * 0.0), belt - 0.11);
-  handle(parts, -L * 0.34, -L * 0.27, hullHalfWidth(hull, belt - 0.11, -L * 0.3), belt - 0.11);
+  // End faces shrink about lamp height, so the clusters stay level and the bumper below leans out under them.
+  const yCRear = belt - 0.07, yCFront = belt - 0.22;
+  // Side silhouette rear -> front: boot lip, rear screen, roof, windscreen, cowl, bonnet, nose; plan curve widest at the B pillar.
+  const rear = station(-hl, c, belt + 0.10, hp * 0.74, belt + 0.04, hp * 0.86, { yFloor: c + 0.03, wFloor: hp * 0.78, yLow: belt - 0.17, wLow: hp * 0.85, edge: 0.025, crown: 0.01, seg: REAR_WRAP });
+  const nose = station(hl - 0.05, c, belt - 0.10, hp * 0.62, belt - 0.13, hp * 0.83, { yFloor: c + 0.03, wFloor: hp * 0.76, yLow: belt - 0.30, wLow: hp * 0.83, edge: 0.03, crown: 0.01, seg: FRONT_FACE });
+  const cowlZ = L * 0.145, roofFrontZ = -0.02, roofRearZ = -L * 0.215, screenBaseZ = -L * 0.31;
+  const stations: Station[] = [
+    shrunk(rear, -hl - 0.07, 0, yCRear, FAN),
+    shrunk(rear, -hl - 0.05, 0.5, yCRear, REAR_FACE),
+    rear,
+    station(-hl + 0.24, c, belt + 0.115, hp * 0.76, belt + 0.035, hp * 0.925, { wFloor: hp * 0.86, yLow: belt - 0.17, wLow: hp * 0.91, edge: 0.03, crown: 0.015 }),
+    station(screenBaseZ, c, belt + 0.10, hp * 0.72, belt + 0.025, hp * 0.95, { edge: 0.02, crown: 0.01, seg: { ...BODY, top: T.glass } }),
+    station(roofRearZ, c, roof, hp * 0.72, belt + 0.015, hp * 0.94, { edge: 0.05, crown: 0.025, seg: { ...BODY, side: T.glass } }),
+    station(-0.27, c, roof, hp * 0.73, belt + 0.005, hp * 0.945, { edge: 0.05, crown: 0.025, seg: { ...BODY, side: T.black } }),
+    station(-0.18, c, roof, hp * 0.73, belt + 0.005, hp * 0.945, { edge: 0.05, crown: 0.025, seg: { ...BODY, side: T.glass } }),
+    station(roofFrontZ, c, roof - 0.01, hp * 0.71, belt, hp * 0.94, { edge: 0.05, crown: 0.025, seg: { ...BODY, top: T.glass, side: T.glass } }),
+    station(0.33, c, belt + 0.29, hp * 0.75, belt - 0.005, hp * 0.945, { edge: 0.04, crown: 0.01, seg: { ...BODY, top: T.glass } }),
+    station(cowlZ, c, belt + 0.085, hp * 0.78, belt - 0.012, hp * 0.93, { edge: 0.03, crown: 0.01 }),
+    station(1.45, c, belt + 0.02, hp * 0.70, belt - 0.04, hp * 0.90, { edge: 0.04, crown: 0.02, bulge: 0.03 }),
+    station(hl - 0.30, c, belt - 0.05, hp * 0.66, belt - 0.09, hp * 0.87, { wFloor: hp * 0.80, yLow: belt - 0.28, wLow: hp * 0.86, edge: 0.04, crown: 0.015, seg: FRONT_WRAP }),
+    nose,
+    shrunk(nose, hl + 0.05, 0.5, yCFront, FAN),
+    shrunk(nose, hl + 0.06, 0, yCFront, FAN),
+  ];
+  const width = (y: number, z: number): number => shellWidth(stations, y, z);
+  // A pillars (raked posts over the quarter glass), rocker strip, door shut lines, bonnet gap.
+  pillar(parts, cowlZ + 0.02, width(belt, cowlZ), belt - 0.01, roofFrontZ + 0.03, hp * 0.71, roof - 0.055);
+  flankStrip(parts, width, -L * 0.33, L * 0.33, c + 0.02, c + 0.15, 0.010, 0.04, DARK, 0.25);
+  shutLine(parts, L * 0.13, width(c + 0.17, L * 0.13), c + 0.17, width(belt - 0.02, L * 0.13), belt - 0.02);
+  shutLine(parts, -L * 0.19, width(c + 0.17, -L * 0.19), c + 0.17, width(belt - 0.02, -L * 0.19), belt - 0.02);
+  parts.push({ ...block(cowlZ + 0.02, cowlZ + 0.036, hw * 0.76, belt + 0.05, belt + 0.10, BLACK, 0), plain: true });
+  arches(archDefs, width, wx, wz, VEHICLE_RENDER.wheelRadius, hw - ARCH_INSET - wx);
+  // Grille, plates, exhaust, mirrors, handles.
+  parts.push({ ...block(hl + 0.03, hl + 0.075, hw * 0.36, c + 0.25, belt - 0.19, BLACK, 0), plain: true });
+  parts.push({ ...block(hl + 0.04, hl + 0.085, hw * 0.18, c + 0.08, c + 0.19, SIGN, 0), plain: true });
+  rearDetails(parts, -hl - 0.07, c, c + 0.31, hw * 0.55);
+  mirror(parts, cowlZ - 0.20, cowlZ - 0.06, width(belt + 0.02, cowlZ - 0.13), belt + 0.01, 0.11, 0.05);
+  handle(parts, -L * 0.03, L * 0.04, width(belt - 0.11, 0), belt - 0.11);
+  handle(parts, -L * 0.34, -L * 0.27, width(belt - 0.11, -L * 0.3), belt - 0.11);
 
   const profile: VehicleProfile = {
+    stations,
     parts,
     arches: archDefs,
-    head: { x: hw * 0.60, y: belt - 0.15, z: hl + 0.08, w: 0.34, h: 0.15 },
-    tail: { x: hw * 0.58, y: belt - 0.14, z: -hl - 0.09, w: 0.40, h: 0.16 },
-    roof: { x: 0, y: H, z: 0, w: 0.3, h: 0.12 },
+    head: lampAnchor(nose, stations[stations.length - 2], 1, 0.22, 0.09),
+    tail: lampAnchor(rear, stations[1], -1, 0.24, 0.10),
+    roof: { x: 0, y: H, z: 0, w: 0.3, h: 0.12, sweep: 0 },
     roofKind: 'none',
     wheelScale: 1,
     shadowW: hw * 1.55,
@@ -408,103 +545,80 @@ function sedanProfile(s: VehicleSpec, kind: 'sedan' | 'police' | 'taxi'): Vehicl
   };
 
   if (kind === 'police') {
-    // Bull bar, roof lightbar housing and a blue side flash.
-    pair(parts, { ...block(hl + 0.04, hl + 0.16, hw * 0.08, c + 0.10, belt - 0.02, DARK, 0, hw * 0.40) });
-    parts.push({ ...block(hl + 0.06, hl + 0.15, hw * 0.50, belt - 0.22, belt - 0.10, DARK, 0), plain: true });
-    parts.push({ ...block(-L * 0.05, L * 0.05, hw * 0.46, H, H + 0.11, BLACK, 0), plain: true });
-    flankStrip(parts, hull, -L * 0.30, L * 0.24, belt - 0.30, belt - 0.10, 0.006, 0.05, POLICE_BLUE, 0);
-    flankStrip(parts, glass, -L * 0.30, -L * 0.05, belt - 0.02, glassTop - 0.06, 0.006, 0.05, POLICE_BLUE, 0);
-    profile.roof = { x: 0.24, y: H + 0.055, z: 0.03, w: 0.3, h: 0.12 };
+    // Bull bar, roof lightbar housing and a blue side flash fitted to the shell.
+    pair(parts, { ...block(hl + 0.06, hl + 0.18, hw * 0.08, c + 0.10, belt - 0.06, DARK, 0, hw * 0.40), plain: true });
+    parts.push({ ...block(hl + 0.08, hl + 0.17, hw * 0.50, belt - 0.26, belt - 0.14, DARK, 0), plain: true });
+    parts.push({ ...block(-L * 0.05, L * 0.05, hw * 0.46, roof + 0.01, roof + 0.12, BLACK, 0), plain: true });
+    flankStrip(parts, width, -L * 0.30, L * 0.24, belt - 0.30, belt - 0.10, 0.006, 0.05, POLICE_BLUE, 0);
+    flankStrip(parts, width, -L * 0.29, roofRearZ, belt + 0.02, roof - 0.10, 0.006, 0.05, POLICE_BLUE, 0);
+    profile.roof = { x: 0.24, y: roof + 0.065, z: 0.03, w: 0.3, h: 0.12, sweep: 0 };
     profile.roofKind = 'siren';
   } else if (kind === 'taxi') {
     // Roof sign box + a dark chequer band along the doors.
     parts.push({
-      bz0: -L * 0.03, bz1: L * 0.05, bw0: hw * 0.34, bw1: hw * 0.34, by0: H - 0.01,
-      tz0: -L * 0.02, tz1: L * 0.04, tw0: hw * 0.30, tw1: hw * 0.30, ty0: H + 0.19, col: SIGN, paint: 0,
+      bz0: -L * 0.03, bz1: L * 0.05, bw0: hw * 0.34, bw1: hw * 0.34, by0: roof + 0.01,
+      tz0: -L * 0.02, tz1: L * 0.04, tw0: hw * 0.30, tw1: hw * 0.30, ty0: roof + 0.21, col: SIGN, paint: 0,
     });
-    flankStrip(parts, hull, -L * 0.32, L * 0.30, belt - 0.30, belt - 0.16, 0.006, 0.05, BLACK, 0);
-    profile.roof = { x: 0, y: H + 0.10, z: L * 0.045, w: 0.46, h: 0.15 };
+    flankStrip(parts, width, -L * 0.32, L * 0.30, belt - 0.30, belt - 0.16, 0.006, 0.05, BLACK, 0);
+    profile.roof = { x: 0, y: roof + 0.12, z: L * 0.045, w: 0.46, h: 0.15, sweep: 0 };
     profile.roofKind = 'sign';
   }
   return profile;
 }
 
-/** Low, wide, cab-back coupe with a spoiler. */
+/** Low, wide wedge: long bonnet, cab-back glasshouse, fastback rear screen into a high Kamm tail with a wing. */
 function sportProfile(s: VehicleSpec): VehicleProfile {
   const L = s.length, hl = L / 2, hw = s.width / 2, H = s.height;
   const c = VEHICLE_RENDER.clearance - 0.05;
   const belt = H * 0.58;
-  const glassTop = H - 0.09;
+  const roof = H - 0.03;
   const wz = s.wheelbase / 2;
   const wx = hw - VEHICLE_RENDER.wheelWidth * 0.5 + WHEEL_INSET;
+  const hp = hw * PLAN;
   const parts: PrismDef[] = [];
   const archDefs: ArchDef[] = [];
-  const SOFT = PRISM_BEVEL_SOFT;
-  const hull: PrismDef = {
-    bz0: -hl + 0.08, bz1: hl - 0.08, bw0: hw * 0.91, bw1: hw * 0.84, by0: c, by1: c + 0.04,
-    tz0: -hl, tz1: hl, tw0: hw * 0.94, tw1: hw * 0.88, ty0: belt + 0.02, ty1: belt - 0.10, col: PAINT, paint: 1, bevel: SOFT,
-    noseTaper: 0.18, tailTaper: 0.10,
-  };
-  parts.push(hull);
-  // Long, low bonnet.
-  parts.push({
-    bz0: -L * 0.02, bz1: hl - 0.02, bw0: hw * 0.90, bw1: hw * 0.80, by0: belt - 0.12,
-    tz0: -L * 0.02, tz1: hl - 0.01, tw0: hw * 0.88, tw1: hw * 0.74, ty0: belt + 0.06, ty1: belt - 0.13, col: PAINT, paint: 1,
-    bevel: SOFT, noseTaper: 0.22, crown: 0.02,
-  });
-  // Cab-back glasshouse: inset tinted band, raked pillars, crowned roof.
-  const gz0 = -L * 0.38, gz1 = L * 0.03, gtz0 = -L * 0.31, gtz1 = -L * 0.08;
-  const gbw = hw * 0.83, gtw = hw * 0.69;
-  const glass: PrismDef = {
-    bz0: gz0, bz1: gz1, bw0: gbw - 0.02, bw1: gbw - 0.02, by0: belt - 0.01,
-    tz0: gtz0, tz1: gtz1, tw0: hw * 0.67, tw1: hw * 0.64, ty0: glassTop, col: GLASS, paint: 0.15, bevel: SOFT,
-  };
-  parts.push(glass);
-  pillar(parts, gz1, gbw, belt, gtz1, gtw - 0.02, glassTop + 0.005);
-  pillar(parts, gz0 + PILLAR_W, gbw, belt, gtz0 + PILLAR_W, gtw, glassTop + 0.005);
-  parts.push({
-    bz0: gz1 - 0.06, bz1: gz1 + 0.01, bw0: hw * 0.64, bw1: hw * 0.64, by0: belt + 0.03,
-    tz0: gtz1 - 0.06, tz1: gtz1 + 0.01, tw0: hw * 0.52, tw1: hw * 0.52, ty0: glassTop - 0.03, col: GLASS_DEEP, paint: 0,
-  });
-  parts.push({
-    bz0: gz0 - 0.01, bz1: gz0 + 0.06, bw0: hw * 0.62, bw1: hw * 0.62, by0: belt + 0.03,
-    tz0: gtz0 - 0.01, tz1: gtz0 + 0.06, tw0: hw * 0.56, tw1: hw * 0.56, ty0: glassTop - 0.03, col: GLASS_DEEP, paint: 0,
-  });
-  parts.push({
-    bz0: -L * 0.32, bz1: -L * 0.07, bw0: hw * 0.74, bw1: hw * 0.70, by0: glassTop - 0.01,
-    tz0: -L * 0.30, tz1: -L * 0.10, tw0: hw * 0.70, tw1: hw * 0.66, ty0: H - 0.015, col: PAINT, paint: 1, bevel: SOFT, crown: 0.03,
-  });
-  // Rear deck (boot) with a lip + wing.
-  parts.push({
-    bz0: -hl + 0.02, bz1: -L * 0.30, bw0: hw * 0.90, bw1: hw * 0.90, by0: belt - 0.04,
-    tz0: -hl + 0.04, tz1: -L * 0.30, tw0: hw * 0.86, tw1: hw * 0.88, ty0: belt + 0.03, col: PAINT, paint: 1, tailTaper: 0.12,
-  });
-  parts.push({ ...block(-hl + 0.02, -hl + 0.09, hw * 0.76, belt + 0.02, belt + 0.06, PAINT, 1), plain: true });
-  parts.push({ ...block(-L * 0.30, -L * 0.30 + 0.016, hw * 0.80, belt - 0.05, belt + 0.04, BLACK, 0), plain: true });
-  pair(parts, { ...block(-hl - 0.02, -hl + 0.16, hw * 0.06, belt + 0.01, belt + 0.24, DARK, 0, hw * 0.56) });
-  parts.push({ ...block(-hl - 0.06, -hl + 0.18, hw * 0.90, belt + 0.24, belt + 0.31, PAINT_SHADE, 1), tailTaper: 0.12 });
-  // Splitter / rear bumper (rounded shells with a black valance) and sills hugging the door.
-  bumper(parts, hl, 1, hw, c - 0.02, c + 0.24, 0.14, hw * 0.84, hw * 0.76);
-  bumper(parts, hl, -1, hw, c - 0.02, c + 0.22, 0.12, hw * 0.88, hw * 0.80);
-  flankStrip(parts, hull, -L * 0.35, L * 0.35, c + 0.02, c + 0.14, 0.012, 0.04, BLACK, 0.2);
-  arches(archDefs, wx, wz, VEHICLE_RENDER.wheelRadius * 1.08, hw - 0.04 - wx);
-  // Door shut line (single long door) + bonnet gap.
-  shutLine(parts, L * 0.02, hullHalfWidth(hull, c + 0.15, L * 0.02), c + 0.15, hullHalfWidth(hull, belt - 0.02, L * 0.02), belt - 0.02);
-  parts.push({ ...block(-L * 0.025, -L * 0.025 + 0.016, hw * 0.80, belt + 0.02, belt + 0.075, BLACK, 0), plain: true });
-  parts.push({ ...block(hl - 0.01, hl + 0.08, hw * 0.46, c + 0.20, belt - 0.20, BLACK, 0), plain: true });
-  pair(parts, { ...block(hl - 0.12, hl + 0.03, hw * 0.16, belt - 0.20, belt - 0.09, LAMP, 0, hw * 0.50) });
-  flankStrip(parts, hull, hl - 0.32, hl + 0.01, belt - 0.19, belt - 0.10, 0.012, 0.06, LAMP, 0);
-  parts.push({ ...block(-hl - 0.05, -hl + 0.02, hw * 0.76, belt - 0.14, belt - 0.02, TAIL, 0), plain: true });
-  flankStrip(parts, hull, -hl - 0.01, -hl + 0.26, belt - 0.13, belt - 0.03, 0.012, 0.06, TAIL, 0);
-  rearDetails(parts, hl, c, c + 0.28, hw * 0.50);
-  mirror(parts, L * 0.05, L * 0.11, hullHalfWidth(glass, belt + 0.06, L * 0.02), belt + 0.02, 0.09, 0.045);
-  handle(parts, -L * 0.14, -L * 0.07, hullHalfWidth(hull, belt - 0.10, -L * 0.1), belt - 0.10);
+  const yCRear = belt + 0.01, yCFront = belt - 0.22;
+  const rear = station(-hl, c, belt + 0.17, hp * 0.80, belt + 0.07, hp * 0.90, { yFloor: c + 0.03, wFloor: hp * 0.84, yLow: belt - 0.06, wLow: hp * 0.89, edge: 0.03, crown: 0, seg: REAR_WRAP });
+  const nose = station(hl - 0.05, c, belt - 0.14, hp * 0.60, belt - 0.16, hp * 0.84, { yFloor: c + 0.03, wFloor: hp * 0.78, yLow: belt - 0.27, wLow: hp * 0.84, edge: 0.02, crown: 0.01, seg: FRONT_FACE });
+  const cowlZ = 0.58, roofFrontZ = -0.12, roofRearZ = -0.55, deckZ = -1.30;
+  const stations: Station[] = [
+    shrunk(rear, -hl - 0.06, 0, yCRear, FAN),
+    shrunk(rear, -hl - 0.045, 0.5, yCRear, REAR_FACE),
+    rear,
+    station(-hl + 0.28, c, belt + 0.19, hp * 0.82, belt + 0.06, hp * 0.95, { wFloor: hp * 0.88, yLow: belt - 0.06, wLow: hp * 0.94, edge: 0.03, crown: 0.005 }),
+    station(deckZ, c, belt + 0.17, hp * 0.78, belt + 0.045, hp * 0.945, { edge: 0.02, crown: 0.005, seg: { ...BODY, top: T.glass } }),
+    station(roofRearZ, c, roof, hp * 0.70, belt + 0.025, hp * 0.95, { edge: 0.05, crown: 0.02, seg: { ...BODY, side: T.glass } }),
+    station(roofFrontZ, c, roof - 0.01, hp * 0.69, belt + 0.01, hp * 0.945, { edge: 0.05, crown: 0.02, seg: { ...BODY, top: T.glass, side: T.glass } }),
+    station(0.25, c, belt + 0.30, hp * 0.74, belt, hp * 0.94, { edge: 0.04, crown: 0.01, seg: { ...BODY, top: T.glass } }),
+    station(cowlZ, c, belt + 0.085, hp * 0.78, belt - 0.015, hp * 0.94, { edge: 0.03, crown: 0.01 }),
+    station(1.40, c, belt - 0.01, hp * 0.70, belt - 0.06, hp * 0.91, { edge: 0.04, crown: 0.02, bulge: 0.03 }),
+    station(hl - 0.32, c, belt - 0.08, hp * 0.66, belt - 0.12, hp * 0.88, { wFloor: hp * 0.82, yLow: belt - 0.24, wLow: hp * 0.87, edge: 0.03, crown: 0.015, seg: FRONT_WRAP }),
+    nose,
+    shrunk(nose, hl + 0.045, 0.5, yCFront, FAN),
+    shrunk(nose, hl + 0.055, 0, yCFront, FAN),
+  ];
+  const width = (y: number, z: number): number => shellWidth(stations, y, z);
+  pillar(parts, cowlZ + 0.02, width(belt + 0.01, cowlZ), belt, roofFrontZ + 0.03, hp * 0.69, roof - 0.055);
+  // Wing on two dark uprights, boot shut line, single long door, rocker, bonnet gap, grille, plates, mirrors, handle.
+  pair(parts, { ...block(-hl - 0.02, -hl + 0.16, hw * 0.06, belt + 0.14, belt + 0.30, DARK, 0, hw * 0.56), plain: true });
+  parts.push({ ...block(-hl - 0.06, -hl + 0.18, hw * 0.90, belt + 0.30, belt + 0.36, PAINT_SHADE, 1), tailTaper: 0.12 });
+  parts.push({ ...block(deckZ + 0.02, deckZ + 0.036, hw * 0.76, belt + 0.14, belt + 0.20, BLACK, 0), plain: true });
+  shutLine(parts, L * 0.02, width(c + 0.15, L * 0.02), c + 0.15, width(belt - 0.02, L * 0.02), belt - 0.02);
+  flankStrip(parts, width, -L * 0.35, L * 0.35, c + 0.02, c + 0.13, 0.010, 0.04, BLACK, 0.2);
+  arches(archDefs, width, wx, wz, VEHICLE_RENDER.wheelRadius * 1.08, hw - ARCH_INSET - wx);
+  parts.push({ ...block(cowlZ + 0.02, cowlZ + 0.036, hw * 0.78, belt + 0.05, belt + 0.10, BLACK, 0), plain: true });
+  parts.push({ ...block(hl + 0.03, hl + 0.07, hw * 0.44, c + 0.16, belt - 0.24, BLACK, 0), plain: true });
+  parts.push({ ...block(hl + 0.035, hl + 0.08, hw * 0.18, c + 0.05, c + 0.15, SIGN, 0), plain: true });
+  rearDetails(parts, -hl - 0.06, c, c + 0.26, hw * 0.50);
+  mirror(parts, cowlZ - 0.20, cowlZ - 0.07, width(belt + 0.02, cowlZ - 0.13), belt + 0.01, 0.09, 0.045);
+  handle(parts, -L * 0.14, -L * 0.07, width(belt - 0.10, -L * 0.1), belt - 0.10);
   return {
+    stations,
     parts,
     arches: archDefs,
-    head: { x: hw * 0.56, y: belt - 0.14, z: hl + 0.04, w: 0.34, h: 0.11 },
-    tail: { x: hw * 0.42, y: belt - 0.08, z: -hl - 0.05, w: 0.5, h: 0.12 },
-    roof: { x: 0, y: H, z: 0, w: 0.3, h: 0.12 },
+    head: lampAnchor(nose, stations[stations.length - 2], 1, 0.24, 0.07),
+    tail: lampAnchor(rear, stations[1], -1, 0.34, 0.07),
+    roof: { x: 0, y: H, z: 0, w: 0.3, h: 0.12, sweep: 0 },
     roofKind: 'none',
     wheelScale: 1.08,
     shadowW: hw * 1.55,
@@ -514,83 +628,66 @@ function sportProfile(s: VehicleSpec): VehicleProfile {
   };
 }
 
-/** Tall box van: short sloped snout, deep windscreen, cargo body. */
+/** Tall one-box van: flat cargo body, steep windscreen over a short snout. */
 function vanProfile(s: VehicleSpec): VehicleProfile {
   const L = s.length, hl = L / 2, hw = s.width / 2, H = s.height;
   const c = VEHICLE_RENDER.clearance;
+  const belt = H * 0.5;
+  const roof = H - 0.04;
   const wz = s.wheelbase / 2;
   const wx = hw - VEHICLE_RENDER.wheelWidth * 0.5 + WHEEL_INSET;
   const noseZ = L * 0.28;
+  const hp = hw * PLAN;
   const parts: PrismDef[] = [];
   const archDefs: ArchDef[] = [];
-  const SOFT = PRISM_BEVEL_SOFT;
-  // Cargo body.
-  const hull: PrismDef = {
-    bz0: -hl + 0.04, bz1: noseZ, bw0: hw * 0.92, bw1: hw * 0.93, by0: c + 0.04,
-    tz0: -hl, tz1: noseZ, tw0: hw * 0.95, tw1: hw * 0.95, ty0: H - 0.06, col: PAINT, paint: 1, bevel: SOFT, tailTaper: 0.06,
-  };
-  parts.push(hull);
-  // Roof cap, crowned.
-  parts.push({
-    bz0: -hl + 0.02, bz1: noseZ - 0.05, bw0: hw * 0.93, bw1: hw * 0.93, by0: H - 0.07,
-    tz0: -hl + 0.10, tz1: noseZ - 0.14, tw0: hw * 0.86, tw1: hw * 0.86, ty0: H - 0.02, col: PAINT_DARK, paint: 1, bevel: SOFT, crown: 0.03,
-    tailTaper: 0.08,
-  });
-  // Snout.
-  const snout: PrismDef = {
-    bz0: noseZ - 0.02, bz1: hl - 0.02, bw0: hw * 0.92, bw1: hw * 0.85, by0: c + 0.04,
-    tz0: noseZ - 0.02, tz1: hl - 0.02, tw0: hw * 0.92, tw1: hw * 0.80, ty0: H * 0.53, ty1: H * 0.47, col: PAINT, paint: 1, bevel: SOFT,
-    noseTaper: 0.16,
-  };
-  parts.push(snout);
-  // Bonnet shut line across the snout and a cowl step under the screen.
-  parts.push({ ...block(noseZ + 0.02, noseZ + 0.036, hw * 0.78, H * 0.50, H * 0.535, BLACK, 0), plain: true });
-  // Windscreen, raked back over the snout: inset tinted pane between painted A pillars.
-  parts.push({
-    bz0: noseZ - 0.10, bz1: noseZ + 0.15, bw0: hw * 0.86, bw1: hw * 0.86, by0: H * 0.52,
-    tz0: noseZ - 0.24, tz1: noseZ - 0.03, tw0: hw * 0.84, tw1: hw * 0.84, ty0: H * 0.90, col: GLASS, paint: 0.15,
-  });
-  parts.push({
-    bz0: noseZ + 0.10, bz1: noseZ + 0.16, bw0: hw * 0.70, bw1: hw * 0.70, by0: H * 0.55,
-    tz0: noseZ - 0.08, tz1: noseZ - 0.02, tw0: hw * 0.70, tw1: hw * 0.70, ty0: H * 0.87, col: GLASS_DEEP, paint: 0,
-  });
-  pillar(parts, noseZ + 0.16, hw * 0.90, H * 0.52, noseZ - 0.02, hw * 0.88, H * 0.90);
-  // Cab side windows: dark frame, tinted pane a touch proud of it, painted B pillar behind the door.
-  flankStrip(parts, hull, noseZ - 0.98, noseZ - 0.14, H * 0.585, H * 0.875, 0.004, 0.04, BLACK, 0);
-  flankStrip(parts, hull, noseZ - 0.95, noseZ - 0.16, H * 0.60, H * 0.86, 0.010, 0.04, GLASS, 0.15);
-  flankStrip(parts, hull, noseZ - 1.02, noseZ - 0.94, H * 0.55, H - 0.10, 0.012, 0.04, PAINT, 1);
-  // Sliding door shut lines on the flank.
-  shutLine(parts, noseZ - 1.0, hullHalfWidth(hull, c + 0.20, noseZ - 1.0), c + 0.20, hullHalfWidth(hull, H - 0.12, noseZ - 1.0), H - 0.12);
-  shutLine(parts, -L * 0.22, hullHalfWidth(hull, c + 0.20, -L * 0.22), c + 0.20, hullHalfWidth(hull, H - 0.12, -L * 0.22), H - 0.12);
-  // Rear doors: seam + handles.
-  parts.push({ ...block(-hl - 0.03, -hl + 0.03, hw * 0.02, c + 0.20, H - 0.16, BLACK, 0), plain: true });
-  parts.push({ ...block(-hl - 0.04, -hl + 0.02, hw * 0.58, H * 0.62, H * 0.84, GLASS, 0), plain: true });
-  flankStrip(parts, hull, -L * 0.36, L * 0.20, c + 0.04, c + 0.18, 0.012, 0.04, DARK, 0.25);
-  arches(archDefs, wx, wz, VEHICLE_RENDER.wheelRadius * 1.12, hw - 0.04 - wx);
-  bumper(parts, hl, 1, hw, c + 0.02, c + 0.34, 0.10, hw * 0.84, hw * 0.78);
-  bumper(parts, hl, -1, hw, c + 0.02, c + 0.34, 0.10, hw * 0.90, hw * 0.86);
-  parts.push({ ...block(hl - 0.02, hl + 0.08, hw * 0.46, c + 0.36, H * 0.42, BLACK, 0), plain: true });
-  pair(parts, { ...block(hl - 0.08, hl + 0.06, hw * 0.16, H * 0.30, H * 0.45, LAMP, 0, hw * 0.54) });
-  flankStrip(parts, snout, hl - 0.30, hl + 0.01, H * 0.31, H * 0.44, 0.012, 0.06, LAMP, 0);
-  pair(parts, { ...block(-hl - 0.06, -hl + 0.02, hw * 0.12, H * 0.32, H * 0.62, TAIL, 0, hw * 0.74) });
-  flankStrip(parts, hull, -hl - 0.01, -hl + 0.18, H * 0.34, H * 0.60, 0.012, 0.06, TAIL, 0);
-  rearDetails(parts, hl, c, c + 0.40, hw * 0.55);
+  const rear = station(-hl, c, roof - 0.02, hp * 0.86, belt + 0.02, hp * 0.92, { yFloor: c + 0.04, wFloor: hp * 0.86, yLow: belt - 0.32, wLow: hp * 0.91, edge: 0.05, crown: 0.02, seg: REAR_WRAP });
+  const nose = station(hl - 0.05, c, belt - 0.06, hp * 0.70, belt - 0.11, hp * 0.84, { yFloor: c + 0.04, wFloor: hp * 0.78, yLow: belt - 0.30, wLow: hp * 0.84, edge: 0.03, crown: 0.01, seg: FRONT_FACE });
+  const cowlZ = noseZ + 0.16, roofFrontZ = noseZ - 0.28, bPillarZ = noseZ - 1.02;
+  const stations: Station[] = [
+    shrunk(rear, -hl - 0.05, 0, belt - 0.15, FAN),
+    shrunk(rear, -hl - 0.04, 0.72, belt - 0.15, REAR_FACE),
+    rear,
+    station(-hl + 0.22, c, roof, hp * 0.88, belt + 0.02, hp * 0.95, { wFloor: hp * 0.88, yLow: belt - 0.32, wLow: hp * 0.94, edge: 0.05, crown: 0.02 }),
+    station(bPillarZ, c, roof, hp * 0.88, belt + 0.01, hp * 0.95, { wFloor: hp * 0.88, edge: 0.05, crown: 0.02, seg: { ...BODY, side: T.black } }),
+    station(bPillarZ + 0.08, c, roof, hp * 0.88, belt + 0.01, hp * 0.95, { wFloor: hp * 0.88, edge: 0.05, crown: 0.02, seg: { ...BODY, side: T.glass } }),
+    station(roofFrontZ, c, roof - 0.01, hp * 0.87, belt, hp * 0.95, { wFloor: hp * 0.88, edge: 0.05, crown: 0.02, seg: { ...BODY, top: T.glass, side: T.glass } }),
+    station(noseZ - 0.04, c, belt + 0.54, hp * 0.88, belt - 0.01, hp * 0.94, { edge: 0.04, crown: 0.01, seg: { ...BODY, top: T.glass } }),
+    station(cowlZ, c, belt + 0.10, hp * 0.86, belt - 0.02, hp * 0.93, { edge: 0.03, crown: 0.01 }),
+    station(hl - 0.32, c, belt - 0.02, hp * 0.78, belt - 0.08, hp * 0.88, { wFloor: hp * 0.82, yLow: belt - 0.28, wLow: hp * 0.87, edge: 0.04, crown: 0.02, seg: FRONT_WRAP }),
+    nose,
+    shrunk(nose, hl + 0.05, 0.5, belt - 0.20, FAN),
+    shrunk(nose, hl + 0.06, 0, belt - 0.20, FAN),
+  ];
+  const width = (y: number, z: number): number => shellWidth(stations, y, z);
+  pillar(parts, cowlZ + 0.02, width(belt, cowlZ), belt - 0.01, roofFrontZ + 0.03, hp * 0.87, roof - 0.055);
+  // Bonnet gap, sliding door shut lines, rear door seam + windows, rocker.
+  parts.push({ ...block(cowlZ + 0.02, cowlZ + 0.036, hw * 0.80, belt + 0.06, belt + 0.11, BLACK, 0), plain: true });
+  shutLine(parts, bPillarZ + 0.02, width(c + 0.20, bPillarZ), c + 0.20, width(roof - 0.12, bPillarZ), roof - 0.12);
+  shutLine(parts, -L * 0.22, width(c + 0.20, -L * 0.22), c + 0.20, width(roof - 0.12, -L * 0.22), roof - 0.12);
+  parts.push({ ...block(-hl - 0.055, -hl + 0.03, hw * 0.02, c + 0.20, roof - 0.14, BLACK, 0), plain: true });
+  pair(parts, { ...block(-hl - 0.055, -hl + 0.02, hw * 0.24, H * 0.62, H * 0.84, GLASS, 0, hw * 0.30), plain: true });
+  flankStrip(parts, width, -L * 0.36, L * 0.20, c + 0.04, c + 0.17, 0.010, 0.04, DARK, 0.25);
+  arches(archDefs, width, wx, wz, VEHICLE_RENDER.wheelRadius * 1.12, hw - ARCH_INSET - wx);
+  parts.push({ ...block(hl + 0.03, hl + 0.075, hw * 0.42, c + 0.30, belt - 0.20, BLACK, 0), plain: true });
+  parts.push({ ...block(hl + 0.04, hl + 0.085, hw * 0.18, c + 0.10, c + 0.21, SIGN, 0), plain: true });
+  rearDetails(parts, -hl - 0.05, c, c + 0.38, hw * 0.55);
   // Big mirrors on arms, cab and sliding-door handles.
-  mirror(parts, noseZ - 0.18, noseZ + 0.02, hullHalfWidth(hull, H * 0.70, noseZ - 0.1), H * 0.60, 0.20, 0.06);
-  handle(parts, noseZ - 0.62, noseZ - 0.54, hullHalfWidth(hull, H * 0.52, noseZ - 0.58), H * 0.52);
-  handle(parts, -L * 0.22 + 0.06, -L * 0.22 + 0.14, hullHalfWidth(hull, H * 0.52, -L * 0.22 + 0.1), H * 0.52);
+  mirror(parts, cowlZ - 0.34, cowlZ - 0.14, width(belt + 0.20, cowlZ - 0.24), belt + 0.16, 0.20, 0.06);
+  handle(parts, noseZ - 0.62, noseZ - 0.54, width(belt - 0.02, noseZ - 0.58), belt - 0.02);
+  handle(parts, -L * 0.22 + 0.06, -L * 0.22 + 0.14, width(belt - 0.02, -L * 0.22 + 0.1), belt - 0.02);
   return {
+    stations,
     parts,
     arches: archDefs,
-    head: { x: hw * 0.60, y: H * 0.38, z: hl + 0.07, w: 0.36, h: 0.16 },
-    tail: { x: hw * 0.76, y: H * 0.47, z: -hl - 0.07, w: 0.22, h: 0.3 },
-    roof: { x: 0, y: H, z: 0, w: 0.3, h: 0.12 },
+    head: lampAnchor(nose, stations[stations.length - 2], 1, 0.24, 0.10),
+    tail: lampAnchor(rear, stations[1], -1, 0.13, 0.22),
+    roof: { x: 0, y: H, z: 0, w: 0.3, h: 0.12, sweep: 0 },
     roofKind: 'none',
     wheelScale: 1.12,
     shadowW: hw * 1.55,
     shadowL: hl * 1.14,
     floor: c,
-    belt: H * 0.5,
+    belt,
   };
 }
 
@@ -618,17 +715,18 @@ function bakeShading(g: THREE.BufferGeometry, floor: number, belt: number): void
   }
 }
 
-/** Merges a profile's prisms and arch fenders into one buffer (position / normal / uv / color / paintMix). */
+/** Merges a profile's shell, small parts and arch fenders into one buffer (position / normal / color / paintMix). */
 export function bodyGeometry(s: VehicleSpec): THREE.BufferGeometry {
   const profile = profileFor(s);
   const parts = profile.parts;
-  const geos: THREE.BufferGeometry[] = [];
+  const geos: THREE.BufferGeometry[] = [loft(profile.stations)];
   for (let i = 0; i < parts.length; i++) geos.push(prism(parts[i]));
   for (let i = 0; i < profile.arches.length; i++) {
     const a = profile.arches[i];
     geos.push(...archGeometry(a, 1), ...archGeometry(a, -1));
   }
   const merged = mergeGeometries(geos, false);
+  if (!merged) throw new Error('vehicle body merge failed (attribute mismatch)');
   for (let i = 0; i < geos.length; i++) geos[i].dispose();
   bakeShading(merged, profile.floor, profile.belt);
   merged.computeBoundingSphere();
@@ -636,15 +734,15 @@ export function bodyGeometry(s: VehicleSpec): THREE.BufferGeometry {
 }
 
 /**
- * Wheel: a lathed tyre (flat tread, rounded shoulders, slightly bulged sidewall) around a recessed rim dish, five tapered
- * spokes and a hub cap, merged; one draw call for every wheel in the city. Authored with the axle along y (wheel plane =
- * x/z) and rotated onto x at the end; everything is symmetric about the mid-plane because the same instance geometry
- * serves both sides of the car. 12 segments around: the tread still reads as round at chase distance at ~320 triangles.
+ * Wheel: a lathed tyre (flat tread, rounded shoulders, sidewall darker than the tread) with its bead standing 3 cm
+ * proud of a recessed gunmetal rim: a dish inside the bead, seven thin tapered lathe blades and a small hub cap, merged;
+ * one draw call for every wheel in the city. Authored with the axle along y (wheel plane = x/z) and rotated onto x at
+ * the end; everything is symmetric about the mid-plane because the same instance geometry serves both sides of the car.
  */
 function wheelGeometry(): THREE.BufferGeometry {
   const R = VEHICLE_RENDER;
   const parts: THREE.BufferGeometry[] = [];
-  const TYRE = 0x121315, DISH = 0x2c2f35, SPOKE = 0xc4c8cf, HUB = 0xe2e5ea;
+  const TYRE = 0x1a1b1e, DISH = 0x6e737a, SPOKE = 0x868b93;
   const add = (geo: THREE.BufferGeometry, hex: number, shade?: (x: number, y: number, z: number) => number): void => {
     const g = geo.index ? geo.toNonIndexed() : geo;
     if (g !== geo) geo.dispose();
@@ -658,36 +756,46 @@ function wheelGeometry(): THREE.BufferGeometry {
     }
     g.rotateZ(Math.PI / 2); // axle y -> x
     g.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    stripUv(g);
     parts.push(g);
   };
   const r = R.wheelRadius, w = R.wheelWidth, hwid = w * 0.5;
-  const SEG = 12;
-  // Tyre profile (radius, axial offset): bead -> bulged sidewall -> rounded shoulder -> flat tread, mirrored about y = 0.
+  const SEG = 16;
+  const rimR = r * 0.55;
+  const dishFace = hwid - 0.06; // the dish sits 6 cm inside the tyre bead: a deep rim the blades stand out of
+  // Tyre profile (radius, axial offset): bead seat cone -> bead lip -> bulged sidewall -> rounded shoulder -> flat tread,
+  // mirrored about y = 0.
   const half = [
-    [r * 0.64, hwid - 0.03], [r * 0.82, hwid], [r * 0.965, hwid * 0.80], [r, hwid * 0.50], [r, 0],
+    [rimR, dishFace - 0.002], [r * 0.66, hwid - 0.004], [r * 0.82, hwid], [r * 0.95, hwid * 0.84], [r, hwid * 0.42], [r, 0],
   ];
   const pts: THREE.Vector2[] = [];
   for (let i = 0; i < half.length; i++) pts.push(new THREE.Vector2(half[i][0], -half[i][1]));
   for (let i = half.length - 2; i >= 0; i--) pts.push(new THREE.Vector2(half[i][0], half[i][1]));
-  // Sidewall vertices (inside r*0.93) are lifted so the tyre face is not one flat black disc.
-  add(new THREE.LatheGeometry(pts, SEG), TYRE, (x, _y, z) => (Math.hypot(x, z) < r * 0.93 ? 1.6 : 1));
-  // Rim: recessed dish, a rim lip at the bead, five tapered blade spokes standing proud of the dish on both faces, hub cap.
-  add(new THREE.CylinderGeometry(r * 0.66, r * 0.66, w * 0.40, 8, 1, false), DISH);
-  add(new THREE.CylinderGeometry(r * 0.66, r * 0.66, w * 0.72, 8, 1, true), SPOKE, () => 0.8);
-  for (let i = 0; i < 5; i++) {
-    const spoke = new THREE.BoxGeometry(r * 0.17, w * 0.78, r * 0.56);
-    const sp = spoke.attributes.position;
-    for (let k = 0; k < sp.count; k++) {
-      // Taper toward the rim: the blade narrows to ~55 % of its root width.
-      const t = sp.getZ(k) > 0 ? 0.55 : 1;
-      sp.setX(k, sp.getX(k) * t);
+  add(new THREE.LatheGeometry(pts, SEG), TYRE, (x, _y, z) => (Math.hypot(x, z) < r * 0.95 ? 0.72 : 1.1));
+  // Rim: a dark dish deep in the bead; on each dish face seven thin tapered plates (2 cm deep, 1.5 cm proud) and a hub
+  // cap. Both faces get them because the same instance geometry serves the left and right wheels.
+  add(new THREE.CylinderGeometry(rimR, rimR, dishFace * 2, SEG, 1, false), DISH, (_x, y) => (Math.abs(y) < dishFace - 0.001 ? 0.6 : 0.42));
+  // A 4-point lathe ring is a diamond; turned 45 degrees and scaled it becomes a flat plate (in-plane width x, depth z).
+  const bladeW = r * 0.07, bladeD = 0.02;
+  for (let face = -1; face <= 1; face += 2) {
+    const zc = face * (dishFace + 0.005);
+    const blade: Ring[] = [{ y: r * 0.12, rx: 1, rz: 1, z: zc }, { y: rimR + 0.004, rx: 0.5, rz: 0.8, z: zc }];
+    for (let i = 0; i < 7; i++) {
+      const g = tube(blade, 4, false, false);
+      g.translate(0, 0, -zc);
+      g.rotateY(Math.PI / 4);
+      g.scale(bladeW / Math.SQRT1_2, 1, bladeD / Math.SQRT1_2);
+      g.translate(0, 0, zc);
+      g.rotateX(Math.PI / 2); // tube axis y -> radial z, depth z -> axial -y
+      g.rotateY((i * Math.PI * 2) / 7);
+      add(g, SPOKE, (_x, y) => (y > 0 ? 1 : 0.92));
     }
-    spoke.translate(0, 0, r * 0.36);
-    spoke.rotateY((i * Math.PI * 2) / 5);
-    add(spoke, SPOKE, (_x, y) => (y > 0 ? 1 : 0.9));
+    const cap = new THREE.CylinderGeometry(r * 0.15, r * 0.15, 0.03, 8, 1, false);
+    cap.translate(0, face * (dishFace + 0.012), 0);
+    add(cap, SPOKE, () => 0.85);
   }
-  add(new THREE.CylinderGeometry(r * 0.17, r * 0.17, w * 0.86, 6, 1, false), HUB);
   const merged = mergeGeometries(parts, false);
+  if (!merged) throw new Error('vehicle wheel merge failed (attribute mismatch)');
   for (let i = 0; i < parts.length; i++) parts[i].dispose();
   return merged;
 }
@@ -702,8 +810,9 @@ export class VehicleRenderer {
   private readonly lights: THREE.InstancedMesh;
   private readonly shadows: ContactShadows;
   private readonly bodyMat: THREE.MeshPhysicalMaterial;
-  private readonly wheelMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.62, metalness: 0.35, envMapIntensity: 0.9 });
-  private readonly lightMat = new THREE.MeshBasicMaterial({ color: 0xffffff, vertexColors: true, side: THREE.DoubleSide, fog: false, toneMapped: false });
+  private readonly wheelMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.55, metalness: 0.45, envMapIntensity: 0.8 });
+  /** Instance colour only: PlaneGeometry has no colour attribute, and `vertexColors` would multiply by a zeroed one. */
+  private readonly lightMat = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide, fog: false, toneMapped: false });
   private readonly spotL: THREE.SpotLight;
   private readonly spotR: THREE.SpotLight;
   private readonly counts: Record<VehicleKey, number> = { sedan: 0, sport: 0, van: 0, police: 0, taxi: 0 };
@@ -919,8 +1028,9 @@ export class VehicleRenderer {
       const roof = k >= 4;
       const a = roof ? p.roof : rear ? p.tail : p.head;
       const side = k % 2 === 0 ? -1 : 1;
-      let ox = side * a.x, oz = a.z, rot = yaw, sx = a.w, sy = a.h;
-      if (rear) rot = yaw + Math.PI;
+      // Lamp quads follow the swept lamp faces of the shell (inner edge forward at the nose, backward at the tail).
+      let ox = side * a.x, oz = a.z, rot = yaw + side * a.sweep, sx = a.w, sy = a.h;
+      if (rear) rot = yaw + Math.PI - side * a.sweep;
       if (roof) {
         if (p.roofKind === 'none') { sx = 0; sy = 0; }
         else if (p.roofKind === 'sign') { ox = 0; rot = k === 4 ? yaw : yaw + Math.PI; oz = a.z * (k === 4 ? 1 : -1); }
@@ -931,12 +1041,16 @@ export class VehicleRenderer {
       this.scl.set(sx * sc, sy * sc, sc);
       this.mat.compose(this.pos, this.quat, this.scl);
       this.lights.setMatrixAt(idx, this.mat);
+      // Unlit quads sit close to the lens colour of the shell behind them (a pale headlamp, a dim red tail cluster) so
+      // they are not black boxes by day, and fade with the daylight so an unlit lens does not glow at night; the
+      // emissive push only comes with the lights.
+      const dim = 1 - 0.7 * this.nightFactor;
       if (wreck) c.setRGB(0.05, 0.05, 0.05);
-      else if (k < 2) { if (v.lightsOn) c.setRGB(1, 0.97, 0.85); else c.setRGB(0.34, 0.34, 0.3); }
+      else if (k < 2) { if (v.lightsOn) c.setRGB(1, 0.97, 0.85); else c.setRGB(0.58 * dim, 0.62 * dim, 0.64 * dim); }
       else if (rear) {
         if (braking) c.setRGB(1, 0.16, 0.1);
         else if (v.lightsOn) c.setRGB(0.85, 0.08, 0.05);
-        else c.setRGB(0.3, 0.05, 0.04);
+        else c.setRGB(0.36 * dim, 0.05 * dim, 0.045 * dim);
       } else if (p.roofKind === 'sign') {
         const glow = 0.35 + 0.65 * this.nightFactor;
         c.setRGB(glow, glow * 0.82, glow * 0.28);

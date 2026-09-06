@@ -297,8 +297,13 @@ export function torsoRings(s: number): Ring[] {
   ], s);
 }
 
-/** Arm hanging straight down, centred on x = 0 (translate to the shoulder); the sleeve ends just above the elbow. */
-export function armRings(s: number): Ring[] {
+/**
+ * Arm hanging straight down, centred on x = 0 (translate to the shoulder); the sleeve ends just above the elbow.
+ * `side` is the sign of the shoulder x the arm goes to: the deltoid leans inward and the top ring sits inside the
+ * torso's trapezius slope, so the sleeve top is buried in the shoulder instead of standing proud of it.
+ */
+export function armRings(s: number, side = 1): Ring[] {
+  const inw = -side;
   return scaled([
     { y: 0.79, rx: 0.035, rz: 0.025 },
     { y: 0.84, rx: 0.046, rz: 0.03 },
@@ -308,10 +313,61 @@ export function armRings(s: number): Ring[] {
     { y: 1.14, rx: 0.05, rz: 0.05 },
     { y: 1.25, rx: 0.052, rz: 0.05 },
     { y: 1.255, rx: 0.06, rz: 0.058 },
-    { y: 1.33, rx: 0.068, rz: 0.066 },
-    { y: 1.385, rx: 0.07, rz: 0.068 },
-    { y: 1.415, rx: 0.048, rz: 0.05 },
+    { y: 1.33, rx: 0.068, rz: 0.066, x: inw * 0.004 },
+    { y: 1.37, rx: 0.066, rz: 0.064, x: inw * 0.016 },
+    { y: 1.40, rx: 0.05, rz: 0.05, x: inw * 0.04 },
   ], s);
+}
+
+/**
+ * Mitten hand hanging from the wrist ring: a flattened ellipsoid (thin across x, long down, palm facing the thigh)
+ * with a thumb bud on the inner side. Origin at the wrist (0, 0.79, 0) of an arm going to shoulder side `side`.
+ */
+export function hand(s: number, side: number, segs: number, rings: number): THREE.BufferGeometry {
+  const wrist = 0.79 * s;
+  const palm = blob(0.028 * s, 0.062 * s, 0.04 * s, segs, rings);
+  palm.rotateY(side * 0.25);
+  palm.translate(-side * 0.004 * s, wrist - 0.05 * s, 0.004 * s);
+  const thumb = blob(0.012 * s, 0.026 * s, 0.014 * s, Math.max(4, segs - 2), Math.max(3, rings - 2));
+  thumb.rotateZ(-side * 0.6);
+  thumb.translate(-side * 0.032 * s, wrist - 0.03 * s, 0.026 * s);
+  return fuseBare([palm, thumb]);
+}
+
+/**
+ * Ambient-occlusion bake for a standing figure scaled by `s`: multiplies existing vertex colours down in the crevices
+ * a real body shades itself in — under the armpits, between the thighs, under the chin, inside the collar and along
+ * the hair line. Positions are in figure space (feet at y = 0, facing +z), so call it before a part is re-pivoted.
+ */
+export function bakeAO(g: THREE.BufferGeometry, s: number): THREE.BufferGeometry {
+  const pos = g.attributes.position as THREE.BufferAttribute;
+  const col = g.attributes.color as THREE.BufferAttribute;
+  const P = PROFILE;
+  const cy = P.headCY * s, rx = P.headRX * s, ry = P.headRY * s, rz = P.headRZ * s;
+  const pocket = (x: number, y: number, z: number, px: number, py: number, pz: number, r: number, k: number): number => {
+    const dx = x - px, dy = y - py, dz = z - pz;
+    return 1 - k * (1 - smoothstep(0, r, Math.sqrt(dx * dx + dy * dy + dz * dz)));
+  };
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+    let ao = 1;
+    ao *= pocket(x, y, z, -0.215 * s, 1.33 * s, 0, 0.11 * s, 0.24); // armpits
+    ao *= pocket(x, y, z, 0.215 * s, 1.33 * s, 0, 0.11 * s, 0.24);
+    ao *= pocket(x, y, z, 0, 0.76 * s, 0, 0.13 * s, 0.22); // between the thighs
+    ao *= pocket(x, y, z, 0, 1.51 * s, 0.02 * s, 0.1 * s, 0.22); // under the chin
+    ao *= 1 - 0.14 * smoothstep(1.44 * s, 1.5 * s, y) * (1 - smoothstep(1.52 * s, 1.58 * s, y)); // inside the collar
+    // Hair line: skin just below the cap edge (fringe over the brow, deeper at the temples and the nape).
+    const nx = x / rx, ny = (y - cy) / ry, nz = z / rz;
+    const rr = Math.sqrt(nx * nx + ny * ny + nz * nz);
+    if (rr > 0.9 && rr < 1.06 && Math.abs(y - cy) < ry * 1.2) {
+      const a = Math.atan2(nx, nz), f = (1 - Math.cos(a)) * 0.5;
+      const edge = f < 0.5 ? 1.1 + 0.6 * (f * 2) : 1.7 + 0.55 * ((f - 0.5) * 2);
+      const th = Math.acos(clamp(ny / Math.max(1e-6, rr), -1, 1));
+      ao *= 1 - 0.18 * (1 - smoothstep(edge - 0.02, edge + 0.32, th));
+    }
+    if (ao < 1) col.setXYZ(i, col.getX(i) * ao, col.getY(i) * ao, col.getZ(i) * ao);
+  }
+  return g;
 }
 
 /** Leg centred on x = 0 (translate to the hip): thigh, knee pinch, calf swell, ankle. */
@@ -343,7 +399,7 @@ export function headParts(s: number, segs: number, rings: number, hairRows: numb
   emit('skin', skull(cy, rx, ry, rz, segs, rings, jaw));
   // Ears.
   for (const side of [-1, 1]) {
-    const ear = blob(rx * 0.16, ry * 0.24, rz * 0.18, segs > 10 ? 6 : 4, segs > 10 ? 5 : 3);
+    const ear = blob(rx * 0.16, ry * 0.24, rz * 0.18, segs > 12 ? 6 : 4, segs > 12 ? 5 : 3);
     ear.translate(side * rx * 0.97, cy - ry * 0.02, -rz * 0.05);
     emit('skin', ear);
   }
@@ -436,7 +492,8 @@ function playerGeometry(): THREE.BufferGeometry {
     parts.push(skin(paint(g, hex), HEAD, HEAD, 0, 0));
   });
   for (const side of [-1, 1]) {
-    const arm = paintFn(tube(armRings(1), RADIAL, false, true), (_x, y, _z, out) => {
+    // Arm tube plus the mitten hand at the wrist; the hand rides the elbow bone through the y-threshold weights.
+    const arm = paintFn(fuse([tube(armRings(1, side), RADIAL, false, false), hand(1, side, 8, 6)]), (_x, y, _z, out) => {
       if (y >= P.sleeveY) out.setHex(SLEEVE).multiplyScalar(0.88 + 0.12 * smoothstep(P.sleeveY, 1.36, y));
       else out.setHex(SKIN);
     });
@@ -451,7 +508,7 @@ function playerGeometry(): THREE.BufferGeometry {
     foot.translate(side * P.hipX, 0, 0);
     parts.push(skin(foot, side < 0 ? KNEE_L : KNEE_R, side < 0 ? KNEE_L : KNEE_R, 0, 0));
   }
-  return fuse(parts);
+  return bakeAO(fuse(parts), 1);
 }
 
 export class PlayerRenderer {
@@ -467,6 +524,13 @@ export class PlayerRenderer {
   private swing = 0;
   private airPose = 0;
   private time = 0;
+  // Idle head look-around: a new target yaw/pitch every few seconds, eased toward.
+  private lookTimer = 2.5;
+  private lookTargetY = 0;
+  private lookTargetX = 0;
+  private lookY = 0;
+  private lookX = 0;
+  private lookSeed = 0;
 
   constructor(scene: THREE.Scene) {
     this.scene = scene;
@@ -534,6 +598,8 @@ export class PlayerRenderer {
     if (!p.alive) {
       g.rotation.x = -Math.PI / 2;
       g.position.y += 0.25;
+      this.time = 0; // no idle weight shift or glances on the ground
+      this.lookY = 0; this.lookX = 0;
       this.setPose(0, 0, 0);
       return;
     }
@@ -541,12 +607,34 @@ export class PlayerRenderer {
     const targetAmp = p.moving ? (p.sprinting ? 0.95 : 0.6) : 0;
     this.swing = damp(this.swing, targetAmp, 10, dt);
     this.airPose = damp(this.airPose, p.grounded ? 0 : 1, 12, dt);
+    this.updateLook(dt, this.swing);
     this.setPose(p.animPhase, this.swing, this.airPose);
+  }
+
+  /** Idle head look-around: every ~4 s pick a new glance (yaw up to +-0.25 rad, a little pitch), ease there. */
+  private updateLook(dt: number, amp: number): void {
+    this.lookTimer -= dt;
+    if (this.lookTimer <= 0) {
+      this.lookSeed = (this.lookSeed * 1103515245 + 12345) % 2147483648;
+      const r1 = this.lookSeed / 2147483648;
+      this.lookSeed = (this.lookSeed * 1103515245 + 12345) % 2147483648;
+      const r2 = this.lookSeed / 2147483648;
+      // Glance left, right or back to centre; centre more often so it reads as looking around, not scanning.
+      this.lookTargetY = r1 < 0.25 ? 0 : (r1 - 0.625) * 0.667;
+      this.lookTargetX = (r2 - 0.5) * 0.12;
+      this.lookTimer = 3 + r2 * 2.5;
+    }
+    // Walking straightens the gaze; the ease is quick enough to read as a glance, slow enough not to snap.
+    const idle = 1 - Math.min(1, amp * 2);
+    this.lookY = damp(this.lookY, this.lookTargetY * idle, 4, dt);
+    this.lookX = damp(this.lookX, this.lookTargetX * idle, 4, dt);
   }
 
   /**
    * Walk cycle. Hips swing the legs (sin), the knee folds while the leg swings forward (foot off the ground) and is
-   * straight through the stance; arms counter-swing with a permanent elbow bend that deepens on the forward reach.
+   * straight through the stance; arms counter-swing from a relaxed rest pose (elbows soft, hands by the thighs).
+   * Idle: weight shifts from hip to hip with the spine countering so the head stays put, the chest breathes, the
+   * arms drift a touch and the head glances around.
    */
   private setPose(phase: number, amp: number, air: number): void {
     const B = this.bones;
@@ -554,30 +642,40 @@ export class PlayerRenderer {
     const sn = Math.sin(phase), cs = Math.cos(phase);
     const s = sn * amp;
     const ground = 1 - air;
+    const idle = 1 - Math.min(1, amp * 2);
+    const t = this.time;
+    const shift = Math.sin(t * 0.7) * idle; // slow weight shift, -1..1
+    const breath = (0.5 + 0.5 * Math.sin(t * 1.8)) * idle;
     B[HIP_L].rotation.x = s * ground + 0.55 * air;
     B[HIP_R].rotation.x = -s * ground - 0.15 * air;
-    B[KNEE_L].rotation.x = (0.08 + 1.05 * Math.max(0, -cs)) * amp * ground + 0.9 * air;
-    B[KNEE_R].rotation.x = (0.08 + 1.05 * Math.max(0, cs)) * amp * ground + 0.4 * air;
-    // Arms rest slightly away from the body when still, swing opposite the legs when moving, reach up in the air.
-    const spread = 0.1 + 0.05 * (1 - Math.min(1, Math.abs(s) * 4));
-    B[SH_L].rotation.x = -s * 0.8 * ground - 2.4 * air;
-    B[SH_R].rotation.x = s * 0.8 * ground - 2.4 * air;
-    B[SH_L].rotation.z = -spread;
-    B[SH_R].rotation.z = spread;
-    B[EL_L].rotation.x = -(0.35 + 0.4 * Math.max(0, s)) * ground - 1.1 * air;
-    B[EL_R].rotation.x = -(0.35 + 0.4 * Math.max(0, -s)) * ground - 1.1 * air;
+    // The unloaded leg softens at the knee as the weight leaves it.
+    B[KNEE_L].rotation.x = (0.08 + 1.05 * Math.max(0, -cs)) * amp * ground + 0.9 * air + 0.06 * Math.max(0, shift);
+    B[KNEE_R].rotation.x = (0.08 + 1.05 * Math.max(0, cs)) * amp * ground + 0.4 * air + 0.06 * Math.max(0, -shift);
+    // Arms: rest slightly forward of the hip line with a soft elbow, hang close to the body, swing opposite the legs
+    // when moving, reach up in the air; a slow sway while idle keeps them from freezing.
+    const swayA = 0.03 * Math.sin(t * 0.9 + 0.6) * idle;
+    const spread = 0.04 + 0.02 * Math.min(1, Math.abs(s) * 4) + 0.012 * breath;
+    B[SH_L].rotation.x = (-0.05 - s * 0.8 + swayA) * ground - 2.4 * air;
+    B[SH_R].rotation.x = (-0.05 + s * 0.8 - swayA) * ground - 2.4 * air;
+    B[SH_L].rotation.z = -spread - 0.01 * shift;
+    B[SH_R].rotation.z = spread - 0.01 * shift;
+    B[EL_L].rotation.x = -(0.25 + 0.45 * Math.max(0, s) + 0.03 * breath) * ground - 1.1 * air;
+    B[EL_R].rotation.x = -(0.25 + 0.45 * Math.max(0, -s) + 0.03 * breath) * ground - 1.1 * air;
     // Hips tilt and twist with the stride, shoulders counter-twist; a bounce at twice the stride frequency.
+    // Idle weight shift: the pelvis tips and slides over the loaded leg, the spine leans back the other way.
     const hips = B[HIPS], spine = B[SPINE];
-    hips.rotation.z = 0.05 * s;
+    hips.rotation.z = 0.05 * s + 0.035 * shift;
     hips.rotation.y = -0.07 * s;
-    hips.position.y = P.hipY + 0.025 * amp * (0.5 - 0.5 * Math.cos(phase * 2));
+    hips.position.x = 0.02 * shift;
+    hips.position.y = P.hipY + 0.025 * amp * (0.5 - 0.5 * Math.cos(phase * 2)) - 0.004 * Math.abs(shift);
     spine.rotation.y = 0.14 * s;
-    spine.rotation.z = -0.04 * s;
+    spine.rotation.z = -0.04 * s - 0.03 * shift;
     spine.rotation.x = 0.08 * Math.abs(s) + 0.12 * air;
-    // Idle breathing: the chest swells a touch and the head lifts with it.
-    const breath = (0.5 + 0.5 * Math.sin(this.time * 1.8)) * (1 - Math.min(1, amp * 2));
+    // Idle breathing: the chest swells a touch and the head lifts with it; glances add yaw and a little pitch.
     spine.scale.set(1 + 0.012 * breath, 1 + 0.005 * breath, 1 + 0.022 * breath);
-    B[HEAD].rotation.x = -0.05 * Math.abs(s) - 0.02 * breath;
+    B[HEAD].rotation.x = -0.05 * Math.abs(s) - 0.02 * breath + this.lookX;
+    B[HEAD].rotation.y = this.lookY;
+    B[HEAD].rotation.z = -0.012 * shift + 0.08 * this.lookY;
   }
 
   dispose(): void {
