@@ -58,7 +58,7 @@ npm run shot -- "http://127.0.0.1:8080/?autostart=1&hour=19" out.png   # headles
 
 Hata ayıklama için URL seçenekleri: `?autostart=1` (menüyü atla), `?hour=19`, `?quality=low|high`, `?seed=7`,
 `?stars=2` (aranma seviyesi), `?nearcar=1` (en yakın park halindeki arabanın yanında başla), `?debug=1`,
-`?noadapt=1` (dinamik çözünürlüğü kapat). Konsolda `__GAME_DEBUG__()` kare istatistiklerini, `__GAME_SCENE__()`
+`?noadapt=1` (dinamik çözünürlüğü kapat), `?ao=0|1|2` (ekran uzayı ortam örtüşmesi kapalı/açık/tampon). Konsolda `__GAME_DEBUG__()` kare istatistiklerini, `__GAME_SCENE__()`
 mesh başına üçgen dökümünü verir.
 `/rendertest?hour=19` sayfası şehir render katmanını motor olmadan gösterir; `&view=plaza|beach|spawn|neon|fx`
 veya `&cam=x,y,z&look=x,y,z` ile kamerayı serbestçe konumlandırabilirsiniz.

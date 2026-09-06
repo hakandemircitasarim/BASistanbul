@@ -4,6 +4,7 @@ import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
+import { GTAOPass } from 'three/examples/jsm/postprocessing/GTAOPass.js';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { FXAAShader } from 'three/examples/jsm/shaders/FXAAShader.js';
 import type { Settings } from '../state/GameStore';
@@ -20,6 +21,8 @@ export const CAMERA_FAR = 900;
  * around 1.5-2.5, so by day only the sun disc (>= 4) clears 3.0; at night the emissives (2.0-2.6) clear 1.4.
  */
 export const POSTFX = { bloomStrength: 0.9, bloomRadius: 0.45, bloomThreshold: 1.4, bloomThresholdDay: 3.0, dayScale: 0.12, vignette: 0.9, saturation: 0.92, contrast: 1.0, msaaSamples: 4,
+  // Ambient occlusion (metres): sized for street furniture, kerbs and building bases.
+  aoIntensity: 1.0, aoRadius: 3.2, aoThickness: 1.0, aoSamples: 12,
   // Split tone: cool blue-violet shadows, warm highlights. Almost off by day (0.06); strongest around dusk (0.32).
   shadowTint: [0.80, 0.86, 1.15] as const, highlightTint: [1.05, 1.0, 0.93] as const, tintDay: 0.06, tintDusk: 0.32,
   grain: 0.03 } as const;
@@ -107,8 +110,12 @@ export class Renderer {
   private warmup = 0;
   private composer: EffectComposer | null = null;
   private bloom: UnrealBloomPass | null = null;
+  private gtao: GTAOPass | null = null;
+  /** ?ao=2: show the raw occlusion buffer instead of the shaded frame. */
+  aoDebug = false;
   private grade: ShaderPass | null = null;
   private fxaa: ShaderPass | null = null;
+  private aoWanted = false;
   private postEnabled = false;
   /** Off for screenshots/benchmarks (?noadapt=1) so the buffer size stays predictable. */
   adaptive = true;
@@ -157,6 +164,7 @@ export class Renderer {
       const r = this.gl.getPixelRatio();
       this.composer.setPixelRatio(r);
       this.composer.setSize(w, h);
+      if (this.gtao) this.gtao.setSize(Math.max(1, Math.floor(w * r)), Math.max(1, Math.floor(h * r)));
       const pw = Math.max(1, Math.floor(w * r)), ph = Math.max(1, Math.floor(h * r));
       if (this.fxaa) (this.fxaa.material.uniforms.resolution.value as THREE.Vector2).set(1 / pw, 1 / ph);
       if (this.grade) (this.grade.material.uniforms.uResolution.value as THREE.Vector2).set(pw, ph);
@@ -185,6 +193,18 @@ export class Renderer {
     rt.texture.name = 'EffectComposer.rt1';
     const composer = new EffectComposer(this.gl, rt);
     composer.addPass(new RenderPass(this.scene, this.camera));
+    // Ground-truth ambient occlusion straight after the colour pass: contact darkening where walls meet pavement,
+    // under cars, inside window reveals. It renders its own normal/depth pass over the scene, so it is the one post
+    // effect with a real geometry cost (+~35 draw calls, 2x triangles), so it is opt-in (Settings.ao). The pass must
+    // be built at the drawing-buffer size and resized with the composer or its depth reads are meaningless.
+    const gtao = new GTAOPass(this.scene, this.camera, pw, ph);
+    gtao.output = GTAOPass.OUTPUT.Default;
+    gtao.blendIntensity = POSTFX.aoIntensity;
+    gtao.updateGtaoMaterial({ radius: POSTFX.aoRadius, distanceExponent: 1, thickness: POSTFX.aoThickness, scale: 1, samples: POSTFX.aoSamples, screenSpaceRadius: false });
+    gtao.updatePdMaterial({ lumaPhi: 10, depthPhi: 2, normalPhi: 3, radius: 4, rings: 2, samples: 8 });
+    gtao.enabled = this.aoWanted;
+    composer.addPass(gtao);
+    this.gtao = gtao;
     this.bloom = new UnrealBloomPass(size, POSTFX.bloomStrength, POSTFX.bloomRadius, POSTFX.bloomThreshold);
     composer.addPass(this.bloom);
     composer.addPass(new OutputPass());
@@ -228,6 +248,11 @@ export class Renderer {
     this.baseRatio = Math.min(dpr, s.quality === 'high' ? 1.5 : 1);
     this.applyPixelRatio();
     this.postEnabled = s.quality === 'high';
+    this.aoWanted = s.quality === 'high' && s.ao;
+    if (this.gtao) {
+      this.gtao.enabled = this.aoWanted;
+      this.gtao.output = this.aoDebug ? GTAOPass.OUTPUT.AO : GTAOPass.OUTPUT.Default;
+    }
     if (this.postEnabled) this.ensureComposer();
     const shadows = s.quality === 'high' && s.shadows;
     if (this.gl.shadowMap.enabled !== shadows) {
@@ -301,6 +326,7 @@ export class Renderer {
 
   disposeComposer(): void {
     if (!this.composer) return;
+    if (this.gtao) { this.gtao.dispose(); this.gtao = null; }
     this.composer.dispose();
     this.composer = null;
     this.bloom = null;

@@ -43,7 +43,7 @@ import { AudioSystem } from './audio/AudioSystem';
 /** Debug stats extended for the screenshot harness (player speed / vehicle / wanted / clock / camera yaw). */
 export interface EngineDebugStats extends DebugStats { speed: number; inVehicle: boolean; wanted: number; hour: number; camYaw: number; resScale: number }
 
-export interface EngineOptions { autostart?: boolean; hour?: number; quality?: 'low' | 'high'; seed?: number; debug?: boolean; stars?: number /* ?stars=2: debug wanted level at newGame */; nearCar?: boolean /* ?nearcar=1: spawn beside the nearest parked car (harness/debug) */; noAdapt?: boolean /* ?noadapt=1: fixed drawing-buffer scale */ }
+export interface EngineOptions { autostart?: boolean; hour?: number; quality?: 'low' | 'high'; seed?: number; debug?: boolean; stars?: number /* ?stars=2: debug wanted level at newGame */; nearCar?: boolean /* ?nearcar=1: spawn beside the nearest parked car (harness/debug) */; noAdapt?: boolean /* ?noadapt=1: fixed drawing-buffer scale */; ao?: 0 | 1 | 2 /* ?ao=0 off, 1 on, 2 show the occlusion buffer (debug) */ }
 
 export function parseEngineOptions(search: string): EngineOptions {
   const p = new URLSearchParams(search);
@@ -61,6 +61,8 @@ export function parseEngineOptions(search: string): EngineOptions {
   if (p.has('stars') && isFinite(stars)) o.stars = Math.max(0, Math.min(5, Math.floor(stars)));
   if (p.has('nearcar')) o.nearCar = flag('nearcar');
   if (p.has('noadapt')) o.noAdapt = flag('noadapt');
+  const ao = Number(p.get('ao'));
+  if (p.has('ao') && (ao === 0 || ao === 1 || ao === 2)) o.ao = ao;
   return o;
 }
 
@@ -174,6 +176,10 @@ export class Engine {
     }
     const renderer = new Renderer(this.canvas, settings);
     if (this.options.noAdapt) renderer.adaptive = false;
+    if (this.options.ao !== undefined) {
+      renderer.aoDebug = this.options.ao === 2;
+      this.applySettings({ ao: this.options.ao !== 0 });
+    }
     this.renderer = renderer;
     this.camera = new CameraController(renderer.camera, this.world, this.input, this.ctx.settings, this.events);
     this.ctx.camera = this.camera;

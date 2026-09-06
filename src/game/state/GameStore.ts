@@ -1,7 +1,7 @@
 // Three-free, React-free HUD state store: shallow-merge setState, subscribe, notifications, persisted settings. Track P0.
 import type { GamePhase } from '../core/Types';
 
-export interface Settings { quality: 'low' | 'high'; shadows: boolean; mouseSensitivity: number /*0.5..3, default 1*/; invertY: boolean; muted: boolean; volume: number /*0..1*/; minimapRotate: boolean; showFps: boolean }
+export interface Settings { quality: 'low' | 'high'; shadows: boolean; ao: boolean /* screen-space ambient occlusion (opt-in: one extra geometry pass), high quality only */; mouseSensitivity: number /*0.5..3, default 1*/; invertY: boolean; muted: boolean; volume: number /*0..1*/; minimapRotate: boolean; showFps: boolean }
 export interface Notification { id: number; text: string; kind: 'info' | 'success' | 'danger' | 'police'; at: number }
 export interface DebugStats { fps: number; drawCalls: number; triangles: number; tickMs: number; vehicles: number; peds: number; police: number; traffic: number }
 export interface HudState {
@@ -18,7 +18,7 @@ export const SETTINGS_STORAGE_KEY = 'gta6.settings';
 export const MAX_NOTIFICATIONS = 4;
 
 export const DEFAULT_SETTINGS: Settings = {
-  quality: 'high', shadows: true, mouseSensitivity: 1, invertY: false, muted: false, volume: 0.8, minimapRotate: true, showFps: false,
+  quality: 'high', shadows: true, ao: false, mouseSensitivity: 1, invertY: false, muted: false, volume: 0.8, minimapRotate: true, showFps: false,
 };
 
 export const initialHudState: HudState = {
@@ -39,6 +39,7 @@ function sanitizeSettings(raw: unknown): Partial<Settings> {
   const r = raw as Record<string, unknown>;
   if (r.quality === 'low' || r.quality === 'high') out.quality = r.quality;
   if (typeof r.shadows === 'boolean') out.shadows = r.shadows;
+  if (typeof r.ao === 'boolean') out.ao = r.ao;
   if (typeof r.mouseSensitivity === 'number' && isFinite(r.mouseSensitivity)) out.mouseSensitivity = Math.min(3, Math.max(0.5, r.mouseSensitivity));
   if (typeof r.invertY === 'boolean') out.invertY = r.invertY;
   if (typeof r.muted === 'boolean') out.muted = r.muted;

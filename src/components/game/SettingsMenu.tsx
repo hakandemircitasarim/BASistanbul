@@ -44,6 +44,9 @@ export default function SettingsMenu({ onBack }: { onBack: () => void }) {
         <Row label="Gölgeler">
           <Switch className={SWITCH_CLASS} checked={s.shadows} onCheckedChange={(v) => engine.applySettings({ shadows: v })} />
         </Row>
+        <Row label="Ortam örtüşmesi (AO)">
+          <Switch className={SWITCH_CLASS} checked={s.ao} onCheckedChange={(v) => engine.applySettings({ ao: v })} />
+        </Row>
         <Row label="Fare hassasiyeti" hint={s.mouseSensitivity.toFixed(2)}>
           <Slider className={SLIDER_CLASS} min={0.5} max={3} step={0.05} value={[s.mouseSensitivity]} onValueChange={(v) => engine.applySettings({ mouseSensitivity: v[0] })} />
         </Row>

@@ -59,12 +59,15 @@ export default function RenderTest() {
       : named;
     const run = p.get('run') === '1';
     const fx = p.get('fx') === '1';
-    const settings: Settings = { ...DEFAULT_SETTINGS, quality, shadows: quality === 'high' };
+    const aoParam = p.get('ao');
+    const settings: Settings = { ...DEFAULT_SETTINGS, quality, shadows: quality === 'high', ao: aoParam !== '0' };
     const errors: string[] = [];
     const onError = (e: ErrorEvent): void => { errors.push(e.message); };
     window.addEventListener('error', onError);
 
     const renderer = new Renderer(canvas, settings);
+    renderer.aoDebug = aoParam === '2';
+    renderer.applySettings(settings);
     const gen = generateCity();
     const world = new World(gen, new Random(1));
     const events = new EventBus();

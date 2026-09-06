@@ -274,7 +274,7 @@ export const BUDGET = {
 
 ### 2.11 `src/game/state/GameStore.ts` (Three-free, React-free)
 ```ts
-export interface Settings { quality: 'low' | 'high'; shadows: boolean; mouseSensitivity: number /*0.5..3, default 1*/; invertY: boolean; muted: boolean; volume: number /*0..1*/; minimapRotate: boolean; showFps: boolean }
+export interface Settings { quality: 'low' | 'high'; shadows: boolean; ao: boolean /* screen-space AO, opt-in, high only */; mouseSensitivity: number /*0.5..3, default 1*/; invertY: boolean; muted: boolean; volume: number /*0..1*/; minimapRotate: boolean; showFps: boolean }
 export interface Notification { id: number; text: string; kind: 'info' | 'success' | 'danger' | 'police'; at: number }
 export interface DebugStats { fps: number; drawCalls: number; triangles: number; tickMs: number; vehicles: number; peds: number; police: number; traffic: number }
 export interface HudState {
