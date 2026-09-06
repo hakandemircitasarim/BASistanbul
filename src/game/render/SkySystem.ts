@@ -207,8 +207,8 @@ export class SkySystem {
     const sc = this.sun.shadow.camera;
     // The light sits 220 m from the box centre: a tight near/far keeps depth precision for contact-hugging shadows.
     sc.left = -half; sc.right = half; sc.top = half; sc.bottom = -half; sc.near = 60; sc.far = 420;
-    this.sun.shadow.bias = -0.0003;
-    this.sun.shadow.normalBias = 0.05;
+    this.sun.shadow.bias = -0.0006;
+    this.sun.shadow.normalBias = 0.16;
     scene.add(this.sun);
     scene.add(this.sun.target);
     this.hemi = new THREE.HemisphereLight(0x8fb4e8, 0x9a8a78, 1);
