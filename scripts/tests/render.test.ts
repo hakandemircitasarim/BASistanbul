@@ -192,7 +192,7 @@ test('SkySystem: SKY_KEYS ascend in hour, carry fill/ground/fogDensity and hit t
   for (let i = 1; i < SKY_KEYS.length; i++) expect(SKY_KEYS[i].hour > SKY_KEYS[i - 1].hour, 'keys ascend');
   const k = SKY_KEYS.find((s) => s.hour === 19);
   expect(k !== undefined && k.horizon === 0xff8a4a && k.top === 0x363284, 'sunset horizon #ff8a4a / top #363284');
-  expect(k !== undefined && k.fill === 0x554a8c && k.sun === 0xff8a48, 'sunset: orange key against a violet fill');
+  expect(k !== undefined && k.fill === 0x4a5aa0 && k.sun === 0xff8a48, 'sunset: orange key against a cool blue fill');
   for (const s of SKY_KEYS) {
     expect(s.fogDensity >= 0.001 && s.fogDensity <= 0.006, `fog density sane at ${s.hour} (${s.fogDensity})`);
     expect(s.fill !== s.ground, `fill and ground differ at ${s.hour}`);
