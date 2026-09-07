@@ -2,11 +2,12 @@
 // light quads, contact shadows, player headlight spotlights. Track C.
 //
 // Every body is merged ONCE at construction: one smooth lofted shell (a side silhouette and a plan curve sampled at
-// ~14 stations x 18 ring points, with duplicated rings for the belt and drip-rail creases) whose glass, lamps and
-// valances are coloured regions of the same surface, plus a few small parts (pillars, mirrors, handles, grille, plate,
-// arches). Every vertex carries a base colour and a `paintMix` weight, and the patched Physical shader blends the
-// per-instance paint only where paintMix > 0, so glass stays dark and lamps stay red on a bright yellow taxi while the
-// whole spec still costs one draw call.
+// ~20 stations x 28 ring points, with duplicated rings for the belt and drip-rail creases) whose glass, gaskets, lamps
+// and valances are coloured regions of the same surface, plus a few small parts (pillars, mirrors, handles, grille,
+// plates, arches, exhaust). Every vertex carries a base colour and a `paintMix` weight, and the patched Physical shader
+// blends the per-instance paint only where paintMix > 0, so glass stays dark and lamps stay red on a bright yellow taxi
+// while the whole spec still costs one draw call. `parkedShellGeometry` is the same loft at a coarser ring and fewer
+// stations for the static parked cars of the lots (CityRendererProps).
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
@@ -26,7 +27,13 @@ export const VEHICLE_RENDER = {
   cullDist: 260, clearance: 0.30, wheelRadius: 0.33, wheelWidth: 0.24, lightsPerVehicle: 6, wheelsPerVehicle: 4,
   /** Past this the lathed wheels (~320 triangles each) are a few pixels inside a dark arch; they are simply not written. */
   wheelDist: 110,
-  headlightIntensity: 90, headlightDistance: 50, headlightAngle: 0.5, headlightPenumbra: 0.45, sirenHz: 4,
+  /** Beyond this distance a vehicle is drawn as its parked-shell LOD (baked wheel discs, no shadow-map pass). */
+  bodyLodDist: 75,
+  /**
+   * Player headlights: physically-decaying spots (decay 2). 45 cd puts a readable pool on the road 5-10 m ahead and
+   * falls to a few percent on a facade 25 m away; the old 90 cd / decay 1.2 pair whited out every shopfront it faced.
+   */
+  headlightIntensity: 45, headlightDistance: 35, headlightAngle: 0.5, headlightPenumbra: 0.45, headlightDecay: 2, sirenHz: 4,
   /** Body pitch (dive/squat) and roll (lean) limits in radians, and how hard longAccel / yawRate push them. */
   pitchGain: 0.010, pitchMax: 0.036, rollGain: 0.0035, rollMax: 0.055,
   shadowLift: 0.045,
@@ -45,12 +52,19 @@ const GLASS_DEEP = 0x10161f;
 const CHROME = 0x9aa2ac;
 const DARK = 0x33373d;
 const BLACK = 0x1b1d20;
+/** Rubber gasket / frit band around the glass and the lamp bezels: a hair off black so the clearcoat still catches. */
+const SEAL = 0x15171a;
+const BEZEL = 0x1e2024;
 const LAMP = 0x97a5b0;
 const LAMP_LENS = 0xeef3f2;
 const TAIL = 0x8c1a12;
 const TAIL_LENS = 0xe0503c;
 const POLICE_BLUE = 0x1638b4;
 const SIGN = 0xf6edd2;
+/** Number plates: a muted warm grey-white in a dark frame, not a bright cream rectangle. */
+const PLATE = 0xd8d2c0;
+const PLATE_FRAME = 0x2a2c30;
+const EXHAUST = 0x3a3d42;
 
 /** A box deformed into a frustum: independent z / half-width / y for the (bottom, top) x (back, front) corners. */
 interface PrismDef {
@@ -154,6 +168,16 @@ function decorate(src: THREE.BufferGeometry, hex: number, paint: number): THREE.
   return g;
 }
 
+/** Scales the baked colour of every vertex by `k(x, y, z)` (per-part shading such as a sooty exhaust tip or a rim disc). */
+function shade(g: THREE.BufferGeometry, k: (x: number, y: number, z: number) => number): THREE.BufferGeometry {
+  const pos = g.attributes.position, col = g.attributes.color;
+  for (let i = 0; i < pos.count; i++) {
+    const f = k(pos.getX(i), pos.getY(i), pos.getZ(i));
+    col.setXYZ(i, col.getX(i) * f, col.getY(i) * f, col.getZ(i) * f);
+  }
+  return g;
+}
+
 /** Simple axis-aligned block helper (constant width, flat top/bottom). */
 function block(z0: number, z1: number, hw: number, y0: number, y1: number, col: number, paint: number, xc = 0): PrismDef {
   return { bz0: z0, bz1: z1, bw0: hw, bw1: hw, by0: y0, tz0: z0, tz1: z1, tw0: hw, tw1: hw, ty0: y1, col, paint, xc };
@@ -184,10 +208,29 @@ function shutLine(out: PrismDef[], z: number, bx: number, y0: number, tx: number
   });
 }
 
-/** Rear plate recess and a chrome exhaust stub under the bumper. */
-function rearDetails(out: PrismDef[], zFace: number, c: number, plateY: number, exhaustX: number): void {
-  out.push({ ...block(zFace - 0.012, zFace + 0.06, 0.19, plateY, plateY + 0.11, SIGN, 0), plain: true });
-  out.push({ ...block(zFace - 0.05, zFace + 0.16, 0.028, c - 0.02, c + 0.04, CHROME, 0, exhaustX), plain: true });
+/**
+ * Number plate: a muted plate face 6 mm proud of a dark frame that overhangs it by 2 cm all round, so the plate reads
+ * as a bordered rectangle set into the bumper. The face is toward +z when `zFace > zBack`.
+ */
+function plate(out: PrismDef[], zBack: number, zFace: number, hw: number, y0: number, y1: number): void {
+  const d = zFace > zBack ? 1 : -1;
+  const zFrame = zFace - d * 0.006;
+  out.push({ ...block(Math.min(zBack, zFrame), Math.max(zBack, zFrame), hw + 0.025, y0 - 0.02, y1 + 0.02, PLATE_FRAME, 0), plain: true });
+  out.push({ ...block(Math.min(zBack, zFace), Math.max(zBack, zFace), hw, y0, y1, PLATE, 0), plain: true });
+}
+
+/** Rear plate recess; the exhaust tube itself is lathed in `bodyGeometry` from the profile's `exhaust` anchor. */
+function rearDetails(out: PrismDef[], zFace: number, plateY: number): void {
+  plate(out, zFace + 0.06, zFace - 0.012, 0.19, plateY, plateY + 0.11);
+}
+
+/** Exhaust: a 2 cm dark tube under the bumper (6-sided lathe, closed), its rearmost 2 cm sootier. */
+function exhaustGeometry(x: number, y: number, zFace: number): THREE.BufferGeometry {
+  const len = 0.19;
+  const g = new THREE.CylinderGeometry(0.021, 0.021, len, 6, 1, false);
+  g.rotateX(Math.PI / 2); // axis y -> z
+  g.translate(x, y, zFace + len / 2 - 0.07);
+  return shade(decorate(g, EXHAUST, 0), (_x, _y, z) => (z < zFace - 0.05 ? 0.45 : 1));
 }
 
 /**
@@ -227,6 +270,10 @@ const WHEEL_INSET = -0.01;
 const PLAN = 0.947;
 const PILLAR_W = 0.09;
 const PILLAR_PROUD = 0.012;
+/** Glass sits this far inside the pillars and sills (the gasket bands slope in to meet it). */
+const GLASS_INSET = 0.02;
+/** Width of the rubber gasket band at the belt and drip rail, and of the frit band at the screen ends. */
+const SEAL_W = 0.03;
 
 // ---------------------------------------------------------------------------------------------- lofted shell
 
@@ -234,23 +281,34 @@ const PILLAR_PROUD = 0.012;
 interface Tone { col: number; paint: number }
 const T = {
   paint: { col: PAINT, paint: 1 }, dark: { col: PAINT_DARK, paint: 1 }, shade: { col: PAINT_SHADE, paint: 1 },
-  glass: { col: GLASS, paint: 0.15 }, black: { col: BLACK, paint: 0 }, grey: { col: DARK, paint: 0 },
+  glass: { col: GLASS, paint: 0.15 }, seal: { col: SEAL, paint: 0 }, bezel: { col: BEZEL, paint: 0 }, black: { col: BLACK, paint: 0 }, grey: { col: DARK, paint: 0 },
   tail: { col: TAIL, paint: 0 }, tailLens: { col: TAIL_LENS, paint: 0 }, lamp: { col: LAMP, paint: 0 }, lampLens: { col: LAMP_LENS, paint: 0 },
 } as const satisfies Record<string, Tone>;
 
 /**
- * Tones of the five cell bands of the shell segment that starts at a station and runs to the next one: `sill` (underside
- * and rocker), `low` (sill to lower flank), `flank` (lower flank to belt: doors, lamps), `side` (belt to roof edge: glass
- * or pillars) and `top` (roof edge to centre line: bonnet, screens, roof, boot). `lens` recolours the flank-band vertices
- * on one end station so a lamp cluster gets a lighter inner lens.
+ * Tones of the cell bands of the shell segment that starts at a station and runs to the next one: `sill` (underside and
+ * rocker), `low` (sill to lower flank), `flank` (the middle of the flank: doors, lamp lenses), `side` (belt to roof edge:
+ * glass or pillars) and `top` (roof edge to centre line: bonnet, screens, roof, boot). `bezel` colours the two flank
+ * cells above and below the lens cell (lamp clusters frame their lens with it; body segments leave it undefined = flank),
+ * `seal` the gasket bands at the belt and drip rail (glass segments set it black; undefined = side). `lens` recolours the
+ * lens-cell vertices on one end station so a lamp cluster gets a lighter inner lens.
  */
-interface SegTone { sill: Tone; low: Tone; flank: Tone; side: Tone; top: Tone; lens?: { at: 0 | 1; tone: Tone } }
+interface SegTone { sill: Tone; low: Tone; flank: Tone; side: Tone; top: Tone; bezel?: Tone; seal?: Tone; lens?: { at: 0 | 1; tone: Tone } }
 const BODY: SegTone = { sill: T.paint, low: T.paint, flank: T.paint, side: T.paint, top: T.paint };
+/** Door-glass segment: glass between black gaskets. */
+const GLAZED: SegTone = { ...BODY, side: T.glass, seal: T.seal };
+/** Screen segments (top band glass) and the 3 cm frit bands at their ends. */
+const SCREEN: SegTone = { ...BODY, top: T.glass };
+const SCREEN_EDGE: SegTone = { ...BODY, top: T.seal };
+const GLAZED_SCREEN: SegTone = { ...GLAZED, top: T.glass };
+const GLAZED_SCREEN_EDGE: SegTone = { ...GLAZED, top: T.seal };
+/** B pillar: black, flush with the (inset) glass on both sides of it. */
+const B_PILLAR: SegTone = { ...BODY, side: T.black, seal: T.seal };
 
 /**
- * One cross-section of the shell at depth z. The 18-point ring runs bottom centre -> sill -> lower flank -> belt (twice,
- * for the crease) -> tumblehome mid -> roof edge (twice, drip rail crease) -> top centre and back down the other side.
- * End faces reuse the neighbouring ring scaled about (0, shrinkY) by `shrink` (0 collapses it to the centre point).
+ * One cross-section of the shell at depth z: floor, sill, lower flank, belt, roof edge and centre line, from which the
+ * ring layout derives its points. End faces reuse the neighbouring ring scaled about (0, shrinkY) by `shrink`
+ * (0 collapses it to the centre point).
  */
 interface Station {
   z: number;
@@ -260,13 +318,18 @@ interface Station {
   yTop: number; wTop: number;
   /** The roof edge sits `edge` below yTop; the centre line is lifted by `crown`; `bulge` pushes the tumblehome mid outward. */
   edge: number; crown: number; bulge: number;
+  /** Glass inset: the side points between the belt and drip-rail gaskets sit this far inside the tumblehome line. */
+  inset: number;
+  /** Screen inset: the top-band points (crown) sit this far lower, so a screen steps down from the roof it meets. */
+  topInset: number;
   shrink?: number; shrinkY?: number;
   seg: SegTone;
+  /** Kept by the coarse parked-car shell (`parkedShellGeometry`). */
+  lod?: boolean;
 }
-const RING = 18;
 
 interface StationOpts {
-  yFloor?: number; wFloor?: number; yLow?: number; wLow?: number; edge?: number; crown?: number; bulge?: number; seg?: SegTone;
+  yFloor?: number; wFloor?: number; yLow?: number; wLow?: number; edge?: number; crown?: number; bulge?: number; inset?: number; topInset?: number; seg?: SegTone; lod?: boolean;
 }
 
 /** A full ring; defaults: floor at `c`, floor 5 cm narrower than the belt, lower-flank point 42 % of the way up. */
@@ -274,69 +337,143 @@ function station(z: number, c: number, yTop: number, wTop: number, yBelt: number
   const yFloor = o.yFloor ?? c;
   return {
     z, yFloor, wFloor: o.wFloor ?? wBelt - 0.05, yLow: o.yLow ?? yFloor + (yBelt - yFloor) * 0.42, wLow: o.wLow ?? wBelt - 0.012,
-    yBelt, wBelt, yTop, wTop, edge: o.edge ?? 0.04, crown: o.crown ?? 0.02, bulge: o.bulge ?? 0.02, seg: o.seg ?? BODY,
+    yBelt, wBelt, yTop, wTop, edge: o.edge ?? 0.04, crown: o.crown ?? 0.02, bulge: o.bulge ?? 0.02, inset: o.inset ?? 0, topInset: o.topInset ?? 0,
+    seg: o.seg ?? BODY, lod: o.lod,
   };
 }
 
 /** End-face ring: `base` scaled by k about (0, yC) at depth z. */
-function shrunk(base: Station, z: number, k: number, yC: number, seg: SegTone): Station {
-  return { ...base, z, shrink: k, shrinkY: yC, seg };
+function shrunk(base: Station, z: number, k: number, yC: number, seg: SegTone, lod = false): Station {
+  return { ...base, z, shrink: k, shrinkY: yC, seg, lod };
 }
 
-const ringPt = { x: 0, y: 0 };
-function ringPoint(s: Station, j: number, out: { x: number; y: number }): void {
-  let side = 1, k = j;
-  if (j > 9) { side = -1; k = RING - j; }
+/**
+ * Ring point kinds, bottom centre to top centre along one side; a layout mirrors its half across x. `belt` and `edge`
+ * appear twice for the crease (duplicated vertices, so the smooth normals stop at the belt line and the drip rail
+ * and nowhere else). `lensLo`/`lensHi` split the flank into bezel / lens / bezel cells for the lamp clusters,
+ * `sealLo`/`sealHi` bound the gasket bands, `topMid` rounds the crown of the roof, bonnet and screens.
+ */
+type PointKind = 'bottom' | 'sill' | 'lowFloor' | 'low' | 'lensLo' | 'lensHi' | 'belt' | 'sealLo' | 'mid' | 'sealHi' | 'edge' | 'topMid' | 'top';
+type Band = 'sill' | 'low' | 'bezelLo' | 'flank' | 'bezelHi' | 'sealLo' | 'side' | 'sealHi' | 'top';
+
+interface RingLayout { half: PointKind[]; ring: number; /** Band of the cell between half points k and k+1 (null = crease). */ bands: (Band | null)[] }
+
+function bandBetween(a: PointKind, b: PointKind): Band | null {
+  switch (a) {
+    case 'bottom': case 'sill': return 'sill';
+    case 'lowFloor': return 'low';
+    case 'low': return b === 'lensLo' ? 'bezelLo' : 'flank';
+    case 'lensLo': return 'flank';
+    case 'lensHi': return 'bezelHi';
+    case 'belt': return b === 'belt' ? null : b === 'sealLo' ? 'sealLo' : 'side';
+    case 'sealLo': case 'mid': return 'side';
+    case 'sealHi': return 'sealHi';
+    case 'edge': return b === 'edge' ? null : 'top';
+    default: return 'top';
+  }
+}
+
+function makeLayout(half: PointKind[]): RingLayout {
+  const bands: (Band | null)[] = [];
+  for (let k = 0; k + 1 < half.length; k++) bands.push(bandBetween(half[k], half[k + 1]));
+  return { half, ring: 2 * (half.length - 1), bands };
+}
+
+/** Full ring: 15 half points (28 around) with both creases, the lens split, the gasket bands and a rounded crown. */
+const FULL_RING = makeLayout(['bottom', 'sill', 'lowFloor', 'low', 'lensLo', 'lensHi', 'belt', 'belt', 'sealLo', 'mid', 'sealHi', 'edge', 'edge', 'topMid', 'top']);
+/** Parked-car ring: 8 half points (14 around), belt crease only, no gaskets or lens split. */
+const LOD_RING = makeLayout(['bottom', 'lowFloor', 'low', 'belt', 'belt', 'mid', 'edge', 'top']);
+
+/** Band of ring cell j (points j -> j+1) in a layout: the second half mirrors the first. */
+function cellBand(lay: RingLayout, j: number): Band | null {
+  const n = lay.half.length;
+  return lay.bands[j < n - 1 ? j : lay.ring - 1 - j];
+}
+
+/** Position of one ring point of kind `kind` on the +x side of station `s` (before shrink / mirror). */
+function pointOfKind(s: Station, kind: PointKind, out: { x: number; y: number }): void {
   let x = 0, y = 0;
-  switch (k) {
-    case 0: y = s.yFloor; break;
-    case 1: x = s.wFloor - 0.09; y = s.yFloor; break;
-    case 2: x = s.wFloor; y = s.yFloor + 0.07; break;
-    case 3: x = s.wLow; y = s.yLow; break;
-    case 4: case 5: x = s.wBelt; y = s.yBelt; break;
-    case 6: {
+  switch (kind) {
+    case 'bottom': y = s.yFloor; break;
+    case 'sill': x = s.wFloor - 0.09; y = s.yFloor; break;
+    case 'lowFloor': x = s.wFloor; y = s.yFloor + 0.07; break;
+    case 'low': x = s.wLow; y = s.yLow; break;
+    case 'lensLo': x = s.wLow + (s.wBelt - s.wLow) * 0.22; y = s.yLow + (s.yBelt - s.yLow) * 0.22; break;
+    case 'lensHi': x = s.wLow + (s.wBelt - s.wLow) * 0.78; y = s.yLow + (s.yBelt - s.yLow) * 0.78; break;
+    case 'belt': x = s.wBelt; y = s.yBelt; break;
+    case 'sealLo': case 'mid': case 'sealHi': {
+      // Along the tumblehome line from the belt to the roof edge; `n` is its outward normal.
       const ex = s.wTop, ey = s.yTop - s.edge;
       const dx = ex - s.wBelt, dy = ey - s.yBelt;
       const len = Math.max(1e-4, Math.hypot(dx, dy));
-      x = s.wBelt + dx * 0.55 + (dy / len) * s.bulge;
-      y = s.yBelt + dy * 0.55 - (dx / len) * s.bulge;
+      const ux = dx / len, uy = dy / len, nx = uy, ny = -ux;
+      const seal = Math.min(SEAL_W, len * 0.3);
+      if (kind === 'mid') {
+        const off = s.bulge - s.inset;
+        x = s.wBelt + dx * 0.55 + nx * off; y = s.yBelt + dy * 0.55 + ny * off;
+      } else if (kind === 'sealLo') {
+        x = s.wBelt + ux * seal - nx * s.inset; y = s.yBelt + uy * seal - ny * s.inset;
+      } else {
+        x = ex - ux * seal - nx * s.inset; y = ey - uy * seal - ny * s.inset;
+      }
       break;
     }
-    case 7: case 8: x = s.wTop; y = s.yTop - s.edge; break;
-    default: y = s.yTop + s.crown; break;
-  }
-  x *= side;
-  if (s.shrink !== undefined) {
-    const cy = s.shrinkY ?? (s.yFloor + s.yTop) * 0.5;
-    x *= s.shrink;
-    y = cy + (y - cy) * s.shrink;
+    case 'edge': x = s.wTop; y = s.yTop - s.edge; break;
+    case 'topMid': {
+      const ey = s.yTop - s.edge, cy = s.yTop + s.crown;
+      x = s.wTop * 0.5; y = ey + (cy - ey) * 0.8 - s.topInset;
+      break;
+    }
+    default: y = s.yTop + s.crown - s.topInset; break;
   }
   out.x = x; out.y = y;
 }
 
-type Band = 'sill' | 'low' | 'flank' | 'side' | 'top';
-/** Band of the ring cell between points j and j+1 (null for the zero-width crease cells). */
-function bandOf(j: number): Band | null {
-  const k = j > 9 ? 17 - j : j;
-  switch (k) {
-    case 0: case 1: return 'sill';
-    case 2: return 'low';
-    case 3: return 'flank';
-    case 5: case 6: return 'side';
-    case 8: case 9: return 'top';
-    default: return null;
+const ringPt = { x: 0, y: 0 };
+function ringPoint(s: Station, lay: RingLayout, j: number, out: { x: number; y: number }): void {
+  const n = lay.half.length;
+  let side = 1, k = j;
+  if (j >= n) { side = -1; k = lay.ring - j; }
+  pointOfKind(s, lay.half[k], out);
+  out.x *= side;
+  if (s.shrink !== undefined) {
+    const cy = s.shrinkY ?? (s.yFloor + s.yTop) * 0.5;
+    out.x *= s.shrink;
+    out.y = cy + (out.y - cy) * s.shrink;
   }
 }
 
+function toneFor(seg: SegTone, band: Band | null): Tone {
+  switch (band) {
+    case 'sill': return seg.sill;
+    case 'low': return seg.low;
+    case 'bezelLo': case 'bezelHi': return seg.bezel ?? seg.flank;
+    case 'sealLo': case 'sealHi': return seg.seal ?? seg.side;
+    case 'side': return seg.side;
+    case 'top': return seg.top;
+    default: return seg.flank;
+  }
+}
+
+/** Glass darkens over its top 35 % (a tint band under the roof), like a sun strip: 1 at the belt, 0.45 at the roof. */
+function glassShade(y: number, yBelt: number, roofY: number): number {
+  const t = clamp((y - yBelt) / Math.max(0.05, roofY - yBelt), 0, 1);
+  const f = clamp((t - 0.62) / 0.38, 0, 1);
+  return 1 - 0.55 * f * f * (3 - 2 * f);
+}
+
 /**
- * The shell: one smooth sheet through every station, coloured per cell so glass, lamps and valances are regions of the
- * same surface rather than slabs. Cell order reproduces `surface()` (two triangles a-b-c / b-d-c per cell, rows = stations)
- * and is verified against the sampled positions, so a change to the helper fails loudly here instead of mis-painting.
+ * The shell: one smooth sheet through every station, coloured per cell so glass, gaskets, lamps and valances are regions
+ * of the same surface rather than slabs. Cell order reproduces `surface()` (two triangles a-b-c / b-d-c per cell, rows =
+ * stations) and is verified against the sampled positions, so a change to the helper fails loudly here instead of
+ * mis-painting.
  */
-function loft(stations: Station[]): THREE.BufferGeometry {
-  const rows = stations.length, cols = RING;
+function loft(stations: Station[], lay: RingLayout): THREE.BufferGeometry {
+  const rows = stations.length, cols = lay.ring;
+  let roofY = -Infinity;
+  for (let i = 0; i < rows; i++) roofY = Math.max(roofY, stations[i].yTop + stations[i].crown);
   const g = surface(rows, cols, true, false, (i, j, out) => {
-    ringPoint(stations[i], j, ringPt);
+    ringPoint(stations[i], lay, j, ringPt);
     out.set(ringPt.x, ringPt.y, stations[i].z);
   });
   const pos = g.attributes.position;
@@ -349,16 +486,17 @@ function loft(stations: Station[]): THREE.BufferGeometry {
     const far = tri === 0 ? corner === 2 : corner !== 0;
     const nextJ = tri === 0 ? corner === 1 : corner !== 2;
     const gi = far ? i + 1 : i, gj = nextJ ? (j + 1) % cols : j;
-    ringPoint(stations[gi], gj, ringPt);
+    ringPoint(stations[gi], lay, gj, ringPt);
     if (Math.abs(pos.getX(k) - ringPt.x) > 1e-5 || Math.abs(pos.getY(k) - ringPt.y) > 1e-5 || Math.abs(pos.getZ(k) - stations[gi].z) > 1e-5) {
       throw new Error('vehicle loft: surface() cell order changed');
     }
     const seg = stations[i].seg;
-    const band = bandOf(j) ?? 'flank';
-    let tone: Tone = seg[band];
+    const band = cellBand(lay, j);
+    let tone: Tone = toneFor(seg, band);
     if (band === 'flank' && seg.lens && (seg.lens.at === 1) === far) tone = seg.lens.tone;
     authorColor.setHex(tone.col);
-    colors[k * 3] = authorColor.r; colors[k * 3 + 1] = authorColor.g; colors[k * 3 + 2] = authorColor.b;
+    const shadeK = tone === T.glass ? glassShade(ringPt.y, stations[gi].yBelt, roofY) : 1;
+    colors[k * 3] = authorColor.r * shadeK; colors[k * 3 + 1] = authorColor.g * shadeK; colors[k * 3 + 2] = authorColor.b * shadeK;
     paints[k] = tone.paint;
   }
   g.setAttribute('color', new THREE.BufferAttribute(colors, 3));
@@ -383,9 +521,10 @@ function shellWidth(stations: Station[], y: number, z: number): number {
 }
 const ringA = { x: 0, y: 0 }, ringB = { x: 0, y: 0 };
 function ringWidth(s: Station, y: number): number {
-  ringPoint(s, 1, ringA);
-  for (let k = 2; k <= 9; k++) {
-    ringPoint(s, k, ringB);
+  const half = FULL_RING.half;
+  pointOfKind(s, half[1], ringA);
+  for (let k = 2; k < half.length; k++) {
+    pointOfKind(s, half[k], ringB);
     if (y <= ringB.y) {
       const t = clamp((y - ringA.y) / Math.max(1e-4, ringB.y - ringA.y), 0, 1);
       return ringA.x + (ringB.x - ringA.x) * t;
@@ -404,6 +543,8 @@ interface VehicleProfile {
   stations: Station[];
   parts: PrismDef[];
   arches: ArchDef[];
+  /** Exhaust tube anchor: x, y and the bumper face z it pokes out of. */
+  exhaust: { x: number; y: number; zFace: number };
   head: Anchor;
   tail: Anchor;
   /** Roof lamps: police lightbar halves, or the taxi sign faces. */
@@ -459,11 +600,11 @@ function archGeometry(a: ArchDef, side: number): THREE.BufferGeometry[] {
   return [decorate(tube, PAINT_DARK, 1), decorate(lip, PAINT_DARK, 1), decorate(well, BLACK, 0), decorate(back, BLACK, 0)];
 }
 
-/** Segment tones of the end faces and their wraps onto the flanks. */
-const REAR_WRAP: SegTone = { ...BODY, flank: T.tail, low: T.dark, sill: T.black };
-const REAR_FACE: SegTone = { sill: T.black, low: T.dark, flank: T.tail, lens: { at: 0, tone: T.tailLens }, side: T.paint, top: T.paint };
-const FRONT_WRAP: SegTone = { ...BODY, flank: T.lamp, low: T.dark, sill: T.black };
-const FRONT_FACE: SegTone = { sill: T.black, low: T.dark, flank: T.lamp, lens: { at: 1, tone: T.lampLens }, side: T.paint, top: T.paint };
+/** Segment tones of the end faces and their wraps onto the flanks: a dark bezel above and below every lens cell. */
+const REAR_WRAP: SegTone = { ...BODY, flank: T.tail, bezel: T.bezel, low: T.dark, sill: T.black };
+const REAR_FACE: SegTone = { sill: T.black, low: T.dark, flank: T.tail, bezel: T.bezel, lens: { at: 0, tone: T.tailLens }, side: T.paint, top: T.paint };
+const FRONT_WRAP: SegTone = { ...BODY, flank: T.lamp, bezel: T.bezel, low: T.dark, sill: T.black };
+const FRONT_FACE: SegTone = { sill: T.black, low: T.dark, flank: T.lamp, bezel: T.bezel, lens: { at: 1, tone: T.lampLens }, side: T.paint, top: T.paint };
 const FAN: SegTone = { sill: T.dark, low: T.dark, flank: T.dark, side: T.dark, top: T.dark };
 
 /**
@@ -478,6 +619,24 @@ function lampAnchor(outer: Station, inner: Station, dir: number, w: number, h: n
   return { x: (xo + xi) * 0.5, y: (yo + yi) * 0.5, z: zMid + dir * 0.035, w, h, sweep: Math.atan2(Math.abs(inner.z - outer.z), xo - xi) };
 }
 
+/**
+ * Rear screen stations between the deck station (`base`, top band = frit) and the roof station at `roofZ`: a 3 cm frit
+ * band, two glass segments meeting at a station bulged `bulge` above the straight line (so the screen curves), and the
+ * 3 cm frit band under the roof. `wTop` and `edge`/`crown` are interpolated between the two ends.
+ */
+function rearScreen(out: Station[], base: Station, roofZ: number, roofY: number, roofW: number, roofEdge: number, roofCrown: number, bulge: number): void {
+  const z0 = base.z, z1 = roofZ, y0 = base.yTop, y1 = roofY;
+  const at = (z: number, lift: number, seg: SegTone, extra: StationOpts): Station => {
+    const t = (z - z0) / (z1 - z0);
+    return station(z, base.yFloor, y0 + (y1 - y0) * t + lift, base.wTop + (roofW - base.wTop) * t, base.yBelt, base.wBelt, {
+      wFloor: base.wFloor, yLow: base.yLow, wLow: base.wLow, edge: base.edge + (roofEdge - base.edge) * t, crown: base.crown + (roofCrown - base.crown) * t, seg, ...extra,
+    });
+  };
+  out.push(at(z0 + SEAL_W, 0, SCREEN, { topInset: GLASS_INSET, lod: true }));
+  out.push(at((z0 + z1) * 0.5, bulge, SCREEN, { topInset: GLASS_INSET }));
+  out.push(at(z1 - SEAL_W, 0, SCREEN_EDGE, {}));
+}
+
 /** Three-box saloon: sloped bonnet, raked glasshouse, boot lip. Shared by sedan / police / taxi. */
 function sedanProfile(s: VehicleSpec, kind: 'sedan' | 'police' | 'taxi'): VehicleProfile {
   const L = s.length, hl = L / 2, hw = s.width / 2, H = s.height;
@@ -487,32 +646,39 @@ function sedanProfile(s: VehicleSpec, kind: 'sedan' | 'police' | 'taxi'): Vehicl
   const wz = s.wheelbase / 2;
   const wx = hw - VEHICLE_RENDER.wheelWidth * 0.5 + WHEEL_INSET;
   const hp = hw * PLAN;
+  const IN = GLASS_INSET;
   const parts: PrismDef[] = [];
   const archDefs: ArchDef[] = [];
   // End faces shrink about lamp height, so the clusters stay level and the bumper below leans out under them.
   const yCRear = belt - 0.07, yCFront = belt - 0.22;
   // Side silhouette rear -> front: boot lip, rear screen, roof, windscreen, cowl, bonnet, nose; plan curve widest at the B pillar.
-  const rear = station(-hl, c, belt + 0.10, hp * 0.74, belt + 0.04, hp * 0.86, { yFloor: c + 0.03, wFloor: hp * 0.78, yLow: belt - 0.17, wLow: hp * 0.85, edge: 0.025, crown: 0.01, seg: REAR_WRAP });
-  const nose = station(hl - 0.05, c, belt - 0.10, hp * 0.62, belt - 0.13, hp * 0.83, { yFloor: c + 0.03, wFloor: hp * 0.76, yLow: belt - 0.30, wLow: hp * 0.83, edge: 0.03, crown: 0.01, seg: FRONT_FACE });
+  const rear = station(-hl, c, belt + 0.10, hp * 0.74, belt + 0.04, hp * 0.86, { yFloor: c + 0.03, wFloor: hp * 0.78, yLow: belt - 0.17, wLow: hp * 0.85, edge: 0.025, crown: 0.01, seg: REAR_WRAP, lod: true });
+  const nose = station(hl - 0.05, c, belt - 0.10, hp * 0.62, belt - 0.13, hp * 0.83, { yFloor: c + 0.03, wFloor: hp * 0.76, yLow: belt - 0.30, wLow: hp * 0.83, edge: 0.03, crown: 0.01, seg: FRONT_FACE, lod: true });
   const cowlZ = L * 0.145, roofFrontZ = -0.02, roofRearZ = -L * 0.215, screenBaseZ = -L * 0.31;
+  const deck = station(screenBaseZ, c, belt + 0.10, hp * 0.72, belt + 0.025, hp * 0.95, { edge: 0.02, crown: 0.01, seg: SCREEN_EDGE });
   const stations: Station[] = [
-    shrunk(rear, -hl - 0.07, 0, yCRear, FAN),
-    shrunk(rear, -hl - 0.05, 0.5, yCRear, REAR_FACE),
+    shrunk(rear, -hl - 0.07, 0, yCRear, FAN, true),
+    shrunk(rear, -hl - 0.05, 0.5, yCRear, REAR_FACE, true),
     rear,
-    station(-hl + 0.24, c, belt + 0.115, hp * 0.76, belt + 0.035, hp * 0.925, { wFloor: hp * 0.86, yLow: belt - 0.17, wLow: hp * 0.91, edge: 0.03, crown: 0.015 }),
-    station(screenBaseZ, c, belt + 0.10, hp * 0.72, belt + 0.025, hp * 0.95, { edge: 0.02, crown: 0.01, seg: { ...BODY, top: T.glass } }),
-    station(roofRearZ, c, roof, hp * 0.72, belt + 0.015, hp * 0.94, { edge: 0.05, crown: 0.025, seg: { ...BODY, side: T.glass } }),
-    station(-0.27, c, roof, hp * 0.73, belt + 0.005, hp * 0.945, { edge: 0.05, crown: 0.025, seg: { ...BODY, side: T.black } }),
-    station(-0.18, c, roof, hp * 0.73, belt + 0.005, hp * 0.945, { edge: 0.05, crown: 0.025, seg: { ...BODY, side: T.glass } }),
-    station(roofFrontZ, c, roof - 0.01, hp * 0.71, belt, hp * 0.94, { edge: 0.05, crown: 0.025, seg: { ...BODY, top: T.glass, side: T.glass } }),
-    station(0.33, c, belt + 0.29, hp * 0.75, belt - 0.005, hp * 0.945, { edge: 0.04, crown: 0.01, seg: { ...BODY, top: T.glass } }),
-    station(cowlZ, c, belt + 0.085, hp * 0.78, belt - 0.012, hp * 0.93, { edge: 0.03, crown: 0.01 }),
-    station(1.45, c, belt + 0.02, hp * 0.70, belt - 0.04, hp * 0.90, { edge: 0.04, crown: 0.02, bulge: 0.03 }),
-    station(hl - 0.30, c, belt - 0.05, hp * 0.66, belt - 0.09, hp * 0.87, { wFloor: hp * 0.80, yLow: belt - 0.28, wLow: hp * 0.86, edge: 0.04, crown: 0.015, seg: FRONT_WRAP }),
-    nose,
-    shrunk(nose, hl + 0.05, 0.5, yCFront, FAN),
-    shrunk(nose, hl + 0.06, 0, yCFront, FAN),
+    station(-hl + 0.24, c, belt + 0.115, hp * 0.76, belt + 0.035, hp * 0.925, { wFloor: hp * 0.86, yLow: belt - 0.17, wLow: hp * 0.91, edge: 0.03, crown: 0.015, lod: true }),
+    deck,
   ];
+  rearScreen(stations, deck, roofRearZ, roof, hp * 0.72, 0.05, 0.025, 0.03);
+  stations.push(
+    station(roofRearZ, c, roof, hp * 0.72, belt + 0.015, hp * 0.94, { edge: 0.05, crown: 0.025, seg: GLAZED, inset: IN, lod: true }),
+    station(-0.27, c, roof, hp * 0.73, belt + 0.005, hp * 0.945, { edge: 0.05, crown: 0.025, seg: B_PILLAR, inset: IN }),
+    station(-0.18, c, roof, hp * 0.73, belt + 0.005, hp * 0.945, { edge: 0.05, crown: 0.025, seg: GLAZED, inset: IN }),
+    station(roofFrontZ - SEAL_W, c, roof - 0.005, hp * 0.71, belt, hp * 0.94, { edge: 0.05, crown: 0.025, seg: GLAZED_SCREEN_EDGE, inset: IN }),
+    station(roofFrontZ, c, roof - 0.01, hp * 0.71, belt, hp * 0.94, { edge: 0.05, crown: 0.025, seg: GLAZED_SCREEN, inset: IN, topInset: IN, lod: true }),
+    station(0.33, c, belt + 0.29, hp * 0.75, belt - 0.005, hp * 0.945, { edge: 0.04, crown: 0.01, seg: GLAZED_SCREEN, inset: IN, topInset: IN }),
+    station(cowlZ - SEAL_W, c, belt + 0.105, hp * 0.78, belt - 0.012, hp * 0.93, { edge: 0.03, crown: 0.01, seg: SCREEN_EDGE, topInset: IN * 0.5 }),
+    station(cowlZ, c, belt + 0.085, hp * 0.78, belt - 0.012, hp * 0.93, { edge: 0.03, crown: 0.01, lod: true }),
+    station(1.45, c, belt + 0.02, hp * 0.70, belt - 0.04, hp * 0.90, { edge: 0.04, crown: 0.02, bulge: 0.03 }),
+    station(hl - 0.30, c, belt - 0.05, hp * 0.66, belt - 0.09, hp * 0.87, { wFloor: hp * 0.80, yLow: belt - 0.28, wLow: hp * 0.86, edge: 0.04, crown: 0.015, seg: FRONT_WRAP, lod: true }),
+    nose,
+    shrunk(nose, hl + 0.05, 0.5, yCFront, FAN, true),
+    shrunk(nose, hl + 0.06, 0, yCFront, FAN, true),
+  );
   const width = (y: number, z: number): number => shellWidth(stations, y, z);
   // A pillars (raked posts over the quarter glass), rocker strip, door shut lines, bonnet gap.
   pillar(parts, cowlZ + 0.02, width(belt, cowlZ), belt - 0.01, roofFrontZ + 0.03, hp * 0.71, roof - 0.055);
@@ -521,10 +687,10 @@ function sedanProfile(s: VehicleSpec, kind: 'sedan' | 'police' | 'taxi'): Vehicl
   shutLine(parts, -L * 0.19, width(c + 0.17, -L * 0.19), c + 0.17, width(belt - 0.02, -L * 0.19), belt - 0.02);
   parts.push({ ...block(cowlZ + 0.02, cowlZ + 0.036, hw * 0.76, belt + 0.05, belt + 0.10, BLACK, 0), plain: true });
   arches(archDefs, width, wx, wz, VEHICLE_RENDER.wheelRadius, hw - ARCH_INSET - wx);
-  // Grille, plates, exhaust, mirrors, handles.
+  // Grille, plates, mirrors, handles.
   parts.push({ ...block(hl + 0.03, hl + 0.075, hw * 0.36, c + 0.25, belt - 0.19, BLACK, 0), plain: true });
-  parts.push({ ...block(hl + 0.04, hl + 0.085, hw * 0.18, c + 0.08, c + 0.19, SIGN, 0), plain: true });
-  rearDetails(parts, -hl - 0.07, c, c + 0.31, hw * 0.55);
+  plate(parts, hl + 0.04, hl + 0.085, hw * 0.18, c + 0.08, c + 0.19);
+  rearDetails(parts, -hl - 0.07, c + 0.31);
   mirror(parts, cowlZ - 0.20, cowlZ - 0.06, width(belt + 0.02, cowlZ - 0.13), belt + 0.01, 0.11, 0.05);
   handle(parts, -L * 0.03, L * 0.04, width(belt - 0.11, 0), belt - 0.11);
   handle(parts, -L * 0.34, -L * 0.27, width(belt - 0.11, -L * 0.3), belt - 0.11);
@@ -533,6 +699,7 @@ function sedanProfile(s: VehicleSpec, kind: 'sedan' | 'police' | 'taxi'): Vehicl
     stations,
     parts,
     arches: archDefs,
+    exhaust: { x: hw * 0.55, y: c + 0.01, zFace: -hl - 0.07 },
     head: lampAnchor(nose, stations[stations.length - 2], 1, 0.22, 0.09),
     tail: lampAnchor(rear, stations[1], -1, 0.24, 0.10),
     roof: { x: 0, y: H, z: 0, w: 0.3, h: 0.12, sweep: 0 },
@@ -545,12 +712,13 @@ function sedanProfile(s: VehicleSpec, kind: 'sedan' | 'police' | 'taxi'): Vehicl
   };
 
   if (kind === 'police') {
-    // Bull bar, roof lightbar housing and a blue side flash fitted to the shell.
+    // Bull bar, roof lightbar housing and a blue side flash fitted to the shell (the upper flash ends on the flush C
+    // pillar, before the glass steps in).
     pair(parts, { ...block(hl + 0.06, hl + 0.18, hw * 0.08, c + 0.10, belt - 0.06, DARK, 0, hw * 0.40), plain: true });
     parts.push({ ...block(hl + 0.08, hl + 0.17, hw * 0.50, belt - 0.26, belt - 0.14, DARK, 0), plain: true });
     parts.push({ ...block(-L * 0.05, L * 0.05, hw * 0.46, roof + 0.01, roof + 0.12, BLACK, 0), plain: true });
     flankStrip(parts, width, -L * 0.30, L * 0.24, belt - 0.30, belt - 0.10, 0.006, 0.05, POLICE_BLUE, 0);
-    flankStrip(parts, width, -L * 0.29, roofRearZ, belt + 0.02, roof - 0.10, 0.006, 0.05, POLICE_BLUE, 0);
+    flankStrip(parts, width, -L * 0.29, roofRearZ - SEAL_W, belt + 0.02, roof - 0.10, 0.006, 0.05, POLICE_BLUE, 0);
     profile.roof = { x: 0.24, y: roof + 0.065, z: 0.03, w: 0.3, h: 0.12, sweep: 0 };
     profile.roofKind = 'siren';
   } else if (kind === 'taxi') {
@@ -575,28 +743,35 @@ function sportProfile(s: VehicleSpec): VehicleProfile {
   const wz = s.wheelbase / 2;
   const wx = hw - VEHICLE_RENDER.wheelWidth * 0.5 + WHEEL_INSET;
   const hp = hw * PLAN;
+  const IN = GLASS_INSET;
   const parts: PrismDef[] = [];
   const archDefs: ArchDef[] = [];
   const yCRear = belt + 0.01, yCFront = belt - 0.22;
-  const rear = station(-hl, c, belt + 0.17, hp * 0.80, belt + 0.07, hp * 0.90, { yFloor: c + 0.03, wFloor: hp * 0.84, yLow: belt - 0.06, wLow: hp * 0.89, edge: 0.03, crown: 0, seg: REAR_WRAP });
-  const nose = station(hl - 0.05, c, belt - 0.14, hp * 0.60, belt - 0.16, hp * 0.84, { yFloor: c + 0.03, wFloor: hp * 0.78, yLow: belt - 0.27, wLow: hp * 0.84, edge: 0.02, crown: 0.01, seg: FRONT_FACE });
+  const rear = station(-hl, c, belt + 0.17, hp * 0.80, belt + 0.07, hp * 0.90, { yFloor: c + 0.03, wFloor: hp * 0.84, yLow: belt - 0.06, wLow: hp * 0.89, edge: 0.03, crown: 0, seg: REAR_WRAP, lod: true });
+  const nose = station(hl - 0.05, c, belt - 0.14, hp * 0.60, belt - 0.16, hp * 0.84, { yFloor: c + 0.03, wFloor: hp * 0.78, yLow: belt - 0.27, wLow: hp * 0.84, edge: 0.02, crown: 0.01, seg: FRONT_FACE, lod: true });
   const cowlZ = 0.58, roofFrontZ = -0.12, roofRearZ = -0.55, deckZ = -1.30;
+  const deck = station(deckZ, c, belt + 0.17, hp * 0.78, belt + 0.045, hp * 0.945, { edge: 0.02, crown: 0.005, seg: SCREEN_EDGE });
   const stations: Station[] = [
-    shrunk(rear, -hl - 0.06, 0, yCRear, FAN),
-    shrunk(rear, -hl - 0.045, 0.5, yCRear, REAR_FACE),
+    shrunk(rear, -hl - 0.06, 0, yCRear, FAN, true),
+    shrunk(rear, -hl - 0.045, 0.5, yCRear, REAR_FACE, true),
     rear,
-    station(-hl + 0.28, c, belt + 0.19, hp * 0.82, belt + 0.06, hp * 0.95, { wFloor: hp * 0.88, yLow: belt - 0.06, wLow: hp * 0.94, edge: 0.03, crown: 0.005 }),
-    station(deckZ, c, belt + 0.17, hp * 0.78, belt + 0.045, hp * 0.945, { edge: 0.02, crown: 0.005, seg: { ...BODY, top: T.glass } }),
-    station(roofRearZ, c, roof, hp * 0.70, belt + 0.025, hp * 0.95, { edge: 0.05, crown: 0.02, seg: { ...BODY, side: T.glass } }),
-    station(roofFrontZ, c, roof - 0.01, hp * 0.69, belt + 0.01, hp * 0.945, { edge: 0.05, crown: 0.02, seg: { ...BODY, top: T.glass, side: T.glass } }),
-    station(0.25, c, belt + 0.30, hp * 0.74, belt, hp * 0.94, { edge: 0.04, crown: 0.01, seg: { ...BODY, top: T.glass } }),
-    station(cowlZ, c, belt + 0.085, hp * 0.78, belt - 0.015, hp * 0.94, { edge: 0.03, crown: 0.01 }),
-    station(1.40, c, belt - 0.01, hp * 0.70, belt - 0.06, hp * 0.91, { edge: 0.04, crown: 0.02, bulge: 0.03 }),
-    station(hl - 0.32, c, belt - 0.08, hp * 0.66, belt - 0.12, hp * 0.88, { wFloor: hp * 0.82, yLow: belt - 0.24, wLow: hp * 0.87, edge: 0.03, crown: 0.015, seg: FRONT_WRAP }),
-    nose,
-    shrunk(nose, hl + 0.045, 0.5, yCFront, FAN),
-    shrunk(nose, hl + 0.055, 0, yCFront, FAN),
+    station(-hl + 0.28, c, belt + 0.19, hp * 0.82, belt + 0.06, hp * 0.95, { wFloor: hp * 0.88, yLow: belt - 0.06, wLow: hp * 0.94, edge: 0.03, crown: 0.005, lod: true }),
+    deck,
   ];
+  rearScreen(stations, deck, roofRearZ, roof, hp * 0.70, 0.05, 0.02, 0.035);
+  stations.push(
+    station(roofRearZ, c, roof, hp * 0.70, belt + 0.025, hp * 0.95, { edge: 0.05, crown: 0.02, seg: GLAZED, inset: IN, lod: true }),
+    station(roofFrontZ - SEAL_W, c, roof - 0.005, hp * 0.69, belt + 0.01, hp * 0.945, { edge: 0.05, crown: 0.02, seg: GLAZED_SCREEN_EDGE, inset: IN }),
+    station(roofFrontZ, c, roof - 0.01, hp * 0.69, belt + 0.01, hp * 0.945, { edge: 0.05, crown: 0.02, seg: GLAZED_SCREEN, inset: IN, topInset: IN, lod: true }),
+    station(0.25, c, belt + 0.30, hp * 0.74, belt, hp * 0.94, { edge: 0.04, crown: 0.01, seg: GLAZED_SCREEN, inset: IN, topInset: IN }),
+    station(cowlZ - SEAL_W, c, belt + 0.105, hp * 0.78, belt - 0.015, hp * 0.94, { edge: 0.03, crown: 0.01, seg: SCREEN_EDGE, topInset: IN * 0.5 }),
+    station(cowlZ, c, belt + 0.085, hp * 0.78, belt - 0.015, hp * 0.94, { edge: 0.03, crown: 0.01, lod: true }),
+    station(1.40, c, belt - 0.01, hp * 0.70, belt - 0.06, hp * 0.91, { edge: 0.04, crown: 0.02, bulge: 0.03 }),
+    station(hl - 0.32, c, belt - 0.08, hp * 0.66, belt - 0.12, hp * 0.88, { wFloor: hp * 0.82, yLow: belt - 0.24, wLow: hp * 0.87, edge: 0.03, crown: 0.015, seg: FRONT_WRAP, lod: true }),
+    nose,
+    shrunk(nose, hl + 0.045, 0.5, yCFront, FAN, true),
+    shrunk(nose, hl + 0.055, 0, yCFront, FAN, true),
+  );
   const width = (y: number, z: number): number => shellWidth(stations, y, z);
   pillar(parts, cowlZ + 0.02, width(belt + 0.01, cowlZ), belt, roofFrontZ + 0.03, hp * 0.69, roof - 0.055);
   // Wing on two dark uprights, boot shut line, single long door, rocker, bonnet gap, grille, plates, mirrors, handle.
@@ -608,14 +783,15 @@ function sportProfile(s: VehicleSpec): VehicleProfile {
   arches(archDefs, width, wx, wz, VEHICLE_RENDER.wheelRadius * 1.08, hw - ARCH_INSET - wx);
   parts.push({ ...block(cowlZ + 0.02, cowlZ + 0.036, hw * 0.78, belt + 0.05, belt + 0.10, BLACK, 0), plain: true });
   parts.push({ ...block(hl + 0.03, hl + 0.07, hw * 0.44, c + 0.16, belt - 0.24, BLACK, 0), plain: true });
-  parts.push({ ...block(hl + 0.035, hl + 0.08, hw * 0.18, c + 0.05, c + 0.15, SIGN, 0), plain: true });
-  rearDetails(parts, -hl - 0.06, c, c + 0.26, hw * 0.50);
+  plate(parts, hl + 0.035, hl + 0.08, hw * 0.18, c + 0.05, c + 0.15);
+  rearDetails(parts, -hl - 0.06, c + 0.26);
   mirror(parts, cowlZ - 0.20, cowlZ - 0.07, width(belt + 0.02, cowlZ - 0.13), belt + 0.01, 0.09, 0.045);
   handle(parts, -L * 0.14, -L * 0.07, width(belt - 0.10, -L * 0.1), belt - 0.10);
   return {
     stations,
     parts,
     arches: archDefs,
+    exhaust: { x: hw * 0.50, y: c + 0.01, zFace: -hl - 0.06 },
     head: lampAnchor(nose, stations[stations.length - 2], 1, 0.24, 0.07),
     tail: lampAnchor(rear, stations[1], -1, 0.34, 0.07),
     roof: { x: 0, y: H, z: 0, w: 0.3, h: 0.12, sweep: 0 },
@@ -638,39 +814,43 @@ function vanProfile(s: VehicleSpec): VehicleProfile {
   const wx = hw - VEHICLE_RENDER.wheelWidth * 0.5 + WHEEL_INSET;
   const noseZ = L * 0.28;
   const hp = hw * PLAN;
+  const IN = GLASS_INSET;
   const parts: PrismDef[] = [];
   const archDefs: ArchDef[] = [];
-  const rear = station(-hl, c, roof - 0.02, hp * 0.86, belt + 0.02, hp * 0.92, { yFloor: c + 0.04, wFloor: hp * 0.86, yLow: belt - 0.32, wLow: hp * 0.91, edge: 0.05, crown: 0.02, seg: REAR_WRAP });
-  const nose = station(hl - 0.05, c, belt - 0.06, hp * 0.70, belt - 0.11, hp * 0.84, { yFloor: c + 0.04, wFloor: hp * 0.78, yLow: belt - 0.30, wLow: hp * 0.84, edge: 0.03, crown: 0.01, seg: FRONT_FACE });
+  const rear = station(-hl, c, roof - 0.02, hp * 0.86, belt + 0.02, hp * 0.92, { yFloor: c + 0.04, wFloor: hp * 0.86, yLow: belt - 0.32, wLow: hp * 0.91, edge: 0.05, crown: 0.02, seg: REAR_WRAP, lod: true });
+  const nose = station(hl - 0.05, c, belt - 0.06, hp * 0.70, belt - 0.11, hp * 0.84, { yFloor: c + 0.04, wFloor: hp * 0.78, yLow: belt - 0.30, wLow: hp * 0.84, edge: 0.03, crown: 0.01, seg: FRONT_FACE, lod: true });
   const cowlZ = noseZ + 0.16, roofFrontZ = noseZ - 0.28, bPillarZ = noseZ - 1.02;
   const stations: Station[] = [
-    shrunk(rear, -hl - 0.05, 0, belt - 0.15, FAN),
-    shrunk(rear, -hl - 0.04, 0.72, belt - 0.15, REAR_FACE),
+    shrunk(rear, -hl - 0.05, 0, belt - 0.15, FAN, true),
+    shrunk(rear, -hl - 0.04, 0.72, belt - 0.15, REAR_FACE, true),
     rear,
-    station(-hl + 0.22, c, roof, hp * 0.88, belt + 0.02, hp * 0.95, { wFloor: hp * 0.88, yLow: belt - 0.32, wLow: hp * 0.94, edge: 0.05, crown: 0.02 }),
-    station(bPillarZ, c, roof, hp * 0.88, belt + 0.01, hp * 0.95, { wFloor: hp * 0.88, edge: 0.05, crown: 0.02, seg: { ...BODY, side: T.black } }),
-    station(bPillarZ + 0.08, c, roof, hp * 0.88, belt + 0.01, hp * 0.95, { wFloor: hp * 0.88, edge: 0.05, crown: 0.02, seg: { ...BODY, side: T.glass } }),
-    station(roofFrontZ, c, roof - 0.01, hp * 0.87, belt, hp * 0.95, { wFloor: hp * 0.88, edge: 0.05, crown: 0.02, seg: { ...BODY, top: T.glass, side: T.glass } }),
-    station(noseZ - 0.04, c, belt + 0.54, hp * 0.88, belt - 0.01, hp * 0.94, { edge: 0.04, crown: 0.01, seg: { ...BODY, top: T.glass } }),
-    station(cowlZ, c, belt + 0.10, hp * 0.86, belt - 0.02, hp * 0.93, { edge: 0.03, crown: 0.01 }),
-    station(hl - 0.32, c, belt - 0.02, hp * 0.78, belt - 0.08, hp * 0.88, { wFloor: hp * 0.82, yLow: belt - 0.28, wLow: hp * 0.87, edge: 0.04, crown: 0.02, seg: FRONT_WRAP }),
+    station(-hl + 0.22, c, roof, hp * 0.88, belt + 0.02, hp * 0.95, { wFloor: hp * 0.88, yLow: belt - 0.32, wLow: hp * 0.94, edge: 0.05, crown: 0.02, lod: true }),
+    station(bPillarZ, c, roof, hp * 0.88, belt + 0.01, hp * 0.95, { wFloor: hp * 0.88, edge: 0.05, crown: 0.02, seg: B_PILLAR, inset: IN }),
+    station(bPillarZ + 0.08, c, roof, hp * 0.88, belt + 0.01, hp * 0.95, { wFloor: hp * 0.88, edge: 0.05, crown: 0.02, seg: GLAZED, inset: IN, lod: true }),
+    station(roofFrontZ - SEAL_W, c, roof - 0.005, hp * 0.87, belt, hp * 0.95, { wFloor: hp * 0.88, edge: 0.05, crown: 0.02, seg: GLAZED_SCREEN_EDGE, inset: IN }),
+    station(roofFrontZ, c, roof - 0.01, hp * 0.87, belt, hp * 0.95, { wFloor: hp * 0.88, edge: 0.05, crown: 0.02, seg: GLAZED_SCREEN, inset: IN, topInset: IN, lod: true }),
+    station(noseZ - 0.04, c, belt + 0.54, hp * 0.88, belt - 0.01, hp * 0.94, { edge: 0.04, crown: 0.01, seg: SCREEN, topInset: IN }),
+    station(cowlZ - SEAL_W, c, belt + 0.166, hp * 0.86, belt - 0.02, hp * 0.93, { edge: 0.03, crown: 0.01, seg: SCREEN_EDGE, topInset: IN * 0.5 }),
+    station(cowlZ, c, belt + 0.10, hp * 0.86, belt - 0.02, hp * 0.93, { edge: 0.03, crown: 0.01, lod: true }),
+    station(hl - 0.32, c, belt - 0.02, hp * 0.78, belt - 0.08, hp * 0.88, { wFloor: hp * 0.82, yLow: belt - 0.28, wLow: hp * 0.87, edge: 0.04, crown: 0.02, seg: FRONT_WRAP, lod: true }),
     nose,
-    shrunk(nose, hl + 0.05, 0.5, belt - 0.20, FAN),
-    shrunk(nose, hl + 0.06, 0, belt - 0.20, FAN),
+    shrunk(nose, hl + 0.05, 0.5, belt - 0.20, FAN, true),
+    shrunk(nose, hl + 0.06, 0, belt - 0.20, FAN, true),
   ];
   const width = (y: number, z: number): number => shellWidth(stations, y, z);
   pillar(parts, cowlZ + 0.02, width(belt, cowlZ), belt - 0.01, roofFrontZ + 0.03, hp * 0.87, roof - 0.055);
-  // Bonnet gap, sliding door shut lines, rear door seam + windows, rocker.
+  // Bonnet gap, sliding door shut lines, rear door seam + windows (glass in a dark frame), rocker.
   parts.push({ ...block(cowlZ + 0.02, cowlZ + 0.036, hw * 0.80, belt + 0.06, belt + 0.11, BLACK, 0), plain: true });
   shutLine(parts, bPillarZ + 0.02, width(c + 0.20, bPillarZ), c + 0.20, width(roof - 0.12, bPillarZ), roof - 0.12);
   shutLine(parts, -L * 0.22, width(c + 0.20, -L * 0.22), c + 0.20, width(roof - 0.12, -L * 0.22), roof - 0.12);
   parts.push({ ...block(-hl - 0.055, -hl + 0.03, hw * 0.02, c + 0.20, roof - 0.14, BLACK, 0), plain: true });
+  pair(parts, { ...block(-hl - 0.05, -hl + 0.02, hw * 0.27, H * 0.605, H * 0.855, SEAL, 0, hw * 0.30), plain: true });
   pair(parts, { ...block(-hl - 0.055, -hl + 0.02, hw * 0.24, H * 0.62, H * 0.84, GLASS, 0, hw * 0.30), plain: true });
   flankStrip(parts, width, -L * 0.36, L * 0.20, c + 0.04, c + 0.17, 0.010, 0.04, DARK, 0.25);
   arches(archDefs, width, wx, wz, VEHICLE_RENDER.wheelRadius * 1.12, hw - ARCH_INSET - wx);
   parts.push({ ...block(hl + 0.03, hl + 0.075, hw * 0.42, c + 0.30, belt - 0.20, BLACK, 0), plain: true });
-  parts.push({ ...block(hl + 0.04, hl + 0.085, hw * 0.18, c + 0.10, c + 0.21, SIGN, 0), plain: true });
-  rearDetails(parts, -hl - 0.05, c, c + 0.38, hw * 0.55);
+  plate(parts, hl + 0.04, hl + 0.085, hw * 0.18, c + 0.10, c + 0.21);
+  rearDetails(parts, -hl - 0.05, c + 0.38);
   // Big mirrors on arms, cab and sliding-door handles.
   mirror(parts, cowlZ - 0.34, cowlZ - 0.14, width(belt + 0.20, cowlZ - 0.24), belt + 0.16, 0.20, 0.06);
   handle(parts, noseZ - 0.62, noseZ - 0.54, width(belt - 0.02, noseZ - 0.58), belt - 0.02);
@@ -679,6 +859,7 @@ function vanProfile(s: VehicleSpec): VehicleProfile {
     stations,
     parts,
     arches: archDefs,
+    exhaust: { x: hw * 0.55, y: c + 0.01, zFace: -hl - 0.05 },
     head: lampAnchor(nose, stations[stations.length - 2], 1, 0.24, 0.10),
     tail: lampAnchor(rear, stations[1], -1, 0.13, 0.22),
     roof: { x: 0, y: H, z: 0, w: 0.3, h: 0.12, sweep: 0 },
@@ -715,18 +896,52 @@ function bakeShading(g: THREE.BufferGeometry, floor: number, belt: number): void
   }
 }
 
-/** Merges a profile's shell, small parts and arch fenders into one buffer (position / normal / color / paintMix). */
+/** Merges a profile's shell, small parts, arch fenders and exhaust into one buffer (position / normal / color / paintMix). */
 export function bodyGeometry(s: VehicleSpec): THREE.BufferGeometry {
   const profile = profileFor(s);
   const parts = profile.parts;
-  const geos: THREE.BufferGeometry[] = [loft(profile.stations)];
+  const geos: THREE.BufferGeometry[] = [loft(profile.stations, FULL_RING)];
   for (let i = 0; i < parts.length; i++) geos.push(prism(parts[i]));
   for (let i = 0; i < profile.arches.length; i++) {
     const a = profile.arches[i];
     geos.push(...archGeometry(a, 1), ...archGeometry(a, -1));
   }
+  geos.push(exhaustGeometry(profile.exhaust.x, profile.exhaust.y, profile.exhaust.zFace));
   const merged = mergeGeometries(geos, false);
   if (!merged) throw new Error('vehicle body merge failed (attribute mismatch)');
+  for (let i = 0; i < geos.length; i++) geos[i].dispose();
+  bakeShading(merged, profile.floor, profile.belt);
+  merged.computeBoundingSphere();
+  return merged;
+}
+
+/** Rim tone of the parked-car shell's baked wheel discs; the tread ring is shaded down to tyre black from it. */
+const LOD_RIM = 0x4a4e55;
+
+/**
+ * Cheap shell for the static parked cars of the lots: the same loft at the coarse ring through the `lod` stations only
+ * (about 300 triangles), no pillars / arches / mirrors, and each wheel a dark 8-sided disc with a lighter rim face
+ * instead of a lathed tyre. Same attribute set and paint material as the bodies, so `instanceColor` tints the paint
+ * regions and leaves glass and lamps alone. Sits on the ground like a body (floor at `clearance`).
+ */
+export function parkedShellGeometry(s: VehicleSpec): THREE.BufferGeometry {
+  const profile = profileFor(s);
+  const stations: Station[] = [];
+  for (let i = 0; i < profile.stations.length; i++) if (profile.stations[i].lod) stations.push(profile.stations[i]);
+  const geos: THREE.BufferGeometry[] = [loft(stations, LOD_RING)];
+  const R = VEHICLE_RENDER;
+  const r = R.wheelRadius * profile.wheelScale, w = R.wheelWidth;
+  const hw = s.width * 0.5 - w * 0.5 + WHEEL_INSET, hb = s.wheelbase * 0.5;
+  for (let k = 0; k < 4; k++) {
+    const x = (k % 2 === 0 ? -1 : 1) * hw, z = k < 2 ? hb : -hb;
+    const disc = new THREE.CylinderGeometry(r, r, w, 8, 1, false);
+    disc.rotateZ(Math.PI / 2); // axle y -> x
+    disc.translate(x, r, z);
+    // Rim faces: the cap vertices sit at |x - axle| = half width; the tread ring stays tyre-black.
+    geos.push(shade(decorate(disc, LOD_RIM, 0), (px, py, pz) => (Math.abs(Math.abs(px - x) - w * 0.5) < 1e-4 && Math.hypot(py - r, pz - z) < r * 0.999 ? 1 : 0.36)));
+  }
+  const merged = mergeGeometries(geos, false);
+  if (!merged) throw new Error('parked shell merge failed (attribute mismatch)');
   for (let i = 0; i < geos.length; i++) geos[i].dispose();
   bakeShading(merged, profile.floor, profile.belt);
   merged.computeBoundingSphere();
@@ -800,11 +1015,44 @@ function wheelGeometry(): THREE.BufferGeometry {
   return merged;
 }
 
+// ---------------------------------------------------------------------------------------------- paint material
+
+/**
+ * Physical + `paintMix`: the per-instance paint colour is blended in only where the geometry asks for it, so glass,
+ * bumpers, lamps and liveries keep their authored colour on every car. Shared by the vehicle bodies and the parked
+ * shells of the lots (CityRendererProps). The base paint is a fairly rough metallic (colour comes from the paint layer)
+ * and the glossy clearcoat lobe on top gives the sun / lamp glint that makes the shell read as lacquered metal.
+ */
+export function makeVehiclePaintMaterial(): THREE.MeshPhysicalMaterial {
+  const m = new THREE.MeshPhysicalMaterial({
+    vertexColors: true, metalness: 0.45, roughness: 0.5, envMapIntensity: 1.15, clearcoat: 0.6, clearcoatRoughness: 0.15,
+  });
+  m.onBeforeCompile = (shader) => {
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nattribute float paintMix;')
+      // three >= r155 declares vColor as vec4 (see color_pars_vertex), so write through .rgb.
+      .replace('#include <color_vertex>', [
+        'vColor = vec4( 1.0 );',
+        '#ifdef USE_COLOR',
+        '  vColor.rgb *= color;',
+        '#endif',
+        '#ifdef USE_INSTANCING_COLOR',
+        '  vColor.rgb *= mix( vec3( 1.0 ), instanceColor.rgb, clamp( paintMix, 0.0, 1.0 ) );',
+        '#endif',
+      ].join('\n'));
+  };
+  m.customProgramCacheKey = () => 'vehiclePaintMix';
+  return m;
+}
+
 // ---------------------------------------------------------------------------------------------- renderer
 
 export class VehicleRenderer {
   private readonly scene: THREE.Scene;
   private readonly bodies: Record<VehicleKey, THREE.InstancedMesh>;
+  /** Far LOD per spec: the parked shell (~450 tris, wheels baked in) instead of the ~2k-tri body; no shadow casting. */
+  private readonly lodBodies: Record<VehicleKey, THREE.InstancedMesh>;
+  private readonly lodCounts: Record<VehicleKey, number> = { sedan: 0, sport: 0, van: 0, police: 0, taxi: 0 };
   private readonly profiles: Record<VehicleKey, VehicleProfile>;
   private readonly wheels: THREE.InstancedMesh;
   private readonly lights: THREE.InstancedMesh;
@@ -828,13 +1076,15 @@ export class VehicleRenderer {
   constructor(scene: THREE.Scene) {
     this.scene = scene;
     const cap = BUDGET.MAX_VEHICLES;
-    this.bodyMat = this.makeBodyMaterial();
+    this.bodyMat = makeVehiclePaintMaterial();
     this.bodies = {} as Record<VehicleKey, THREE.InstancedMesh>;
+    this.lodBodies = {} as Record<VehicleKey, THREE.InstancedMesh>;
     this.profiles = {} as Record<VehicleKey, VehicleProfile>;
     for (let i = 0; i < KEYS.length; i++) {
       const key = KEYS[i];
       this.profiles[key] = profileFor(SPECS[key]);
       const mesh = new THREE.InstancedMesh(bodyGeometry(SPECS[key]), this.bodyMat, cap);
+      mesh.name = `veh:body:${key}`;
       mesh.count = 0;
       mesh.frustumCulled = false;
       mesh.castShadow = true;
@@ -845,7 +1095,22 @@ export class VehicleRenderer {
       this.bodies[key] = mesh;
       scene.add(mesh);
     }
+    for (let i = 0; i < KEYS.length; i++) {
+      const key = KEYS[i];
+      const lod = new THREE.InstancedMesh(parkedShellGeometry(SPECS[key]), this.bodyMat, cap);
+      lod.name = `veh:lod:${key}`;
+      lod.count = 0;
+      lod.frustumCulled = false;
+      lod.castShadow = false;
+      lod.receiveShadow = true;
+      lod.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      this.color.setRGB(1, 1, 1);
+      for (let k = 0; k < cap; k++) lod.setColorAt(k, this.color);
+      this.lodBodies[key] = lod;
+      scene.add(lod);
+    }
     this.wheels = new THREE.InstancedMesh(wheelGeometry(), this.wheelMat, cap * VEHICLE_RENDER.wheelsPerVehicle);
+    this.wheels.name = 'veh:wheels';
     this.wheels.count = 0;
     this.wheels.frustumCulled = false;
     // No shadow pass for the wheels: the body shadow + contact blob already cover them, and 4 x MAX_VEHICLES instances
@@ -855,6 +1120,7 @@ export class VehicleRenderer {
     scene.add(this.wheels);
     const lightGeo = new THREE.PlaneGeometry(1, 1);
     this.lights = new THREE.InstancedMesh(lightGeo, this.lightMat, cap * VEHICLE_RENDER.lightsPerVehicle);
+    this.lights.name = 'veh:lights';
     this.lights.count = 0;
     this.lights.frustumCulled = false;
     this.lights.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -866,37 +1132,9 @@ export class VehicleRenderer {
     this.spotR = this.makeSpot();
   }
 
-  /**
-   * Physical + `paintMix`: the per-instance paint colour is blended in only where the geometry asks for it, so glass,
-   * bumpers, lamps and liveries keep their authored colour on every car.
-   */
-  private makeBodyMaterial(): THREE.MeshPhysicalMaterial {
-    // Physical with a clearcoat: the base paint is a fairly rough metallic (colour comes from the paint layer) and the
-    // glossy clearcoat lobe on top gives the sun / lamp glint that makes the shell read as lacquered metal, not canvas.
-    const m = new THREE.MeshPhysicalMaterial({
-      vertexColors: true, metalness: 0.45, roughness: 0.5, envMapIntensity: 1.15, clearcoat: 0.6, clearcoatRoughness: 0.15,
-    });
-    m.onBeforeCompile = (shader) => {
-      shader.vertexShader = shader.vertexShader
-        .replace('#include <common>', '#include <common>\nattribute float paintMix;')
-        // three >= r155 declares vColor as vec4 (see color_pars_vertex), so write through .rgb.
-        .replace('#include <color_vertex>', [
-          'vColor = vec4( 1.0 );',
-          '#ifdef USE_COLOR',
-          '  vColor.rgb *= color;',
-          '#endif',
-          '#ifdef USE_INSTANCING_COLOR',
-          '  vColor.rgb *= mix( vec3( 1.0 ), instanceColor.rgb, clamp( paintMix, 0.0, 1.0 ) );',
-          '#endif',
-        ].join('\n'));
-    };
-    m.customProgramCacheKey = () => 'vehiclePaintMix';
-    return m;
-  }
-
   private makeSpot(): THREE.SpotLight {
     const R = VEHICLE_RENDER;
-    const s = new THREE.SpotLight(0xfff1d0, 0, R.headlightDistance, R.headlightAngle, R.headlightPenumbra, 1.2);
+    const s = new THREE.SpotLight(0xfff1d0, 0, R.headlightDistance, R.headlightAngle, R.headlightPenumbra, R.headlightDecay);
     s.castShadow = false;
     this.scene.add(s);
     this.scene.add(s.target);
@@ -914,6 +1152,9 @@ export class VehicleRenderer {
     const list = world.vehicleList;
     const counts = this.counts;
     counts.sedan = 0; counts.sport = 0; counts.van = 0; counts.police = 0; counts.taxi = 0;
+    const lodCounts = this.lodCounts;
+    lodCounts.sedan = 0; lodCounts.sport = 0; lodCounts.van = 0; lodCounts.police = 0; lodCounts.taxi = 0;
+    const lodDist2 = R.bodyLodDist * R.bodyLodDist;
     let wheelIdx = 0;
     let lightIdx = 0;
     const sirenPhase = Math.floor(time * R.sirenHz * 2) % 2;
@@ -922,14 +1163,17 @@ export class VehicleRenderer {
     for (let i = 0; i < list.length; i++) {
       const v = list[i];
       const key = v.spec.key;
-      const mesh = this.bodies[key];
       const profile = this.profiles[key];
-      const idx = counts[key]++;
-      v.renderIndex = idx;
       lerpTransform(this.interp, v.prev, v.curr, alpha);
       const t = this.interp;
       const dx = t.x - camX, dz = t.z - camZ;
-      const visible = dx * dx + dz * dz < R.cullDist * R.cullDist;
+      const d2 = dx * dx + dz * dz;
+      const visible = d2 < R.cullDist * R.cullDist;
+      // Near cars get the full loft + lathed wheels and cast shadows; far ones the parked shell with baked wheel discs.
+      const near = d2 < lodDist2;
+      const mesh = near ? this.bodies[key] : this.lodBodies[key];
+      const idx = near ? counts[key]++ : lodCounts[key]++;
+      v.renderIndex = idx;
       const sc = visible ? Math.max(0.001, v.spawnFade) : 0;
       const yaw = t.yaw;
       // Weight transfer: dive on the brakes, squat on the throttle, lean out of the corner.
@@ -949,7 +1193,7 @@ export class VehicleRenderer {
       this.paintColor(v);
       mesh.setColorAt(idx, this.color);
       if (visible) {
-        if (dx * dx + dz * dz < R.wheelDist * R.wheelDist) wheelIdx = this.syncWheels(v, t, sc, profile.wheelScale, wheelIdx);
+        if (near && d2 < R.wheelDist * R.wheelDist) wheelIdx = this.syncWheels(v, t, sc, profile.wheelScale, wheelIdx);
         lightIdx = this.syncLights(v, t, sc, profile, sirenPhase, lightIdx);
         this.shadows.add(t.x, groundYAt(t.x, t.z) + R.shadowLift, t.z, profile.shadowW, profile.shadowL, yaw, v.spawnFade);
         if (v.occupiedByPlayer) { this.syncSpots(v, t, profile); spotsSet = true; }
@@ -960,6 +1204,10 @@ export class VehicleRenderer {
       mesh.count = counts[KEYS[i]];
       mesh.instanceMatrix.needsUpdate = true;
       if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+      const lod = this.lodBodies[KEYS[i]];
+      lod.count = lodCounts[KEYS[i]];
+      lod.instanceMatrix.needsUpdate = true;
+      if (lod.instanceColor) lod.instanceColor.needsUpdate = true;
     }
     this.wheels.count = wheelIdx;
     this.wheels.instanceMatrix.needsUpdate = true;
@@ -1086,6 +1334,12 @@ export class VehicleRenderer {
       this.scene.remove(mesh);
       mesh.geometry.dispose();
       mesh.dispose();
+    }
+    for (let i = 0; i < KEYS.length; i++) {
+      const lod = this.lodBodies[KEYS[i]];
+      this.scene.remove(lod);
+      lod.geometry.dispose();
+      lod.dispose();
     }
     this.scene.remove(this.wheels);
     this.wheels.geometry.dispose();

@@ -1,4 +1,4 @@
-// City tests: graph counts/links, pathing, walk graph, validateCity, points/spots, reservations, lookups, determinism, minimap. Track A.
+// City tests: graph counts/links, pathing, walk graph, validateCity, points/spots, reservations, lookups, determinism, minimap, lot dressing. Track A.
 import { test, expect, approx } from './harness';
 import { generateCity, validateCity } from '../../src/game/city/CityGenerator';
 import type { GeneratedCity } from '../../src/game/city/CityGenerator';
@@ -6,6 +6,9 @@ import { BUDGET } from '../../src/game/core/Budget';
 import { Random } from '../../src/game/core/Random';
 import { INTERSECTION_R, LANE_W, PITCH } from '../../src/game/city/CityConfig';
 import { colliderDistance, onRoad } from '../../src/game/city/CityBuild';
+import { LOT_BAYS, lotLayout } from '../../src/game/city/CityLots';
+import type { Lot } from '../../src/game/city/CityData';
+import { SPECS } from '../../src/game/entities/VehicleSpecs';
 import type { LanePos } from '../../src/game/city/RoadGraph';
 import { MINIMAP_BLIP_CAPACITY, MinimapRenderer, createMinimapSnapshot } from '../../src/game/minimap/MinimapRenderer';
 
@@ -329,4 +332,73 @@ test('minimap: snapshot capacity and renderer draws with a fake canvas', () => {
   } finally {
     if (!hadDoc) delete g.document;
   }
+});
+
+test('lots: static parked cars fill free bays only, keep the gameplay spots, their exit side and the gate lane clear, and carry colliders', () => {
+  const g = city();
+  const c = g.city;
+  const lots = c.lots ?? [], parked = c.parked ?? [], lotProps = c.lotProps ?? [];
+  const B = LOT_BAYS;
+  expect(parked.length >= 400 && parked.length <= 2000, `400-2000 static parked cars (got ${parked.length})`);
+  let islands = 0, planters = 0;
+  for (const p of lotProps) { if (p.kind === 'island') islands++; else if (p.kind === 'planter') planters++; }
+  expect(islands >= lots.length && planters >= lots.length / 2, `islands (${islands}) and planters (${planters}) for ${lots.length} lots`);
+  console.log(`    summary: parked ${parked.length}, islands ${islands}, planters ${planters} over ${lots.length} lots`);
+  const lotOf = (x: number, z: number): Lot | null => {
+    for (const l of lots) if (Math.abs(x - l.x) <= l.w / 2 && Math.abs(z - l.z) <= l.d / 2) return l;
+    return null;
+  };
+  const rect = (x: number, z: number, yaw: number, hw: number, hl: number) => {
+    const cs = Math.abs(Math.cos(yaw)), sn = Math.abs(Math.sin(yaw));
+    const ex = hw * cs + hl * sn, ez = hw * sn + hl * cs;
+    return { x0: x - ex, z0: z - ez, x1: x + ex, z1: z + ez };
+  };
+  const overlap = (a: { x0: number; z0: number; x1: number; z1: number }, b: { x0: number; z0: number; x1: number; z1: number }): boolean => a.x0 < b.x1 && a.x1 > b.x0 && a.z0 < b.z1 && a.z1 > b.z0;
+  const aabbs = c.staticColliders.filter((k) => k.tag === 'prop' && k.shape.kind === 'aabb');
+  const hasCollider = (x: number, z: number): boolean => aabbs.some((k) => k.shape.kind === 'aabb' && x > k.shape.minX && x < k.shape.maxX && z > k.shape.minZ && z < k.shape.maxZ);
+  const rects: { x0: number; z0: number; x1: number; z1: number }[] = [];
+  for (const p of parked) {
+    const lot = lotOf(p.x, p.z);
+    expect(lot !== null, `parked car at (${p.x.toFixed(1)}, ${p.z.toFixed(1)}) lies in a lot`);
+    expect(p.spec === 'sedan' || p.spec === 'sport' || p.spec === 'van', 'parked spec valid');
+    expect(SPECS[p.spec].colors.indexOf(p.colour) >= 0, 'parked colour from the spec palette');
+    const q = Math.round(p.yaw / (Math.PI / 2));
+    approx(p.yaw, q * Math.PI / 2, 1e-9, 'parked yaw is a quarter turn');
+    const lay = lotLayout(g.roads, c.blocks, lot!);
+    const along = lay.alongX ? p.x : p.z, across = lay.alongX ? p.z : p.x;
+    expect(lay.strips.some((a) => Math.abs(a - along) < 1e-6) && lay.bays.some((b) => Math.abs(b - across) < 1e-6), 'parked car sits on a bay centre');
+    expect(lay.alongX === (Math.abs(Math.sin(p.yaw)) > 0.5), 'parked car noses along the strip heading');
+    const r = rect(p.x, p.z, p.yaw, SPECS[p.spec].width / 2, SPECS[p.spec].length / 2);
+    expect(!overlap(r, lay.gateRect), 'parked car stays out of the gate lane');
+    for (const o of rects) expect(!overlap(r, o), 'parked cars never overlap');
+    rects.push(r);
+    expect(hasCollider(p.x, p.z), 'parked car has an AABB prop collider');
+  }
+  // Gameplay spots: the spot bay and the bay to the driver's right (where ?nearcar=1 places the player) stay free.
+  for (const s of c.parkedSpots) {
+    const lot = lotOf(s.x, s.z);
+    if (!lot) continue;
+    const lay = lotLayout(g.roads, c.blocks, lot);
+    const bay = (x: number, z: number) => (lay.alongX ? { x0: x - B.bayLen / 2, x1: x + B.bayLen / 2, z0: z - B.bayPitch / 2, z1: z + B.bayPitch / 2 } : { x0: x - B.bayPitch / 2, x1: x + B.bayPitch / 2, z0: z - B.bayLen / 2, z1: z + B.bayLen / 2 });
+    const own = bay(s.x, s.z), right = bay(s.x - Math.cos(s.yaw) * B.bayPitch, s.z + Math.sin(s.yaw) * B.bayPitch);
+    for (const r of rects) expect(!overlap(r, own) && !overlap(r, right), `spot (${s.x.toFixed(0)}, ${s.z.toFixed(0)}) and its exit bay are free of static cars`);
+    expect(lay.strips.some((a) => Math.abs(a - (lay.alongX ? s.x : s.z)) < 1e-6) && lay.bays.some((b) => Math.abs(b - (lay.alongX ? s.z : s.x)) < 1e-6), 'gameplay spot lands on a bay centre of the shared grid');
+  }
+  for (const p of lotProps) {
+    const lot = lotOf(p.x, p.z);
+    expect(lot !== null, `${p.kind} lies in a lot`);
+    if (p.kind === 'island') {
+      expect(hasCollider(p.x, p.z), 'island has an AABB prop collider');
+      const r = rect(p.x, p.z, p.yaw, 0.75, 2.8);
+      for (const o of rects) expect(!overlap(r, o), 'island never overlaps a parked car');
+    } else {
+      expect(lotProps.some((q) => q.kind === 'island' && Math.abs(q.x - p.x) < 2.2 && Math.abs(q.z - p.z) < 2.2), 'planter stands on an island');
+    }
+  }
+  // The spawn lot: static cars present, the nearest gameplay spot to the spawn untouched.
+  const sp = c.points.playerSpawn;
+  expect(parked.some((p) => Math.hypot(p.x - sp.x, p.z - sp.z) < 45), 'static cars in the spawn lot');
+  // Determinism of the dressing alone.
+  const b = generateCity(1907).city;
+  expect(JSON.stringify(b.parked) === JSON.stringify(parked) && JSON.stringify(b.lotProps) === JSON.stringify(lotProps), 'lot dressing deterministic for the seed');
 });

@@ -3,7 +3,7 @@ import type { Random } from '../core/Random';
 import type { StaticCollider } from '../core/Collision';
 import { SpatialHash } from '../core/SpatialHash';
 import { BLOCK, DISTRICTS, GRID_COLS, INTERSECTION_R, LANDMARK_BLOCKS, LANES_PER_DIR, LANE_W, PITCH, PLAZA_BLOCKS, ROAD_W } from './CityConfig';
-import type { Block, Building, District, Landmark, Lot, NeonSign, ParkedSpot, Prop } from './CityData';
+import type { Block, Building, District, Landmark, Lot, LotProp, NeonSign, ParkedCar, ParkedSpec, ParkedSpot, Prop } from './CityData';
 import type { RoadGraph, LanePos } from './RoadGraph';
 import type { SidewalkGraph } from './SidewalkGraph';
 
@@ -18,6 +18,8 @@ export interface GenContext {
   neonSigns: NeonSign[];
   parkedSpots: ParkedSpot[];
   emptyLots: Lot[];
+  parked: ParkedCar[];
+  lotProps: LotProp[];
   roads: RoadGraph;
   sidewalks: SidewalkGraph;
 }
@@ -27,7 +29,7 @@ export const STATIC_CELL = 32;
 export const ASPHALT_HALF = LANES_PER_DIR * LANE_W;
 
 export function createContext(rng: Random, roads: RoadGraph, sidewalks: SidewalkGraph, blocks: Block[]): GenContext {
-  return { rng, blocks, buildings: [], colliders: [], hash: new SpatialHash<StaticCollider>(STATIC_CELL), props: [], landmarks: [], neonSigns: [], parkedSpots: [], emptyLots: [], roads, sidewalks };
+  return { rng, blocks, buildings: [], colliders: [], hash: new SpatialHash<StaticCollider>(STATIC_CELL), props: [], landmarks: [], neonSigns: [], parkedSpots: [], emptyLots: [], parked: [], lotProps: [], roads, sidewalks };
 }
 
 export function districtOf(col: number, row: number): District {
@@ -76,6 +78,28 @@ export function addCircle(ctx: GenContext, cx: number, cz: number, r: number, ta
 export function addProp(ctx: GenContext, kind: Prop['kind'], x: number, z: number, yaw: number, scale: number, colliderR: number): void {
   ctx.props.push({ kind, x, z, yaw, scale });
   if (colliderR > 0) addCircle(ctx, x, z, colliderR * scale, 'prop', kind === 'palm' ? 7 * scale : kind === 'lamp' ? 6 : kind === 'sign' ? 2.6 : kind === 'shelter' ? 2.5 : 1);
+}
+
+/**
+ * AABB collider of a box of half sizes `hw` (across) x `hl` (along the nose) at a quarter-turn yaw: the footprint of a
+ * parked car or a kerb island. (right = (-cos yaw, sin yaw), forward = (sin yaw, cos yaw).)
+ */
+function addFootprint(ctx: GenContext, x: number, z: number, yaw: number, hw: number, hl: number, height: number): void {
+  const c = Math.abs(Math.cos(yaw)), s = Math.abs(Math.sin(yaw));
+  const ex = hw * c + hl * s, ez = hw * s + hl * c;
+  addAabb(ctx, x - ex, z - ez, x + ex, z + ez, 'prop', height);
+}
+
+/** Static parked car (lot set dressing) with its footprint collider, like the sign / shelter props. */
+export function addParkedCar(ctx: GenContext, x: number, z: number, yaw: number, spec: ParkedSpec, colour: number, halfW: number, halfL: number, height: number): void {
+  ctx.parked.push({ x, z, yaw, spec, colour });
+  addFootprint(ctx, x, z, yaw, halfW, halfL, height);
+}
+
+/** Lot furniture; a zero footprint (planters standing on an island already inside its collider) adds no collider. */
+export function addLotProp(ctx: GenContext, kind: LotProp['kind'], x: number, z: number, yaw: number, halfW: number, halfL: number, height: number): void {
+  ctx.lotProps.push({ kind, x, z, yaw });
+  if (halfW > 0 && halfL > 0) addFootprint(ctx, x, z, yaw, halfW, halfL, height);
 }
 
 /** Distance from a point to a collider's surface (negative when inside an AABB / circle). */

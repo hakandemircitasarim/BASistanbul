@@ -11,10 +11,21 @@ export interface Landmark { kind: 'tower' | 'arena' | 'lighthouse' | 'ferris' | 
 export interface ParkedSpot { x: number; z: number; yaw: number }
 export interface NeonSign { x: number; y: number; z: number; yaw: number; text: string; color: number; w: number; h: number }
 export interface NamedPoint { x: number; z: number; yaw: number }
+export type ParkedSpec = 'sedan' | 'sport' | 'van';
+/**
+ * A static car filling a lot bay: set dressing with a collider, never a Vehicle (CityRendererProps draws a cheap shell
+ * of `spec` tinted `colour`). The nose points along `yaw` (0 = +Z), always a multiple of a quarter turn.
+ */
+export interface ParkedCar { x: number; z: number; yaw: number; spec: ParkedSpec; colour: number }
+/** Lot furniture: kerb islands at the heads of the bay strips and the planters standing on them (`booth` is reserved). */
+export interface LotProp { kind: 'planter' | 'island' | 'booth'; x: number; z: number; yaw: number }
 export interface CityData {
   seed: number; buildings: Building[]; blocks: Block[]; props: Prop[]; landmarks: Landmark[]; parkedSpots: ParkedSpot[];
   staticColliders: StaticCollider[]; neonSigns: NeonSign[]; bounds: AABB;
   /** Empty lot cells used as off-street parking (kerb ring, bays and wheel stops are drawn from these). */
   lots?: Lot[];
+  /** Static cars in the lot bays (about 40 % of the bays gameplay does not use) and the lot furniture. */
+  parked?: ParkedCar[];
+  lotProps?: LotProp[];
   points: { playerSpawn: NamedPoint; hospital: NamedPoint; policeStation: NamedPoint; pier: NamedPoint; missionStarts: NamedPoint[]; garage: NamedPoint; beachDelivery: NamedPoint };
 }

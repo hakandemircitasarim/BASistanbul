@@ -1,9 +1,13 @@
-// Lot subdivision and building placement per block: lot grids, merges, empty parking lots, heights, styles, neon signs. Track A.
+// Lot subdivision and building placement per block: lot grids, merges, empty parking lots, heights, styles, neon signs;
+// lot furnishing (static parked cars, kerb islands, planters) once the gameplay spots are placed. Track A.
 import { BLOCK } from './CityConfig';
 import { NEONS, SIGN_WORDS, pickStyle } from './Palette';
-import type { Building, NeonSign } from './CityData';
-import { addAabb, districtOf } from './CityBuild';
+import type { Block, Building, Lot, NeonSign, ParkedSpec } from './CityData';
+import { addAabb, addLotProp, addParkedCar, blockIndex, districtOf } from './CityBuild';
 import type { GenContext } from './CityBuild';
+import type { LanePos, RoadGraph } from './RoadGraph';
+import type { Random } from '../core/Random';
+import { SPECS } from '../entities/VehicleSpecs';
 
 const INSET = 2;
 const GAP_NORMAL = 1.5;
@@ -245,4 +249,157 @@ function makeSign(rng: { range(a: number, b: number): number; pick<T>(a: readonl
   const dir = FACING_DIR[b.facing];
   const off = (b.facing === 0 || b.facing === 2 ? b.d : b.w) / 2 + 0.15;
   return { x: b.x + dir[0] * off, y: rng.range(6, b.h - 2), z: b.z + dir[1] * off, yaw: FACING_YAW[b.facing], text: rng.pick(SIGN_WORDS), color: rng.pick(NEONS), w, h: SIGN_H };
+}
+
+// ---------------------------------------------------------------------------------------------- lot furnishing
+
+/**
+ * Bay geometry of a lot, shared with the painted bays of CityRenderer (STREET.stripInset / stripPitch / bayPitch /
+ * bayLen / lotGateW mirror these — the render layer cannot be imported here). Strips run along the heading of the
+ * nearest lane at the parked-spot pitch (so every gameplay spot lands on a bay centre), bays step across it.
+ */
+export const LOT_BAYS = { inset: 3.5, stripPitch: 9, bayPitch: 3, bayLen: 5.6, gateW: 7, gateDepth: 12, kerbW: 0.3 } as const;
+/** Share of the free bays that get a static car. */
+const P_PARKED = 0.4;
+/** Bays kept free around every gameplay spot, in bay pitches along the driver's exit side (negative = far side). */
+const SPOT_CLEAR_BAYS = [1, 2, -1] as const;
+const PARKED_MIX: { key: ParkedSpec; weight: number }[] = [{ key: 'sedan', weight: 60 }, { key: 'sport', weight: 20 }, { key: 'van', weight: 20 }];
+/** Kerb island at a strip head: bay-long, a car door wide, kerb high. Planters (r 0.45) stand on the islands. */
+const ISLAND = { w: 1.5, l: 5.6, h: 0.16, p: 0.5, p2: 0.3 } as const;
+const PARKED_H = 1.5;
+
+/** Axis-aligned rectangle in world space. */
+export interface Rect { x0: number; z0: number; x1: number; z1: number }
+
+export interface LotLayout {
+  /** Strips (and car noses) run along x when true, along z otherwise. */
+  alongX: boolean;
+  /** Yaw of the nearest lane (the heading every bay follows). */
+  yaw: number;
+  /** Strip centres along the heading axis and bay centres across it. */
+  strips: number[];
+  bays: number[];
+  /** Nearest block edge the lot opens onto (0 +Z, 1 +X, 2 -Z, 3 -X) and the drive lane behind the gate. */
+  gate: 0 | 1 | 2 | 3;
+  gateRect: Rect;
+}
+
+const overlaps = (a: Rect, b: Rect, pad: number): boolean => a.x0 < b.x1 + pad && a.x1 > b.x0 - pad && a.z0 < b.z1 + pad && a.z1 > b.z0 - pad;
+const inside = (r: Rect, lot: Lot, margin: number): boolean =>
+  r.x0 >= lot.x - lot.w / 2 + margin && r.x1 <= lot.x + lot.w / 2 - margin && r.z0 >= lot.z - lot.d / 2 + margin && r.z1 <= lot.z + lot.d / 2 - margin;
+
+/** World rectangle of a bay-shaped box centred at (along, across) in a lot's heading frame: `l` along, `w` across. */
+function bayRect(lay: LotLayout, along: number, across: number, l: number, w: number): Rect {
+  const x = lay.alongX ? along : across, z = lay.alongX ? across : along;
+  const ex = lay.alongX ? l / 2 : w / 2, ez = lay.alongX ? w / 2 : l / 2;
+  return { x0: x - ex, z0: z - ez, x1: x + ex, z1: z + ez };
+}
+
+/** Bay grid, heading and gate of a lot (exported so the tests can check the placements against it). */
+export function lotLayout(roads: RoadGraph, blocks: Block[], lot: Lot): LotLayout {
+  const B = LOT_BAYS;
+  roads.nearestLane(lot.x, lot.z, laneScratch);
+  const dir = roads.lanes[laneScratch.lane].dir;
+  const alongX = Math.abs(dir.x) >= Math.abs(dir.z);
+  const yaw = Math.atan2(dir.x, dir.z);
+  const along0 = (alongX ? lot.x - lot.w / 2 : lot.z - lot.d / 2) + B.inset, along1 = (alongX ? lot.x + lot.w / 2 : lot.z + lot.d / 2) - B.inset;
+  const across0 = (alongX ? lot.z - lot.d / 2 : lot.x - lot.w / 2) + B.inset, across1 = (alongX ? lot.z + lot.d / 2 : lot.x + lot.w / 2) - B.inset;
+  const strips: number[] = [], bays: number[] = [];
+  for (let a = along0; a <= along1 + 1e-6; a += B.stripPitch) strips.push(a);
+  for (let c = across0; c <= across1 + 1e-6; c += B.bayPitch) bays.push(c);
+  const x0 = lot.x - lot.w / 2, x1 = lot.x + lot.w / 2, z0 = lot.z - lot.d / 2, z1 = lot.z + lot.d / 2;
+  const blk = blocks[blockIndex(lot.blockCol, lot.blockRow)];
+  const dS = blk.z1 - z1, dN = z0 - blk.z0, dE = blk.x1 - x1, dW = x0 - blk.x0;
+  let gate: 0 | 1 | 2 | 3 = dN < dS ? 2 : 0, best = Math.min(dS, dN);
+  if (dE < best) { best = dE; gate = 1; }
+  if (dW < best) gate = 3;
+  const g = B.gateW / 2 + 1, dpt = B.gateDepth;
+  const gateRect: Rect = gate === 0 ? { x0: lot.x - g, x1: lot.x + g, z0: z1 - dpt, z1 }
+    : gate === 2 ? { x0: lot.x - g, x1: lot.x + g, z0, z1: z0 + dpt }
+      : gate === 1 ? { x0: x1 - dpt, x1, z0: lot.z - g, z1: lot.z + g }
+        : { x0, x1: x0 + dpt, z0: lot.z - g, z1: lot.z + g };
+  return { alongX, yaw, strips, bays, gate, gateRect };
+}
+
+const laneScratch: LanePos = { lane: 0, t: 0 };
+
+function pickParkedSpec(rng: Random): ParkedSpec {
+  let total = 0;
+  for (let i = 0; i < PARKED_MIX.length; i++) total += PARKED_MIX[i].weight;
+  let r = rng.next() * total;
+  for (let i = 0; i < PARKED_MIX.length; i++) { r -= PARKED_MIX[i].weight; if (r < 0) return PARKED_MIX[i].key; }
+  return 'sedan';
+}
+
+/**
+ * Fills the lots after the gameplay spots are placed: kerb islands (with planters) at both heads of every bay strip,
+ * then a static car in about 40 % of the bays that are free. A bay stays free when it is a gameplay spot, the bay to
+ * the right of one (where `?nearcar=1` and the exit put the player), lies in the gate's drive lane, or touches an
+ * island. Everything gets a collider, so the player cannot drive through the dressing. Seeded from the city stream.
+ */
+export function furnishLots(ctx: GenContext): void {
+  const rng = ctx.rng.fork();
+  const B = LOT_BAYS;
+  const lots = ctx.emptyLots, spots = ctx.parkedSpots;
+  const blocked: Rect[] = [];
+  for (let li = 0; li < lots.length; li++) {
+    const lot = lots[li];
+    const lay = lotLayout(ctx.roads, ctx.blocks, lot);
+    blocked.length = 0;
+    blocked.push(lay.gateRect);
+    for (let i = 0; i < spots.length; i++) {
+      const s = spots[i];
+      if (Math.abs(s.x - lot.x) > lot.w / 2 || Math.abs(s.z - lot.z) > lot.d / 2) continue;
+      const along = lay.alongX ? s.x : s.z, across = lay.alongX ? s.z : s.x;
+      blocked.push(bayRect(lay, along, across, B.bayLen, B.bayPitch));
+      // right(yaw) = (-cos yaw, sin yaw): the driver's exit side. Keep two bays free there (the player stands in the
+      // first one at spawn / on exit) and one on the far side, so the cheap parked shells never sit a metre from the
+      // camera at the start of the game.
+      for (const k of SPOT_CLEAR_BAYS) {
+        const rx = s.x - Math.cos(s.yaw) * B.bayPitch * k, rz = s.z + Math.sin(s.yaw) * B.bayPitch * k;
+        blocked.push(bayRect(lay, lay.alongX ? rx : rz, lay.alongX ? rz : rx, B.bayLen, B.bayPitch));
+      }
+    }
+    // Islands at the two heads of every strip: just outside the first / last bay line, inside the kerb ring.
+    const first = lay.bays[0] - B.bayPitch / 2, last = lay.bays[lay.bays.length - 1] + B.bayPitch / 2;
+    for (let si = 0; si < lay.strips.length; si++) {
+      for (let end = 0; end < 2; end++) {
+        const across = end === 0 ? first - 0.1 - ISLAND.w / 2 : last + 0.1 + ISLAND.w / 2;
+        const r = bayRect(lay, lay.strips[si], across, ISLAND.l, ISLAND.w);
+        if (!inside(r, lot, B.kerbW + 0.1)) continue;
+        let hit = false;
+        for (let k = 0; k < blocked.length && !hit; k++) hit = overlaps(r, blocked[k], 0.3);
+        if (hit) continue;
+        const x = (r.x0 + r.x1) / 2, z = (r.z0 + r.z1) / 2;
+        const yaw = lay.alongX ? Math.PI / 2 : 0;
+        addLotProp(ctx, 'island', x, z, yaw, ISLAND.w / 2, ISLAND.l / 2, ISLAND.h);
+        blocked.push(r);
+        if (rng.chance(ISLAND.p)) {
+          const two = rng.chance(ISLAND.p2);
+          const off = two ? 1.6 : 0;
+          for (let k = 0; k < (two ? 2 : 1); k++) {
+            const o = off * (k === 0 ? -1 : 1);
+            addLotProp(ctx, 'planter', x + (lay.alongX ? o : 0), z + (lay.alongX ? 0 : o), yaw, 0, 0, 0);
+          }
+        }
+      }
+    }
+    // Static cars in the free bays, nose in or out at random, along the heading.
+    for (let si = 0; si < lay.strips.length; si++) {
+      for (let bi = 0; bi < lay.bays.length; bi++) {
+        const r = bayRect(lay, lay.strips[si], lay.bays[bi], B.bayLen, B.bayPitch);
+        let hit = false;
+        for (let k = 0; k < blocked.length && !hit; k++) hit = overlaps(r, blocked[k], 0);
+        if (hit || !rng.chance(P_PARKED)) continue;
+        const key = pickParkedSpec(rng);
+        const spec = SPECS[key];
+        const colour = rng.pick(spec.colors);
+        const forward = rng.chance(0.5);
+        const yaw = lay.alongX ? (forward ? Math.PI / 2 : -Math.PI / 2) : (forward ? 0 : Math.PI);
+        const x = (r.x0 + r.x1) / 2, z = (r.z0 + r.z1) / 2;
+        addParkedCar(ctx, x, z, yaw, key, colour, spec.width / 2, spec.length / 2, PARKED_H);
+        blocked.push(r);
+      }
+    }
+  }
 }

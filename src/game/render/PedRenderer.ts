@@ -296,6 +296,7 @@ export class PedRenderer {
 
   private make(geo: THREE.BufferGeometry, cap: number): THREE.InstancedMesh {
     const m = new THREE.InstancedMesh(geo, this.mat, cap);
+    m.name = 'ped:part';
     m.count = 0;
     m.frustumCulled = false;
     m.castShadow = true;
