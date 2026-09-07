@@ -48,8 +48,8 @@ export const CAMERA_FAR = 900;
 export const POSTFX = { bloomStrength: 0.9, bloomRadius: 0.45, bloomThreshold: 1.4, bloomThresholdDay: 3.0, dayScale: 0.12, vignette: 0.9, saturation: 0.92, contrast: 1.0, msaaSamples: 4,
   // Ambient occlusion (metres): sized for street furniture, kerbs and building bases.
   aoIntensity: 1.0, aoRadius: 3.2, aoThickness: 1.0, aoSamples: 12,
-  // Split tone: cool blue-violet shadows, warm highlights. Almost off by day (0.06); strongest around dusk (0.32).
-  shadowTint: [0.80, 0.86, 1.15] as const, highlightTint: [1.05, 1.0, 0.93] as const, tintDay: 0.06, tintDusk: 0.32,
+  // Split tone: cool blue-violet shadows, warm highlights. Almost off by day (0.06); strongest around dusk (0.18 — higher values turned dusk into a monochrome salmon wash).
+  shadowTint: [0.80, 0.86, 1.15] as const, highlightTint: [1.05, 1.0, 0.93] as const, tintDay: 0.06, tintDusk: 0.18,
   grain: 0.03 } as const;
 
 /**

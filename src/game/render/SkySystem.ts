@@ -21,13 +21,14 @@ export const SKY_KEYS: SkyKey[] = [
   { hour: 12, top: 0x2a63d4, horizon: 0xa9cdef, sun: 0xfff1dc, fill: 0x8fb4e8, ground: 0x9a8a78, fog: 0xb4cbe6, sunI: 1.15, ambI: 1.0, fogDensity: 0.0018 },
   { hour: 16.5, top: 0x3670c8, horizon: 0xe8c8a8, sun: 0xffe2b0, fill: 0x7f98d0, ground: 0x8a7a68, fog: 0xe6d2c2, sunI: 1.0, ambI: 0.9, fogDensity: 0.002 },
   { hour: 17.5, top: 0x3454a8, horizon: 0xf8b880, sun: 0xffd090, fill: 0x7480c0, ground: 0x7a6860, fog: 0xecc8b0, sunI: 1.05, ambI: 0.85, fogDensity: 0.0021 },
-  { hour: 18, top: 0x6a3f9a, horizon: 0xff8a48, sun: 0xffb070, fill: 0x70629e, ground: 0x6a5048, fog: 0xf0b898, sunI: 1.1, ambI: 0.9, fogDensity: 0.002 },
-  { hour: 19, top: 0x6a2c8f, horizon: 0xff7a3d, sun: 0xff8a48, fill: 0x554a8c, ground: 0x50403a, fog: 0xd7a08e, sunI: 0.8, ambI: 0.9, fogDensity: 0.0024 },
+  { hour: 18, top: 0x4a4aa8, horizon: 0xff9a58, sun: 0xffb070, fill: 0x6470b4, ground: 0x625650, fog: 0xe6c6b4, sunI: 1.1, ambI: 0.9, fogDensity: 0.002 },
+  { hour: 19, top: 0x363284, horizon: 0xff8a4a, sun: 0xff8a48, fill: 0x4a5aa0, ground: 0x46423f, fog: 0xc6b0b4, sunI: 1.0, ambI: 0.85, fogDensity: 0.0022 },
   { hour: 20.5, top: 0x141238, horizon: 0x4a2c66, sun: 0x000000, fill: 0x34407a, ground: 0x3a2c22, fog: 0x2a2448, sunI: 0.05, ambI: 0.6, fogDensity: 0.0032 },
   { hour: 22, top: 0x07081f, horizon: 0x3a2a4e, sun: 0x000000, fill: 0x2c3a6e, ground: 0x3a2c22, fog: 0x1a1e44, sunI: 0, ambI: 0.5, fogDensity: 0.0036 },
 ];
 
-export const SKY_TUNING = {
+export const scratchLuma = new THREE.Color();
+const SKY_TUNING = {
   domeRadius: 850, sunDist: 700, sunScale: 34, moonScale: 55, starCount: 1400, shadowBox: 120, shadowMap: 2048, lightUnits: 3.0,
   // Clouds: uv scale of the flat-plane projection, density cut/softness, day and night coverage, drift per game hour.
   cloudScale: 0.6, cloudCut: 0.28, cloudSoft: 0.3, cloudDay: 0.45, cloudNight: 0.22, cloudDrift: 0.018,
@@ -68,9 +69,15 @@ void main() {
   vec2 sd = normalize(vec2(uSunDir.x, uSunDir.z) + vec2(1e-4, 0.0));
   float sunSide = 0.4 + 0.6 * pow(0.5 + 0.5 * dot(hd, sd), 2.0);
   vec3 hor = mix(mix(uHorizon, uTop, 0.4) * 1.1, uHorizon, sunSide);
+  // An orange horizon key blended with a violet zenith key lands on magenta; at low sun pull the away-from-sun haze and
+  // the mid band toward their luminance (a grey-blue dusk) so the sky does not wash the whole frame salmon.
+  const vec3 LUMA = vec3(0.299, 0.587, 0.114);
+  float dusk = uSunLow;
+  hor = mix(hor, vec3(dot(hor, LUMA)) * vec3(1.0, 0.97, 0.96), 0.4 * dusk * (1.0 - sunSide));
   // Three-stop gradient: bright horizon band, a mid tone at ~17 deg elevation, then a slow curve into the deep zenith.
   // With a low sun the band narrows (mid pulled toward the top) so the sunset glow stays a rim, not a whole-sky wash.
   vec3 mid = mix(mix(hor, uTop, 0.72), uTop, uSunLow * 0.3) * 0.8;
+  mid = mix(mid, vec3(dot(mid, LUMA)) * vec3(0.9, 0.95, 1.06), 0.5 * dusk);
   vec3 col = yy < 0.3 ? mix(hor, mid, pow(yy / 0.3, 0.7)) : mix(mid, uTop, pow((yy - 0.3) / 0.7, 0.45));
   if (y < 0.0) col = mix(hor, hor * 0.35, clamp(-y * 3.0, 0.0, 1.0));
   float s = max(dot(d, uSunDir), 0.0);
@@ -292,6 +299,8 @@ export class SkySystem {
         const ss = 0.5 + 0.5 * (Math.cos(phi) * sdx + Math.sin(phi) * sdz);
         hor.lerpColors(coolHor, warmHor, 0.4 + 0.6 * ss * ss);
         mid.lerpColors(hor, top, 0.72).lerp(top, sunLow * 0.3).multiplyScalar(0.8);
+        // Mirror of the dome's low-sun desaturation (see FRAG) so the probe agrees with the visible sky.
+        { const l = mid.r * 0.299 + mid.g * 0.587 + mid.b * 0.114; mid.lerp(scratchLuma.setRGB(l * 0.9, l * 0.95, l * 1.06), 0.5 * sunLow); }
         if (y >= 0) {
           if (y < 0.035) px.copy(hor).multiplyScalar(1.12);
           else if (y < 0.3) px.lerpColors(hor, mid, Math.pow(y / 0.3, 0.7));

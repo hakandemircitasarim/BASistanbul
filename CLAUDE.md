@@ -17,7 +17,7 @@ Ayrıntılı sözleşmeler: `docs/GAME_DESIGN.md` (bölüm 0 = temel kurallar, 2
 - Sabit adım 1/60 s, render interpolasyonu; `fixedUpdate` ve `sync` yollarında **tahsis yok**
   (modül seviyesinde scratch nesneler, `out` parametreleri, sayaç döndüren sorgular).
 - Yoğun nesneler `InstancedMesh`, statik şehir birleştirilmiş (merged) geometri.
-- Çizim çağrısı bütçesi: kare başına < 120 (statik şehir ~35), üçgen bütçesi ~100 bin.
+- Çizim çağrısı bütçesi: kare başına < 120 (öğlen ~97, statik şehir ~52), üçgen bütçesi öğlen ≤ ~720 bin (şu an ~660 bin); doku belleği ~84 MB RGBA.
 - Çok sayıda statik nesne (lamba, palmiye) mesafeye göre paketlenir: `PropRenderer` yalnızca
   `PROP_RANGE` içindekileri instance tamponuna yazar ve kamera 15 m hareket edince yeniden paketler.
 - Dinamik çözünürlük: `Renderer.adapt()` fps düşerse çizim tamponunu 0.65'e kadar küçültür
