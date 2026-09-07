@@ -191,7 +191,7 @@ test('BuildingGeometry: every landmark kind yields parts; the ferris wheel has a
 test('SkySystem: SKY_KEYS ascend in hour, carry fill/ground/fogDensity and hit the sunset palette at 19:00', () => {
   for (let i = 1; i < SKY_KEYS.length; i++) expect(SKY_KEYS[i].hour > SKY_KEYS[i - 1].hour, 'keys ascend');
   const k = SKY_KEYS.find((s) => s.hour === 19);
-  expect(k !== undefined && k.horizon === 0xff7a3d && k.top === 0x6a2c8f, 'sunset horizon #ff7a3d / top #6a2c8f');
+  expect(k !== undefined && k.horizon === 0xff8a4a && k.top === 0x363284, 'sunset horizon #ff8a4a / top #363284');
   expect(k !== undefined && k.fill === 0x554a8c && k.sun === 0xff8a48, 'sunset: orange key against a violet fill');
   for (const s of SKY_KEYS) {
     expect(s.fogDensity >= 0.001 && s.fogDensity <= 0.006, `fog density sane at ${s.hour} (${s.fogDensity})`);
