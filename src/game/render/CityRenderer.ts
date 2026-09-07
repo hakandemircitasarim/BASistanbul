@@ -9,7 +9,7 @@ import type { Materials } from './Materials';
 import { STYLES, TILE_M } from './Materials';
 import type { TextureFactory } from './TextureFactory';
 import { GLOW_U, MARK_UV } from './TextureFactory';
-import { BAND, GeoBuilder, appendBuilding, appendBuildingDetail, appendStreetLevel, bandHeight, landmarkGeometries } from './BuildingGeometry';
+import { BAND, FACE, GeoBuilder, appendBuilding, appendBuildingDetail, appendStreetLevel, bandHeight, landmarkGeometries } from './BuildingGeometry';
 import type { WallSign } from './BuildingGeometry';
 import { Random } from '../core/Random';
 import { PropRenderer } from './CityRendererProps';
@@ -88,6 +88,15 @@ function decal(gb: GeoBuilder, cx: number, cz: number, hx: number, hz: number, w
 
 const laneScratch: LanePos = { lane: 0, t: 0 };
 
+/**
+ * Neon sign bodies. `wallGap` is how far CityLots hangs the sign centre off the facade (0.15 m); the backing box runs
+ * from the wall to `backing` in front of it and the glyph quad sits `lift` in front of the box. Signs up to
+ * `fullWidth` m keep their full tint, wider ones dim by sqrt(fullWidth / w) down to `minTint`.
+ */
+const NEON = { wallGap: 0.15, backing: 0.25, lift: 0.05, margin: 0.25, body: 0x24262b, strut: 0x3a3d44, fullWidth: 8, minTint: 0.72 } as const;
+/** World face bit of building face 0..3 (+Z, +X, -Z, -X), the order CityLots' FACING_YAW uses. */
+const FACE_BIT = [FACE.pz, FACE.px, FACE.nz, FACE.nx];
+
 export class CityRenderer {
   private readonly scene: THREE.Scene;
   private readonly city: CityData;
@@ -145,7 +154,7 @@ export class CityRenderer {
     const markMesh = this.addGeo(marks.build(), this.materials.roadMark, false, true);
     markMesh.renderOrder = 1;
     this.buildGround();
-    this.props = new PropRenderer(this.scene, this.city.props, this.materials);
+    this.props = new PropRenderer(this.scene, this.city.props, this.materials, this.city.parked ?? [], this.city.lotProps ?? []);
     this._staticDraws += this.props.drawCount;
     this.buildNeon();
   }
@@ -218,16 +227,47 @@ export class CityRenderer {
       if (gb.vertexCount === 0) continue;
       this.addGeo(gb.build(), this.materials.building[STYLES[i]], true, true);
     }
+    this.appendNeonBodies(trim);
     // Thin trims never receive: a cornice shadowing its own soffit turns into shadow acne at grazing sun.
     if (trim.vertexCount > 0) this.addGeo(trim.build(), this.materials.plain, false, false);
     if (glow.vertexCount > 0) this.addGeo(glow.build(), this.materials.glow, false, true);
     if (shopBand.vertexCount > 0) this.addGeo(shopBand.build(), this.materials.shopfront, false, true);
     if (plinthBand.vertexCount > 0) this.addGeo(plinthBand.build(), this.materials.plinth, false, true);
-    if (awning.vertexCount > 0) this.addGeo(awning.build(), this.materials.awning, true, true);
+    // Awnings sit under the arcade cap's own shadow; keeping ~20k of thin canvas out of the shadow pass buys the per-bay variety.
+    if (awning.vertexCount > 0) this.addGeo(awning.build(), this.materials.awning, false, true);
   }
 
   /** Painted wall signs collected by the building detail pass, drawn with the neon atlas. */
   private readonly wallSigns: WallSign[] = [];
+
+  /**
+   * Sign bodies behind the neon words: a dark box NEON.backing proud of the wall, a hair wider than the glyph quad,
+   * with two struts under it, so the letters hang on something instead of floating on the render. Plain trim mesh.
+   */
+  private appendNeonBodies(trim: GeoBuilder): void {
+    const signs = this.city.neonSigns;
+    const ao = trim.bakeAo;
+    trim.bakeAo = false;
+    for (let i = 0; i < signs.length; i++) {
+      const s = signs[i];
+      const rx = Math.cos(s.yaw), rz = -Math.sin(s.yaw), nx = Math.sin(s.yaw), nz = Math.cos(s.yaw);
+      const hw = s.w / 2 + NEON.margin, hh = s.h / 2 + NEON.margin * 0.6;
+      // s is NEON.wallGap off the wall: the box runs from the wall to NEON.backing in front of it.
+      const wx = s.x - nx * NEON.wallGap, wz = s.z - nz * NEON.wallGap;
+      const ax = wx - rx * hw, az = wz - rz * hw, bx = wx + rx * hw, bz = wz + rz * hw;
+      const fx = nx * NEON.backing, fz = nz * NEON.backing;
+      // Axis-aligned box (signs face one of the four block edges): front, both ends, top and bottom; the wall face is never seen.
+      const f = (((Math.round(s.yaw / (Math.PI / 2)) % 4) + 4) % 4);
+      const mask = FACE_BIT[f] | FACE_BIT[(f + 1) % 4] | FACE_BIT[(f + 3) % 4] | FACE.top | FACE.bot;
+      trim.setColor(NEON.body);
+      trim.boxFaces(Math.min(ax, bx, ax + fx, bx + fx), s.y - hh, Math.min(az, bz, az + fz, bz + fz), Math.max(ax, bx, ax + fx, bx + fx), s.y + hh, Math.max(az, bz, az + fz, bz + fz), NEON.body, mask);
+      for (const side of [-0.35, 0.35]) {
+        const px = wx + rx * s.w * side, pz = wz + rz * s.w * side;
+        trim.bar(px, s.y - hh - 0.45, pz, px + fx, s.y - hh, pz + fz, 0.08, NEON.strut);
+      }
+    }
+    trim.bakeAo = ao;
+  }
 
   private buildLandmarks(): void {
     const list = this.city.landmarks;
@@ -469,8 +509,11 @@ export class CityRenderer {
       const rx = Math.cos(s.yaw), rz = -Math.sin(s.yaw); // local +X in world
       const nx = Math.sin(s.yaw), nz = Math.cos(s.yaw);
       const hw = s.w / 2, hh = s.h / 2;
-      gb.setColor(s.color);
-      gb.quad(s.x - rx * hw, s.y - hh, s.z - rz * hw, s.x + rx * hw, s.y - hh, s.z + rz * hw, s.x + rx * hw, s.y + hh, s.z + rz * hw, s.x - rx * hw, s.y + hh, s.z - rz * hw,
+      // Glyph quad NEON.lift in front of the backing box (appendNeonBodies) so the two never z-fight; wide signs are
+      // dimmed through the tint (a 14 m word at full strength is a wall of light) - the atlas halo does the glowing.
+      const px = s.x + nx * (NEON.backing - NEON.wallGap + NEON.lift), pz = s.z + nz * (NEON.backing - NEON.wallGap + NEON.lift);
+      gb.setColor(s.color, Math.max(NEON.minTint, Math.sqrt(NEON.fullWidth / s.w)));
+      gb.quad(px - rx * hw, s.y - hh, pz - rz * hw, px + rx * hw, s.y - hh, pz + rz * hw, px + rx * hw, s.y + hh, pz + rz * hw, px - rx * hw, s.y + hh, pz - rz * hw,
         nx, 0, nz, rect.u0, rect.v0, rect.u1, rect.v0, rect.u1, rect.v1, rect.u0, rect.v1);
     }
     const mesh = this.addGeo(gb.build(), this.materials.neon(atlas.texture), false, false);

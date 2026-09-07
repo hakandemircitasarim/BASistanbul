@@ -1,7 +1,8 @@
 // Track B tests: DayNightSystem clock/sun/night factor/AI lights, building UVs in meters, landmark parts, sky keys. Track B.
 import { test, expect, approx, createHeadless } from './harness';
 import { DayNightSystem, DAY_TUNING } from '../../src/game/systems/DayNightSystem';
-import { ARCADE, BAND, GeoBuilder, appendBuilding, appendBuildingDetail, appendStreetLevel, bandHeight, buildingGeometry, hasCrown, landmarkGeometries, massingOf } from '../../src/game/render/BuildingGeometry';
+import { ARCADE, BAND, GeoBuilder, appendBuilding, appendBuildingDetail, appendStreetLevel, bandHeight, buildingGeometry, buildingTint, hasCrown, landmarkGeometries, massingOf } from '../../src/game/render/BuildingGeometry';
+import { PLINTH_BAYS, PLINTH_TILE_W, SHOP_BAYS, SHOP_TILE_W } from '../../src/game/render/TextureFactory';
 import { Random } from '../../src/game/core/Random';
 import { SKY_KEYS } from '../../src/game/render/SkySystem';
 import { Vehicle } from '../../src/game/entities/Vehicle';
@@ -115,16 +116,45 @@ test('BuildingGeometry: street level = recessed band + arcade columns + cap, awn
   for (let s = ARCADE.recess + ARCADE.bay; s < 16 - ARCADE.recess - 1.5; s += ARCADE.bay) bays++;
   expect(bays >= 2, `a 16 m face holds at least two bay columns (got ${bays})`);
   expect(style.vertexCount === (6 + 8 + 3 * bays) * 4, `cap + corner + bay columns = ${6 + 8 + 3 * bays} quads (got ${style.vertexCount / 4})`);
-  // Awning: one slope + one valance quad, u along the span, v from 1 at the wall down to 0 at the hem.
-  expect(awning.vertexCount === 8, `awning = 2 quads (got ${awning.vertexCount / 4})`);
+  // The band starts the shop sequence on a whole bay (so the painted piers stay under the columns), picked per face.
+  const bayStarts = [0];
+  for (let i = 0; i < SHOP_BAYS.length; i++) bayStarts.push(bayStarts[i] + SHOP_BAYS[i].w);
+  approx(bayStarts[bayStarts.length - 1], SHOP_TILE_W, 1e-9, 'shop bays fill the tile exactly');
+  for (let k = 1; k * ARCADE.bay < SHOP_TILE_W; k++) expect(bayStarts.some((v) => Math.abs(v - k * ARCADE.bay) < 1e-9), `a bay boundary (pier) falls on arcade column line ${k}`);
+  const u0 = bg.attributes.uv.getX(0), u0side = bg.attributes.uv.getX(4);
+  expect(bayStarts.some((v) => Math.abs(v / SHOP_TILE_W - u0) < 1e-6), `band u offset is a whole bay (u0 ${u0.toFixed(4)})`);
+  expect(Math.abs(u0side - u0) > 1e-6, 'adjacent faces start at different bays');
+  // Awnings per shop bay: several slope + valance pairs in more than one colour, plus the cafe's hanging sign board;
+  // u runs along the span, v from 1 at the wall down to 0 at the hem, and nothing pokes above the arcade cap.
+  expect(awning.vertexCount % 4 === 0 && awning.vertexCount / 4 >= 8, `awnings per bay: at least 4 awnings (got ${awning.vertexCount / 4} quads)`);
   const ag = awning.build();
-  let vMin = 1, vMax = 0, uMax = 0;
-  for (let i = 0; i < 8; i++) { vMin = Math.min(vMin, ag.attributes.uv.getY(i)); vMax = Math.max(vMax, ag.attributes.uv.getY(i)); uMax = Math.max(uMax, ag.attributes.uv.getX(i)); }
-  expect(vMin === 0 && vMax === 1 && uMax > 3, `awning v spans 0..1 and u repeats along the span (u max ${uMax.toFixed(2)})`);
-  expect(ag.attributes.position.getY(0) > ag.attributes.position.getY(6), 'awning slopes down from the wall');
+  let vMin = 1, vMax = 0, uMax = 0, yMin = Infinity, yMax = 0;
+  const tints = new Set<string>();
+  for (let i = 0; i < ag.attributes.position.count; i++) {
+    vMin = Math.min(vMin, ag.attributes.uv.getY(i)); vMax = Math.max(vMax, ag.attributes.uv.getY(i)); uMax = Math.max(uMax, ag.attributes.uv.getX(i));
+    yMin = Math.min(yMin, ag.attributes.position.getY(i)); yMax = Math.max(yMax, ag.attributes.position.getY(i));
+    tints.add(`${ag.attributes.color.getX(i).toFixed(2)},${ag.attributes.color.getY(i).toFixed(2)},${ag.attributes.color.getZ(i).toFixed(2)}`);
+  }
+  expect(vMin === 0 && vMax === 1 && uMax > 2, `awning v spans 0..1 and u repeats along the span (u max ${uMax.toFixed(2)})`);
+  expect(yMax < BAND.shopH - 0.3 && yMin > 2.2 && yMax - yMin > 0.6, `awnings hang under the cap and drop (y ${yMin.toFixed(2)}..${yMax.toFixed(2)})`);
+  expect(tints.size >= 3, `awnings come in several colours (got ${tints.size})`);
+  // Neighbouring ids render with different tints even on the same palette colour.
+  expect(buildingTint(shop) !== buildingTint({ ...shop, id: 8 }), 'render tint differs between neighbouring ids');
+  // Downtown plinth: band stretched to whole bays per face, a cap, and an entrance canopy in front of the facing wall.
   const plinthStyle = new GeoBuilder(), plinth = new GeoBuilder();
-  appendStreetLevel(plinthStyle, plinth, sampleBuilding({}), rng, true, awning, 15);
-  expect(plinth.vertexCount === 16 && plinthStyle.vertexCount === 20 && awning.vertexCount === 8, 'downtown plinth: flush band + cap, no columns, no awning');
+  const tower = sampleBuilding({});
+  appendStreetLevel(plinthStyle, plinth, tower, rng, true, awning, 15);
+  expect(plinth.vertexCount === 16 && plinthStyle.vertexCount > 20 && awning.vertexCount === ag.attributes.position.count, 'downtown plinth: flush band + cap + entrance, no columns, no awning');
+  const pg = plinth.build();
+  const nBays = Math.round((tower.w + 2 * BAND.plinthOut) / (PLINTH_TILE_W / PLINTH_BAYS));
+  approx(pg.attributes.uv.getX(1) - pg.attributes.uv.getX(0), nBays / PLINTH_BAYS, 1e-6, `plinth facing wall holds ${nBays} whole bays`);
+  const sg = plinthStyle.build();
+  let canopyZ = -Infinity, canopyTop = 0;
+  for (let i = 0; i < sg.attributes.position.count; i++) { const z = sg.attributes.position.getZ(i); if (z > canopyZ) { canopyZ = z; canopyTop = sg.attributes.position.getY(i); } }
+  expect(canopyZ > tower.z + tower.d / 2 + BAND.plinthOut + 2.2 && canopyTop < BAND.plinthH, `entrance canopy reaches 2.5 m over the pavement (z ${canopyZ.toFixed(2)})`);
+  // Long street faces split into tint segments (one quad a face otherwise).
+  const longG = buildingGeometry(sampleBuilding({ w: 60 }));
+  expect(longG.attributes.position.count > 20, `a 60 m face is more than one quad (got ${longG.attributes.position.count / 4} quads)`);
   // Without a street mask a shop still gets its band and cap but no columns.
   const s2 = new GeoBuilder();
   appendStreetLevel(s2, new GeoBuilder(), shop, rng, false, null, 0);

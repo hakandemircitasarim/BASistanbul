@@ -18,10 +18,18 @@ const WINDOW_EMISSIVE_COLOR = 0xffe6b8;
 const NEON_MIN_OPACITY = 0.15;
 /** Shop interiors stay a little lit in daylight so the street level never reads as dead. */
 const SHOP_EMISSIVE_DAY = 0.16;
-const SHOP_EMISSIVE_NIGHT = 2.0;
-const PLINTH_EMISSIVE_NIGHT = 1.6;
+/** 1.5: the warm interiors land just under the night bloom threshold (1.4) so a lit shop row stays legible; only the ceiling spots tip over it. */
+const SHOP_EMISSIVE_NIGHT = 1.5;
+/** 1.3: the baked lobby (pendants at ~1.0 in the map) glows without the whole band blooming into a white wall. */
+const PLINTH_EMISSIVE_NIGHT = 1.3;
 /** Unlit additive materials are not tone mapped, so a x2 colour stays in range on screen but crosses the bloom threshold. */
 const HDR_BOOST = 2;
+/**
+ * Neon glyphs: x1.5 rather than the lamp boost. At x2 a 12 m sign crossed the bloom threshold over its whole face and
+ * the letters smeared into one blob; at x1.5 the atlas' own baked halo carries the glow and the strokes stay readable.
+ * CityRenderer dims wide signs further through the vertex tint.
+ */
+const NEON_BOOST = 1.5;
 
 /**
  * Roughness / metalness / sky-probe strength per surface family. Everything lit is MeshStandardMaterial so the PMREM
@@ -52,7 +60,7 @@ export class Materials {
   readonly glow: THREE.MeshStandardMaterial;
   /** Ground-floor shopfront band (beachfront/suburb): glazing + fascias, warm interiors at night. */
   readonly shopfront: THREE.MeshStandardMaterial;
-  /** Ground-floor stone plinth band (downtown): pilasters + recessed lobby glazing. */
+  /** Ground-floor lobby plinth band (downtown): pale stone piers, tall lobby glazing with a baked interior, an entrance bay. */
   readonly plinth: THREE.MeshStandardMaterial;
   /** Striped canvas for shop awnings (vertex colour sets the hue, u runs along the stripes' width, v up the drop). */
   readonly awning: THREE.MeshStandardMaterial;
@@ -172,6 +180,8 @@ export class Materials {
     this.macroVariation(this.sand, macro, macroFor(TILE_M.sand), 0.12);
     this.macroVariation(this.grass, macro, macroFor(TILE_M.grass), 0.22);
     this.setNight(0);
+    // Name every material after its field so Renderer.sceneBreakdown() can attribute merged meshes (debug only).
+    for (const [k, v] of Object.entries(this)) if (v instanceof THREE.Material && !v.name) v.name = k;
   }
 
   /**
@@ -205,7 +215,7 @@ export class Materials {
   /** Neon sign atlas material: additive, vertex-tinted, opacity follows the night factor (min 0.15 by day). */
   neon(atlasTex: THREE.Texture): THREE.MeshBasicMaterial {
     if (!this.neonMat) {
-      this.neonMat = new THREE.MeshBasicMaterial({ map: atlasTex, color: new THREE.Color(HDR_BOOST, HDR_BOOST, HDR_BOOST), vertexColors: true, transparent: true, opacity: NEON_MIN_OPACITY, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, fog: false, toneMapped: false });
+      this.neonMat = new THREE.MeshBasicMaterial({ map: atlasTex, color: new THREE.Color(NEON_BOOST, NEON_BOOST, NEON_BOOST), vertexColors: true, transparent: true, opacity: NEON_MIN_OPACITY, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, fog: false, toneMapped: false });
       this.applyNight();
     }
     return this.neonMat;

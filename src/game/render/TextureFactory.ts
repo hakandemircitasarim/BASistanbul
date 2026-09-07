@@ -17,11 +17,36 @@ export const ROOF_V = 1 - ROOF_STRIP_PX / 2 / WINDOW_TILE_PX_H;
 export const GLOW_U = { none: 0.0625, magenta: 0.1875, cyan: 0.3125, yellow: 0.4375, orange: 0.5625, red: 0.6875, green: 0.8125, white: 0.9375 } as const;
 const GLOW_CELLS: number[] = [0x000000, 0xff2d95, 0x00e5ff, 0xfff03b, 0xff7a00, 0xff2418, 0x2bff6a, 0xf0f4ff];
 export const ROAD_TILE_M = 14;
-/** Street-level band tiles: the ground-floor shopfront (beach/suburb) and the downtown stone plinth. u repeats every TILE_W m, v spans the band height exactly. The shop tile carries a pier on every quarter (4 m), where BuildingGeometry's arcade columns stand. */
-export const SHOP_TILE_W = 16;
+/** Street-level band tiles: the ground-floor shopfront (beach/suburb) and the downtown lobby plinth. u repeats every TILE_W m, v spans the band height exactly. The shop tile carries a pier on every quarter (6 m), where BuildingGeometry's arcade columns stand. */
+export const SHOP_TILE_W = 24;
 export const SHOP_BAND_H = 4.2;
-export const PLINTH_TILE_W = 16;
+export const PLINTH_TILE_W = 24;
 export const PLINTH_BAND_H = 6;
+/** The plinth tile holds PLINTH_BAYS equal bays; bay PLINTH_DOOR_BAY (0-based) is the double-door entrance the geometry hangs a canopy over. */
+export const PLINTH_BAYS = 5;
+export const PLINTH_DOOR_BAY = 2;
+export type ShopKind = 'bakkal' | 'eczane' | 'kebap' | 'door' | 'kuafor' | 'shutter' | 'simit' | 'market' | 'butik' | 'vacant' | 'kahve' | 'lokanta';
+/** One bay of the shopfront tile: width in metres, what stands in it, its fascia colours and how the fascia is built (painted board / lit sign box / timber board). */
+export interface ShopBay { name: string; w: number; kind: ShopKind; fascia: number; text: number; glow: number; sign: 'board' | 'lightbox' | 'wood' | 'none' }
+/**
+ * Bays of the 24 m shopfront tile in order, in four 6 m groups so a pier falls on every arcade column line (ARCADE.bay):
+ * nine glazed shops, a rolled shutter, a recessed stair entrance and a whitewashed vacant unit. Exported so the geometry
+ * can start each facade at a different bay, hang an awning per shop and a sign board on the cafe.
+ */
+export const SHOP_BAYS: readonly ShopBay[] = [
+  { name: 'BAKKAL', w: 2.4, kind: 'bakkal', fascia: 0x1f5a48, text: 0xfff4dc, glow: 0x62ffc0, sign: 'board' },
+  { name: 'ECZANE', w: 1.7, kind: 'eczane', fascia: 0xf0f2ee, text: 0x1e8a4c, glow: 0x3cf080, sign: 'lightbox' },
+  { name: 'KEBAP', w: 1.9, kind: 'kebap', fascia: 0xc8281e, text: 0xfff0c8, glow: 0xffb15c, sign: 'lightbox' },
+  { name: 'KUAFÖR', w: 1.9, kind: 'kuafor', fascia: 0x6a2050, text: 0xffe0f0, glow: 0xff6aa8, sign: 'board' },
+  { name: 'BERBER', w: 1.5, kind: 'shutter', fascia: 0x1f3a5c, text: 0xf0f4ff, glow: 0x59c8ff, sign: 'board' },
+  { name: '', w: 1.1, kind: 'door', fascia: 0x8c8478, text: 0, glow: 0, sign: 'none' },
+  { name: 'SİMİT', w: 1.5, kind: 'simit', fascia: 0x8a5a2a, text: 0x2a1a08, glow: 0xffd070, sign: 'wood' },
+  { name: 'MARKET', w: 2.4, kind: 'market', fascia: 0x1c4fa8, text: 0xffffff, glow: 0x7fb4ff, sign: 'lightbox' },
+  { name: 'KİRALIK', w: 1.6, kind: 'vacant', fascia: 0xbdb5a6, text: 0x9a8f7c, glow: 0, sign: 'none' },
+  { name: 'BUTİK', w: 2.0, kind: 'butik', fascia: 0x2a2a30, text: 0xf4e8d8, glow: 0xffe0b0, sign: 'board' },
+  { name: 'KAHVE', w: 2.5, kind: 'kahve', fascia: 0x3e2a1a, text: 0xf0d090, glow: 0xffc878, sign: 'wood' },
+  { name: 'LOKANTA', w: 3.5, kind: 'lokanta', fascia: 0xe0a020, text: 0x3a2408, glow: 0xffd070, sign: 'lightbox' },
+];
 /** Road-marking atlas cells (u0,v0,u1,v1): forward arrow, forward+left, forward+right, plain white bar. */
 export const MARK_UV = {
   ahead: { u0: 0, v0: 0.5, u1: 0.5, v1: 1 },
@@ -945,12 +970,14 @@ export class TextureFactory {
   }
 
   /**
-   * Ground-floor shopfront band (16 m x 4.2 m at 2048 x 512 px, 128 px/m): eight shops with painted interiors
-   * behind the glass - shelving, counters, a doner spit, mannequins, tiled floors - plus a bay under a rolled steel
-   * shutter and a recessed apartment doorway, with Turkish names lettered on the fascias. The interior scene is
-   * drawn once on a scratch canvas and used twice: dimmed through the glass in the albedo, and under a warm ceiling
-   * light in the emissive, so the same shelves that show by day glow at night. Relief comes from a structure canvas
-   * (piers, fascias, frames, slats), not the albedo, so a poster does not read as a bump.
+   * Ground-floor shopfront band (24 m x 4.2 m at 3072 x 512 px, 128 px/m): the twelve SHOP_BAYS in four 6 m groups
+   * so a stone pier falls on every arcade column line - nine glazed shops with painted interiors behind the glass
+   * (shelving, counters, a doner spit, mannequins, cafe tables, tiled floors), a bay under a rolled steel shutter with
+   * tags sprayed over it, a whitewashed vacant unit with a KİRALIK notice and a recessed stair entrance. The fascias
+   * come in three families (painted board, lit sign box, timber board with gold lettering) in seven colours. The
+   * interior scene is drawn once on a scratch canvas and used twice: dimmed through the glass in the albedo, and under
+   * a warm ceiling light in the emissive, so the same shelves that show by day glow at night. Relief comes from a
+   * structure canvas (piers, fascias, frames, slats), not the albedo, so a poster does not read as a bump.
    */
   shopfront(): WindowTextures {
     const key = 'shop';
@@ -959,7 +986,7 @@ export class TextureFactory {
     const nk = this.cache.get(key + ':nrm') as THREE.CanvasTexture | undefined;
     const rk = this.cache.get(key + ':rgh') as THREE.CanvasTexture | undefined;
     if (mk && ek && nk && rk) return { map: mk, emissive: ek, normal: nk, rough: rk };
-    const W = 2048, H = 512;
+    const W = 3072, H = 512;
     const sx = W / SHOP_TILE_W, sy = H / SHOP_BAND_H;
     const X = (mx: number): number => mx * sx;
     const Y = (my: number): number => (SHOP_BAND_H - my) * sy;
@@ -970,7 +997,7 @@ export class TextureFactory {
     n.ctx.scale(0.5, 0.5);
     m.ctx.fillStyle = '#cdc6b8';
     m.ctx.fillRect(0, 0, W, H);
-    this.mottle(m.ctx, W, H, rng, 90, 30, 90, 0.05, 0, 0, true);
+    this.mottle(m.ctx, W, H, rng, 120, 30, 90, 0.05, 0, 0, true);
     e.ctx.fillStyle = '#000';
     e.ctx.fillRect(0, 0, W, H);
     r.ctx.fillStyle = grey(0.9);
@@ -978,19 +1005,7 @@ export class TextureFactory {
     n.ctx.fillStyle = grey(0.5);
     n.ctx.fillRect(0, 0, W, H);
     scene.ctx.clearRect(0, 0, W, H);
-    type Kind = 'bakkal' | 'eczane' | 'kebap' | 'door' | 'kuafor' | 'shutter' | 'simit' | 'market' | 'butik';
-    // Widths sum to 16 m in four 4 m groups, so a pier falls on every quarter of the tile (the arcade column line).
-    const bays: { name: string; w: number; kind: Kind; fascia: number; text: number; glow: number }[] = [
-      { name: 'BAKKAL', w: 2.3, kind: 'bakkal', fascia: 0x1f5a48, text: 0xfff4dc, glow: 0x62ffc0 },
-      { name: 'ECZANE', w: 1.7, kind: 'eczane', fascia: 0xf0f2ee, text: 0x1e8a4c, glow: 0x3cf080 },
-      { name: 'KEBAP', w: 2.2, kind: 'kebap', fascia: 0x8c2020, text: 0xffe6b0, glow: 0xffb15c },
-      { name: 'KUAFÖR', w: 1.8, kind: 'kuafor', fascia: 0x6a2050, text: 0xffe0f0, glow: 0xff6aa8 },
-      { name: 'BERBER', w: 1.6, kind: 'shutter', fascia: 0x1f3a5c, text: 0xf0f4ff, glow: 0x59c8ff },
-      { name: '', w: 0.9, kind: 'door', fascia: 0x8c8478, text: 0, glow: 0 },
-      { name: 'SİMİT', w: 1.5, kind: 'simit', fascia: 0xb87a1c, text: 0x3a2408, glow: 0xffd070 },
-      { name: 'MARKET', w: 2.2, kind: 'market', fascia: 0x1c4fa8, text: 0xffffff, glow: 0x7fb4ff },
-      { name: 'BUTİK', w: 1.8, kind: 'butik', fascia: 0x2a2a30, text: 0xf4e8d8, glow: 0xffe0b0 },
-    ];
+    const bays = SHOP_BAYS;
     // Heights above the pavement (m): stall riser, glazing, fascia.
     const RISER = 0.35, GLASS_TOP = 3.3, FASCIA_Y = 3.4, PIER = 0.24;
     const floorY = Y(0.85);
@@ -1060,19 +1075,68 @@ export class TextureFactory {
         sc.fill();
       }
     };
+    const pendants = (x0: number, x1: number, count: number, cord: string): void => {
+      // Pendant lamps on cords: a shade with a bright underside, hung a little lower than the recessed spots.
+      for (let k = 0; k < count; k++) {
+        const cx = x0 + ((k + 0.5) / count) * (x1 - x0);
+        sc.fillStyle = cord;
+        sc.fillRect(cx - 1, Y(GLASS_TOP), 2, Y(2.55) - Y(GLASS_TOP));
+        sc.fillStyle = '#3a2c22';
+        sc.beginPath();
+        sc.moveTo(cx - 14, Y(2.35));
+        sc.lineTo(cx + 14, Y(2.35));
+        sc.lineTo(cx + 8, Y(2.55));
+        sc.lineTo(cx - 8, Y(2.55));
+        sc.closePath();
+        sc.fill();
+        sc.fillStyle = '#ffe9b8';
+        sc.fillRect(cx - 12, Y(2.35), 24, 5);
+      }
+    };
+    const table = (cx: number, round: boolean, cloth: string | null): void => {
+      // A table with two chairs seen from the pavement: top at 0.75 m, a stem or four legs, chairs as dark backs.
+      const tw = round ? 0.62 * sx : 0.9 * sx, y = Y(0.75);
+      sc.fillStyle = '#3a3034';
+      if (round) sc.fillRect(cx - 3, y, 6, Y(0.42) - y);
+      else { sc.fillRect(cx - tw / 2 + 4, y, 4, Y(0.42) - y); sc.fillRect(cx + tw / 2 - 8, y, 4, Y(0.42) - y); }
+      sc.fillStyle = cloth ?? '#8a5c34';
+      sc.fillRect(cx - tw / 2, y - 6, tw, cloth ? 22 : 7);
+      sc.fillStyle = rgba(0, 0, 0, 0.35);
+      sc.fillRect(cx - tw / 2, y + (cloth ? 16 : 1), tw, 3);
+      for (const s of [-1, 1]) {
+        const x = cx + s * (tw / 2 + 12);
+        sc.fillStyle = '#2c2428';
+        sc.fillRect(x - 7, Y(1.0), 14, Y(0.7) - Y(1.0));
+        sc.fillRect(x - 6, Y(0.7), 3, Y(0.42) - Y(0.7));
+        sc.fillRect(x + 3, Y(0.7), 3, Y(0.42) - Y(0.7));
+      }
+    };
     let mx = 0;
     const fasciaFont = `900 ${Math.round(0.42 * sy)}px 'Trebuchet MS', 'Segoe UI', 'DejaVu Sans', Arial, sans-serif`;
+    const woodFont = `bold ${Math.round(0.4 * sy)}px Georgia, 'Times New Roman', 'DejaVu Serif', serif`;
     for (const bay of bays) {
       const bx0 = X(mx), bx1 = X(mx + bay.w);
       const ix0 = X(mx + PIER / 2), ix1 = X(mx + bay.w - PIER / 2);
       mx += bay.w;
       if (bay.kind === 'door') {
-        // Recessed apartment entrance: dark reveal, a panelled timber door with a fanlight, a step and a number plate.
+        // Recessed stair entrance: dark reveal with a lit jamb, two granite risers climbing into it, a panelled timber
+        // door with a fanlight and a number plate.
         m.ctx.fillStyle = '#2a2622';
         m.ctx.fillRect(ix0, Y(FASCIA_Y), ix1 - ix0, Y(0) - Y(FASCIA_Y));
-        const dw = Math.min(0.9 * sx, ix1 - ix0 - 12), dx = (ix0 + ix1) / 2 - dw / 2;
+        this.softRect(m.ctx, ix0, Y(FASCIA_Y), 9, Y(0.34) - Y(FASCIA_Y), '#a29a8c', 0.55);
+        const STEP = 0.17;
+        for (let k = 0; k < 2; k++) {
+          const ry0 = Y((k + 1) * STEP), ry1 = Y(k * STEP);
+          m.ctx.fillStyle = k === 0 ? '#8a8478' : '#7c766a';
+          m.ctx.fillRect(ix0 + 4 + k * 6, ry0, ix1 - ix0 - 8 - k * 12, ry1 - ry0);
+          this.softRect(m.ctx, ix0 + 4 + k * 6, ry0, ix1 - ix0 - 8 - k * 12, 3, '#fff', 0.4);
+          this.softRect(m.ctx, ix0 + 4 + k * 6, ry1 - 5, ix1 - ix0 - 8 - k * 12, 5, '#000', 0.35);
+          n.ctx.fillStyle = grey(0.42 + k * 0.08);
+          n.ctx.fillRect(ix0 + 4 + k * 6, ry0, ix1 - ix0 - 8 - k * 12, ry1 - ry0);
+        }
+        const dw = Math.min(0.92 * sx, ix1 - ix0 - 22), dx = (ix0 + ix1) / 2 - dw / 2;
         m.ctx.fillStyle = '#6a4426';
-        m.ctx.fillRect(dx, Y(2.5), dw, Y(0.42) - Y(2.5));
+        m.ctx.fillRect(dx, Y(2.5), dw, Y(0.34) - Y(2.5));
         for (const [py0, py1] of [[2.3, 1.55], [1.35, 0.6]]) {
           this.softRect(m.ctx, dx + 10, Y(py0), dw - 20, Y(py1) - Y(py0), '#000', 0.3);
           this.softRect(m.ctx, dx + 14, Y(py0) + 4, dw - 28, Y(py1) - Y(py0) - 8, '#8a5c34', 1);
@@ -1084,24 +1148,23 @@ export class TextureFactory {
         m.ctx.fillRect(dx, Y(2.95), dw, Y(2.55) - Y(2.95));
         e.ctx.fillStyle = rgba(150, 120, 80, 1);
         e.ctx.fillRect(dx, Y(2.95), dw, Y(2.55) - Y(2.95));
-        // Step and number plate.
-        m.ctx.fillStyle = '#8a8478';
-        m.ctx.fillRect(ix0, Y(0.42), ix1 - ix0, Y(0) - Y(0.42));
-        this.softRect(m.ctx, ix0, Y(0.42), ix1 - ix0, 3, '#fff', 0.35);
+        // Number plate and doorbell panel.
         m.ctx.fillStyle = '#1a3c8c';
         m.ctx.fillRect(dx - 22, Y(2.2), 18, 14);
+        m.ctx.fillStyle = '#b8b4a8';
+        m.ctx.fillRect(dx - 20, Y(1.7), 12, 26);
         // Lintel band where the fascia would be.
         m.ctx.fillStyle = hex(bay.fascia);
         m.ctx.fillRect(bx0, Y(SHOP_BAND_H), bx1 - bx0, Y(FASCIA_Y));
-        // Structure: the recess sits back, the door step forward.
+        // Structure: the recess sits back, the door and the steps forward.
         n.ctx.fillStyle = grey(0.22);
-        n.ctx.fillRect(ix0, Y(FASCIA_Y), ix1 - ix0, Y(0.42) - Y(FASCIA_Y));
+        n.ctx.fillRect(ix0, Y(FASCIA_Y), ix1 - ix0, Y(0.34) - Y(FASCIA_Y));
         n.ctx.fillStyle = grey(0.35);
-        n.ctx.fillRect(dx, Y(2.95), dw, Y(0.42) - Y(2.95));
+        n.ctx.fillRect(dx, Y(2.95), dw, Y(0.34) - Y(2.95));
         r.ctx.fillStyle = grey(0.55);
-        r.ctx.fillRect(dx, Y(2.5), dw, Y(0.42) - Y(2.5));
+        r.ctx.fillRect(dx, Y(2.5), dw, Y(0.34) - Y(2.5));
       } else if (bay.kind === 'shutter') {
-        // Rolled steel shutter down over the whole opening: a housing box, slats, a tag sprayed low.
+        // Rolled steel shutter down over the whole opening: a housing box, slats, tags sprayed low and a torn poster.
         m.ctx.fillStyle = '#5a5e62';
         m.ctx.fillRect(ix0, Y(GLASS_TOP + 0.05), ix1 - ix0, Y(3.0) - Y(GLASS_TOP + 0.05));
         this.softRect(m.ctx, ix0, Y(3.0), ix1 - ix0, 6, '#000', 0.35);
@@ -1128,8 +1191,68 @@ export class TextureFactory {
         m.ctx.moveTo(ix0 + 90, Y(0.9));
         m.ctx.quadraticCurveTo(ix0 + 140, Y(1.4), ix0 + 190, Y(0.85));
         m.ctx.stroke();
+        m.ctx.lineWidth = 6;
+        m.ctx.strokeStyle = rgba(250, 230, 40, 0.75);
+        m.ctx.beginPath();
+        m.ctx.moveTo(ix0 + 40, Y(1.9));
+        m.ctx.lineTo(ix0 + 80, Y(2.3));
+        m.ctx.lineTo(ix0 + 96, Y(1.75));
+        m.ctx.stroke();
+        m.ctx.fillStyle = '#e8e2d4';
+        m.ctx.fillRect(ix1 - 60, Y(2.7), 44, 58);
+        m.ctx.fillStyle = '#c83a2a';
+        m.ctx.fillRect(ix1 - 56, Y(2.7) + 4, 36, 26);
         r.ctx.fillStyle = grey(0.5);
         r.ctx.fillRect(ix0, Y(GLASS_TOP + 0.05), ix1 - ix0, Y(RISER) - Y(GLASS_TOP + 0.05));
+      } else if (bay.kind === 'vacant') {
+        // Whitewashed vacant unit: the pane painted over from inside in streaky white, a taped KİRALIK notice with a
+        // phone line, and a blank fascia carrying the ghost of the sign that came down. Nothing lit at night.
+        const gx0 = ix0 + 6, gx1 = ix1 - 6, gy0 = Y(GLASS_TOP), gy1 = Y(RISER);
+        m.ctx.fillStyle = '#d6d2c6';
+        m.ctx.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+        for (let x = gx0; x < gx1;) {
+          const w = rng.range(5, 14);
+          m.ctx.fillStyle = rng.chance(0.55) ? rgba(255, 255, 255, rng.range(0.1, 0.32)) : rgba(110, 100, 86, rng.range(0.06, 0.18));
+          m.ctx.fillRect(x, gy0 + rng.range(0, 30), w, gy1 - gy0);
+          x += w;
+        }
+        const wash = m.ctx.createLinearGradient(0, gy0, 0, gy1);
+        wash.addColorStop(0, rgba(190, 205, 215, 0.3));
+        wash.addColorStop(0.5, rgba(190, 205, 215, 0));
+        wash.addColorStop(1, rgba(70, 62, 50, 0.22));
+        m.ctx.fillStyle = wash;
+        m.ctx.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+        // The notice: an A4 sheet with a red heading and a phone line, a strip of tape at each top corner.
+        const nw = 0.3 * sx, nh = 0.42 * sy, nx = (gx0 + gx1) / 2 - nw / 2, ny = Y(1.95);
+        m.ctx.fillStyle = '#f8f6f0';
+        m.ctx.fillRect(nx, ny, nw, nh);
+        m.ctx.font = `900 ${Math.round(0.11 * sy)}px 'Trebuchet MS', 'Segoe UI', 'DejaVu Sans', Arial, sans-serif`;
+        m.ctx.textAlign = 'center';
+        m.ctx.textBaseline = 'middle';
+        m.ctx.fillStyle = '#c8241e';
+        m.ctx.fillText('KİRALIK', nx + nw / 2, ny + nh * 0.28, nw - 6);
+        m.ctx.fillStyle = '#2a2a30';
+        for (let k = 0; k < 3; k++) m.ctx.fillRect(nx + 6, ny + nh * (0.52 + k * 0.14), nw - 12 - k * 8, 3);
+        m.ctx.fillStyle = rgba(255, 240, 200, 0.7);
+        m.ctx.fillRect(nx - 4, ny - 3, 12, 6);
+        m.ctx.fillRect(nx + nw - 8, ny - 3, 12, 6);
+        // Frame and one mullion, then the ghost sign on the fascia handled below.
+        const mull = (gx0 + gx1) / 2;
+        for (const c of [m.ctx, e.ctx]) {
+          c.fillStyle = c === m.ctx ? '#3a3e44' : '#000';
+          c.fillRect(gx0 - 6, gy0 - 6, gx1 - gx0 + 12, 8);
+          c.fillRect(gx0 - 6, gy0, 6, gy1 - gy0);
+          c.fillRect(gx1, gy0, 6, gy1 - gy0);
+          c.fillRect(mull - 3, gy0, 6, gy1 - gy0);
+        }
+        this.softRect(m.ctx, gx0 - 6, gy0 - 6, gx1 - gx0 + 12, 3, '#9aa8b4', 0.5);
+        n.ctx.fillStyle = grey(0.4);
+        n.ctx.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+        n.ctx.fillStyle = grey(0.62);
+        n.ctx.fillRect(gx0 - 6, gy0 - 6, gx1 - gx0 + 12, 8);
+        n.ctx.fillRect(mull - 3, gy0, 6, gy1 - gy0);
+        r.ctx.fillStyle = grey(0.5);
+        r.ctx.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
       } else {
         // Glazed shop: interior scene, then the glass over it.
         const gx0 = ix0 + 6, gx1 = ix1 - 6, gy0 = Y(GLASS_TOP), gy1 = Y(RISER);
@@ -1319,6 +1442,63 @@ export class TextureFactory {
             poster(doorLeft ? gx0 + 16 : gx1 - 66, Y(2.85), 50, 70, '#e0a030');
             break;
           }
+          case 'kahve': {
+            // Cafe: dark timber wall with a chalkboard menu, an espresso counter, pendants and two small round tables.
+            sc.fillStyle = '#5c4232';
+            sc.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+            sc.fillStyle = rgba(0, 0, 0, 0.2);
+            for (let x = gx0; x < gx1; x += 0.22 * sx) sc.fillRect(x, gy0, 2, gy1 - gy0);
+            const cbx = doorLeft ? gx1 - 1.05 * sx : gx0 + 14;
+            sc.fillStyle = '#243428';
+            sc.fillRect(cbx, Y(2.95), 0.9 * sx, Y(2.0) - Y(2.95));
+            sc.fillStyle = rgba(255, 244, 220, 0.8);
+            for (let yy = Y(2.85); yy < Y(2.05); yy += 11) sc.fillRect(cbx + 8, yy, rng.range(24, 80), 3);
+            pendants(gx0, gx1, narrow ? 2 : 3, '#1a1410');
+            floor(gx0, gx1, '#a89078', rgba(50, 36, 28, 0.5));
+            const kx0 = doorLeft ? gx0 + dw + 14 : gx0 + 10, kx1 = doorLeft ? gx1 - 0.9 * sx : gx0 + 0.95 * sx;
+            counter(kx0, kx1, '#3a2a20', '#d8cdbc');
+            // Espresso machine: a steel box with a chrome top and a red switch light.
+            const ex = (kx0 + kx1) / 2 - 0.2 * sx;
+            sc.fillStyle = '#b8bcc2';
+            sc.fillRect(ex, Y(1.4), 0.4 * sx, Y(0.95) - Y(1.4));
+            sc.fillStyle = '#e8ecf0';
+            sc.fillRect(ex - 3, Y(1.45), 0.4 * sx + 6, 6);
+            sc.fillStyle = '#e02020';
+            sc.fillRect(ex + 6, Y(1.25), 6, 6);
+            const tx = doorLeft ? gx0 + dw + 0.5 * sx : gx1 - 0.55 * sx;
+            table(tx, true, null);
+            if (!narrow) table(tx + (doorLeft ? 0.95 : -0.95) * sx, true, null);
+            break;
+          }
+          case 'lokanta': {
+            // Restaurant: pale wall with framed pictures, tables under white cloths, a display counter at the door.
+            sc.fillStyle = '#d8c8a8';
+            sc.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+            sc.fillStyle = '#8a4a30';
+            sc.fillRect(gx0, Y(1.35), gx1 - gx0, Y(0.85) - Y(1.35));
+            for (let k = 0; k < 3; k++) {
+              const px = gx0 + 0.3 * sx + k * 0.95 * sx;
+              if (px + 60 > gx1) break;
+              sc.fillStyle = '#3a2a1c';
+              sc.fillRect(px, Y(2.75), 56, 44);
+              sc.fillStyle = ['#5c9ad8', '#d8a050', '#7ab070'][k];
+              sc.fillRect(px + 5, Y(2.75) + 5, 46, 34);
+            }
+            spots(gx0, gx1, 4);
+            floor(gx0, gx1, '#d4c8b4', rgba(80, 60, 40, 0.35));
+            const t0 = doorLeft ? gx0 + dw + 0.6 * sx : gx0 + 0.55 * sx;
+            for (let k = 0; k < 3; k++) {
+              const tx = t0 + k * 1.15 * sx;
+              if (tx + 0.6 * sx > (doorLeft ? gx1 - 0.2 * sx : gx1 - dw - 0.5 * sx)) break;
+              table(tx, false, '#f4f0e6');
+            }
+            const cx0 = doorLeft ? gx0 + 8 : gx1 - 0.8 * sx, cx1 = doorLeft ? gx0 + 0.8 * sx : gx1 - 8;
+            counter(cx0, cx1, '#6a4a34', '#c8ccd0');
+            sc.fillStyle = rgba(200, 230, 240, 0.35);
+            sc.fillRect(cx0, Y(1.5), cx1 - cx0, Y(0.95) - Y(1.5));
+            for (let x = cx0 + 12; x < cx1 - 12; x += 22) { sc.fillStyle = ['#c86a30', '#e8d090', '#a03828'][rng.int(0, 2)]; sc.fillRect(x, Y(1.25), 14, 12); }
+            break;
+          }
           default:
             break;
         }
@@ -1390,31 +1570,111 @@ export class TextureFactory {
         r.ctx.fillStyle = grey(0.55);
         for (const x of mullions) r.ctx.fillRect(x - 3, gy0, 6, gy1 - gy0);
       }
-      // Fascia: a painted sign box with the shop name, a lit top edge and a shadow under it; dimly backlit at night.
+      // Fascia. Three families: a painted board with lit lettering, a sign box that glows as a whole at night with
+      // darker letters, and a timber board with gold serif lettering under a small spotlight. The vacant unit keeps a
+      // faded panel with the ghost of the old sign.
       if (bay.kind !== 'door') {
         const fy0 = Y(SHOP_BAND_H), fy1 = Y(FASCIA_Y);
-        m.ctx.fillStyle = hex(bay.fascia);
-        m.ctx.fillRect(bx0 + 3, fy0, bx1 - bx0 - 6, fy1 - fy0);
-        this.softRect(m.ctx, bx0 + 3, fy0, bx1 - bx0 - 6, 4, '#fff', 0.2);
-        this.softRect(m.ctx, bx0 + 3, fy1 - 8, bx1 - bx0 - 6, 8, '#000', 0.35);
-        const fg = e.ctx.createLinearGradient(0, fy0, 0, fy1);
-        fg.addColorStop(0, tint(bay.fascia, -0.55));
-        fg.addColorStop(1, tint(bay.fascia, -0.7));
-        e.ctx.fillStyle = fg;
-        e.ctx.fillRect(bx0 + 3, fy0, bx1 - bx0 - 6, fy1 - fy0);
-        for (const c of [m.ctx, e.ctx]) {
-          c.font = fasciaFont;
-          c.textAlign = 'center';
-          c.textBaseline = 'middle';
-          c.fillStyle = c === m.ctx ? hex(bay.text) : tint(bay.glow, 0.25);
-          c.fillText(bay.name, (bx0 + bx1) / 2, (fy0 + fy1) / 2 + 2, bx1 - bx0 - 40);
+        const fx0 = bx0 + 3, fw = bx1 - bx0 - 6;
+        if (bay.kind === 'vacant') {
+          m.ctx.fillStyle = hex(bay.fascia);
+          m.ctx.fillRect(fx0, fy0, fw, fy1 - fy0);
+          this.softRect(m.ctx, fx0, fy1 - 8, fw, 8, '#000', 0.25);
+          m.ctx.font = fasciaFont;
+          m.ctx.textAlign = 'center';
+          m.ctx.textBaseline = 'middle';
+          m.ctx.fillStyle = rgba(255, 252, 240, 0.35);
+          m.ctx.fillText('MANAV', (bx0 + bx1) / 2, (fy0 + fy1) / 2 + 2, fw - 40);
+          // Rust tears from the old bracket holes.
+          for (let k = 0; k < 3; k++) {
+            const hx = fx0 + fw * (0.2 + k * 0.3);
+            m.ctx.fillStyle = '#5a4a40';
+            m.ctx.fillRect(hx - 3, fy0 + 12, 6, 6);
+            const rust = m.ctx.createLinearGradient(0, fy0 + 18, 0, fy1 + 30);
+            rust.addColorStop(0, rgba(120, 60, 20, 0.5));
+            rust.addColorStop(1, rgba(120, 60, 20, 0));
+            m.ctx.fillStyle = rust;
+            m.ctx.fillRect(hx - 2, fy0 + 18, 4, fy1 - fy0 + 12);
+          }
+          n.ctx.fillStyle = grey(0.54);
+          n.ctx.fillRect(fx0, fy0, fw, fy1 - fy0);
+          r.ctx.fillStyle = grey(0.8);
+          r.ctx.fillRect(fx0, fy0, fw, fy1 - fy0);
+        } else if (bay.sign === 'lightbox') {
+          // Acrylic sign box: a dark frame, the coloured face and its letters; at night the whole face is lit.
+          m.ctx.fillStyle = '#2a2c30';
+          m.ctx.fillRect(fx0, fy0, fw, fy1 - fy0);
+          m.ctx.fillStyle = hex(bay.fascia);
+          m.ctx.fillRect(fx0 + 5, fy0 + 5, fw - 10, fy1 - fy0 - 10);
+          this.softRect(m.ctx, fx0 + 5, fy0 + 5, fw - 10, 3, '#fff', 0.3);
+          e.ctx.fillStyle = tint(bay.fascia, -0.42);
+          e.ctx.fillRect(fx0 + 5, fy0 + 5, fw - 10, fy1 - fy0 - 10);
+          for (const c of [m.ctx, e.ctx]) {
+            c.font = fasciaFont;
+            c.textAlign = 'center';
+            c.textBaseline = 'middle';
+            c.fillStyle = c === m.ctx ? hex(bay.text) : tint(bay.text, -0.3);
+            c.fillText(bay.name, (bx0 + bx1) / 2, (fy0 + fy1) / 2 + 2, fw - 44);
+          }
+          n.ctx.fillStyle = grey(0.6);
+          n.ctx.fillRect(fx0, fy0, fw, fy1 - fy0);
+          r.ctx.fillStyle = grey(0.35);
+          r.ctx.fillRect(fx0 + 5, fy0 + 5, fw - 10, fy1 - fy0 - 10);
+        } else if (bay.sign === 'wood') {
+          // Timber board: grain lines, a bevelled edge, gold serif lettering with a drop shadow, a spotlight wash.
+          m.ctx.fillStyle = hex(bay.fascia);
+          m.ctx.fillRect(fx0, fy0, fw, fy1 - fy0);
+          for (let yy = fy0 + 6; yy < fy1 - 4; yy += rng.range(5, 11)) {
+            m.ctx.fillStyle = rgba(0, 0, 0, rng.range(0.08, 0.2));
+            m.ctx.fillRect(fx0 + rng.range(0, 20), yy, fw - rng.range(0, 40), 2);
+          }
+          this.softRect(m.ctx, fx0, fy0, fw, 5, '#fff', 0.22);
+          this.softRect(m.ctx, fx0, fy1 - 6, fw, 6, '#000', 0.4);
+          this.softRect(m.ctx, fx0, fy0, 5, fy1 - fy0, '#fff', 0.15);
+          const wash = e.ctx.createLinearGradient(0, fy0, 0, fy1);
+          wash.addColorStop(0, tint(bay.fascia, -0.35));
+          wash.addColorStop(1, tint(bay.fascia, -0.8));
+          e.ctx.fillStyle = wash;
+          e.ctx.fillRect(fx0, fy0, fw, fy1 - fy0);
+          for (const c of [m.ctx, e.ctx]) {
+            c.font = woodFont;
+            c.textAlign = 'center';
+            c.textBaseline = 'middle';
+            if (c === m.ctx) {
+              c.fillStyle = rgba(0, 0, 0, 0.45);
+              c.fillText(bay.name, (bx0 + bx1) / 2 + 3, (fy0 + fy1) / 2 + 5, fw - 40);
+            }
+            c.fillStyle = c === m.ctx ? hex(bay.text) : tint(bay.text, -0.45);
+            c.fillText(bay.name, (bx0 + bx1) / 2, (fy0 + fy1) / 2 + 2, fw - 40);
+          }
+          n.ctx.fillStyle = grey(0.58);
+          n.ctx.fillRect(fx0, fy0, fw, fy1 - fy0);
+          r.ctx.fillStyle = grey(0.7);
+          r.ctx.fillRect(fx0, fy0, fw, fy1 - fy0);
+        } else {
+          m.ctx.fillStyle = hex(bay.fascia);
+          m.ctx.fillRect(fx0, fy0, fw, fy1 - fy0);
+          this.softRect(m.ctx, fx0, fy0, fw, 4, '#fff', 0.2);
+          this.softRect(m.ctx, fx0, fy1 - 8, fw, 8, '#000', 0.35);
+          const fg = e.ctx.createLinearGradient(0, fy0, 0, fy1);
+          fg.addColorStop(0, tint(bay.fascia, -0.55));
+          fg.addColorStop(1, tint(bay.fascia, -0.7));
+          e.ctx.fillStyle = fg;
+          e.ctx.fillRect(fx0, fy0, fw, fy1 - fy0);
+          for (const c of [m.ctx, e.ctx]) {
+            c.font = fasciaFont;
+            c.textAlign = 'center';
+            c.textBaseline = 'middle';
+            c.fillStyle = c === m.ctx ? hex(bay.text) : tint(bay.glow, 0.25);
+            c.fillText(bay.name, (bx0 + bx1) / 2, (fy0 + fy1) / 2 + 2, fw - 40);
+          }
+          n.ctx.fillStyle = grey(0.56);
+          n.ctx.fillRect(fx0, fy0, fw, fy1 - fy0);
+          r.ctx.fillStyle = grey(0.55);
+          r.ctx.fillRect(fx0, fy0, fw, fy1 - fy0);
         }
-        n.ctx.fillStyle = grey(0.56);
-        n.ctx.fillRect(bx0 + 3, fy0, bx1 - bx0 - 6, fy1 - fy0);
-        r.ctx.fillStyle = grey(0.55);
-        r.ctx.fillRect(bx0 + 3, fy0, bx1 - bx0 - 6, fy1 - fy0);
-        // Awning valance shadow just under the fascia (the real awning is geometry, and only on the street face).
-        this.softRect(m.ctx, bx0 + 3, fy1, bx1 - bx0 - 6, 8, '#000', 0.25);
+        // Awning valance shadow just under the fascia (the real awnings are geometry, on the street face only).
+        this.softRect(m.ctx, fx0, fy1, fw, 8, '#000', 0.18);
       }
       // Stone piers between the bays (each bay owns the pier on its left; the last one wraps to the seam).
       const pxl = bx0 - X(PIER / 2), pw = X(PIER);
@@ -1452,7 +1712,14 @@ export class TextureFactory {
     return { map, emissive, normal, rough };
   }
 
-  /** Downtown stone plinth band (16 m x 6 m): pilasters, recessed dark glazing, brass trim; emissive = dim lobby light. */
+  /**
+   * Downtown lobby plinth band (24 m x 6 m at 1536 x 384 px, 64 px/m): PLINTH_BAYS bays of 4.8 m between wide pale
+   * limestone piers standing on a polished granite base course, tall clear glazing with a baked lobby behind it
+   * (reception desk, pendant lights, planters, lift doors, a seating group, a logo wall) and one double-door
+   * entrance bay (PLINTH_DOOR_BAY) with a lit address number over the transom. The interior is drawn once on a scratch
+   * canvas: dimmed behind the glass in the albedo, warm-lit in the emissive. Relief comes from a structure canvas
+   * (piers, base course, frames), so the glazing reads as recessed between real piers rather than a corrugated wall.
+   */
   plinth(): WindowTextures {
     const key = 'plinth';
     const mk = this.cache.get(key + ':map') as THREE.CanvasTexture | undefined;
@@ -1460,82 +1727,294 @@ export class TextureFactory {
     const nk = this.cache.get(key + ':nrm') as THREE.CanvasTexture | undefined;
     const rk = this.cache.get(key + ':rgh') as THREE.CanvasTexture | undefined;
     if (mk && ek && nk && rk) return { map: mk, emissive: ek, normal: nk, rough: rk };
-    const W = 1024, H = 384;
+    const W = 1536, H = 384;
+    const sx = W / PLINTH_TILE_W, sy = H / PLINTH_BAND_H;
+    const X = (mx: number): number => mx * sx;
+    const Y = (my: number): number => (PLINTH_BAND_H - my) * sy;
     const rng = new Random(1607);
-    // The emissive only carries pane-sized lobby shapes: half resolution through a scaled context.
-    const m = this.canvas(W, H), e = this.canvas(W / 2, H / 2);
+    const m = this.canvas(W, H), e = this.canvas(W / 2, H / 2), n = this.canvas(W / 2, H / 2), r = this.canvas(W / 4, H / 4), scene = this.canvas(W, H);
     e.ctx.scale(0.5, 0.5);
-    m.ctx.fillStyle = '#4a4e58';
+    n.ctx.scale(0.5, 0.5);
+    r.ctx.scale(0.25, 0.25);
+    // Pale limestone ground with a soft mottle; the piers and bands are cut from it.
+    m.ctx.fillStyle = '#c6beae';
     m.ctx.fillRect(0, 0, W, H);
-    this.mottle(m.ctx, W, H, rng, 70, 20, 60, 0.06, 4000, 0.03, false);
+    this.mottle(m.ctx, W, H, rng, 60, 24, 70, 0.05, 0, 0, true);
     e.ctx.fillStyle = '#000';
     e.ctx.fillRect(0, 0, W, H);
-    const cornice = 44, base = H - 26;
-    const bays = 8, bw = W / bays, pw = 34;
-    for (let i = 0; i < bays; i++) {
-      const x = i * bw;
-      // Recessed dark glazing between pilasters.
-      const gx = x + pw / 2 + 6, gw = bw - pw - 12, gy = cornice + 18, gh = base - gy - 10;
-      m.ctx.fillStyle = '#243040';
-      m.ctx.fillRect(gx, gy, gw, gh);
-      m.ctx.fillStyle = rgba(120, 160, 200, 0.14);
-      m.ctx.fillRect(gx, gy, gw, gh * 0.35);
-      // Lobby: cool base light with two ceiling spots and a reception desk / column silhouettes.
-      e.ctx.fillStyle = rgba(70, 92, 118, 1);
-      e.ctx.fillRect(gx, gy, gw, gh);
-      for (let k = 0; k < 2; k++) {
-        const sx = gx + gw * (0.28 + k * 0.44) + rng.range(-8, 8), sy = gy + gh * 0.1, sr = gh * 0.55;
-        const g = e.ctx.createRadialGradient(sx, sy, 0, sx, sy, sr);
-        g.addColorStop(0, rgba(225, 238, 255, 1));
-        g.addColorStop(0.4, rgba(170, 200, 240, 0.5));
-        g.addColorStop(1, rgba(150, 190, 235, 0));
-        e.ctx.fillStyle = g;
-        e.ctx.fillRect(sx - sr, sy - sr, sr * 2, sr * 2);
-      }
-      e.ctx.fillStyle = rgba(0, 0, 0, 0.4);
-      e.ctx.fillRect(gx, gy + gh * 0.6, gw, gh * 0.4);
-      for (let k = 0; k < 3; k++) {
-        const sw = rng.range(10, 30), sh = gh * rng.range(0.3, 0.55);
-        const sx = gx + rng.range(4, gw - sw - 4);
-        e.ctx.fillStyle = rgba(0, 0, 0, 0.65);
-        e.ctx.fillRect(sx, gy + gh - sh, sw, sh);
-      }
-      for (const c of [m.ctx, e.ctx]) {
-        c.fillStyle = c === m.ctx ? 'rgba(24,30,38,0.95)' : 'rgba(0,0,0,0.9)';
-        for (let k = 1; k < 3; k++) c.fillRect(gx + (gw * k) / 3 - 3, gy, 6, gh);
-        c.fillRect(gx - 4, gy - 4, gw + 8, 7);
-        c.fillRect(gx - 4, gy + gh - 3, gw + 8, 7);
-      }
-      // Pilaster column.
-      m.ctx.fillStyle = '#5d626d';
-      m.ctx.fillRect(x - pw / 2, cornice, pw, base - cornice);
-      m.ctx.fillStyle = rgba(255, 255, 255, 0.16);
-      m.ctx.fillRect(x - pw / 2 + 3, cornice, 8, base - cornice);
-      m.ctx.fillStyle = rgba(0, 0, 0, 0.3);
-      m.ctx.fillRect(x + pw / 2 - 6, cornice, 6, base - cornice);
-      // Brass capital + base.
-      m.ctx.fillStyle = '#a8873c';
-      m.ctx.fillRect(x - pw / 2 - 3, cornice, pw + 6, 7);
-      m.ctx.fillRect(x - pw / 2 - 3, base - 10, pw + 6, 6);
+    n.ctx.fillStyle = grey(0.5);
+    n.ctx.fillRect(0, 0, W, H);
+    r.ctx.fillStyle = grey(0.85);
+    r.ctx.fillRect(0, 0, W, H);
+    // Heights above the pavement (m): granite base course, glazing head, cornice band. Pier width in metres.
+    const BASE = 0.6, GLASS_TOP = 5.3, CORNICE = 5.5, PIER = 0.7, BAY = PLINTH_TILE_W / PLINTH_BAYS, DOOR_TOP = 3.0, TRANSOM = 3.6;
+    const floorY = Y(1.35);
+    // --- Lobby scene, one continuous room behind the whole tile -------------------------------------------------
+    const sc = scene.ctx;
+    sc.fillStyle = '#b9a88c';
+    sc.fillRect(0, Y(GLASS_TOP), W, floorY - Y(GLASS_TOP));
+    // Ceiling strip with a cove light line under it.
+    sc.fillStyle = '#6a6058';
+    sc.fillRect(0, Y(GLASS_TOP), W, Y(5.0) - Y(GLASS_TOP));
+    sc.fillStyle = '#ffe6bc';
+    sc.fillRect(0, Y(5.0), W, 4);
+    // Polished stone floor: pale slabs with joint lines converging toward the back, lit blobs reflecting the pendants.
+    sc.fillStyle = '#d6cec2';
+    sc.fillRect(0, floorY, W, Y(0) - floorY);
+    sc.fillStyle = rgba(60, 54, 48, 0.4);
+    for (const yb of [1.35, 1.15, 0.95, 0.75]) sc.fillRect(0, Y(yb), W, 2);
+    for (let x = 0; x < W; x += 0.6 * sx) sc.fillRect(x, floorY, 2, Y(0) - floorY);
+    sc.fillStyle = rgba(0, 0, 0, 0.35);
+    sc.fillRect(0, floorY - 4, W, 5);
+    const planter = (x: number, w: number): void => {
+      sc.fillStyle = '#2e2c2a';
+      sc.fillRect(x, Y(1.25), w, Y(0.62) - Y(1.25));
+      sc.fillStyle = rgba(255, 255, 255, 0.12);
+      sc.fillRect(x, Y(1.25), w, 3);
+      sc.fillStyle = '#3f7a3a';
+      sc.beginPath();
+      sc.ellipse(x + w / 2, Y(1.55), w * 0.62, 0.42 * sy, 0, 0, Math.PI * 2);
+      sc.fill();
+      sc.fillStyle = '#5a9a48';
+      sc.beginPath();
+      sc.ellipse(x + w * 0.4, Y(1.7), w * 0.35, 0.25 * sy, 0, 0, Math.PI * 2);
+      sc.fill();
+    };
+    const pendant = (cx: number, y: number): void => {
+      sc.fillStyle = '#1a1614';
+      sc.fillRect(cx - 1, Y(5.0), 2, Y(y + 0.2) - Y(5.0));
+      sc.fillStyle = '#2c2624';
+      sc.beginPath();
+      sc.arc(cx, Y(y), 12, 0, Math.PI * 2);
+      sc.fill();
+      sc.fillStyle = '#ffe2b0';
+      sc.beginPath();
+      sc.arc(cx, Y(y) + 4, 8, 0, Math.PI * 2);
+      sc.fill();
+    };
+    const sofa = (x: number, w: number, col: string): void => {
+      sc.fillStyle = col;
+      sc.fillRect(x, Y(1.5), w, Y(0.95) - Y(1.5));
+      sc.fillStyle = rgba(255, 255, 255, 0.14);
+      sc.fillRect(x, Y(1.5), w, 4);
+      sc.fillStyle = rgba(0, 0, 0, 0.3);
+      sc.fillRect(x, Y(1.15), w, 3);
+      sc.fillStyle = '#2a2624';
+      sc.fillRect(x + 4, Y(0.95), 6, Y(0.75) - Y(0.95));
+      sc.fillRect(x + w - 10, Y(0.95), 6, Y(0.75) - Y(0.95));
+    };
+    // Bay 0: a waiting corner - sofa, a framed print, a tall planter.
+    sofa(X(0.9), 1.5 * sx, '#5c6a78');
+    sc.fillStyle = '#3a2e26';
+    sc.fillRect(X(1.2), Y(3.9), 1.1 * sx, Y(2.9) - Y(3.9));
+    sc.fillStyle = '#c89a58';
+    sc.fillRect(X(1.2) + 6, Y(3.9) + 6, 1.1 * sx - 12, Y(2.9) - Y(3.9) - 12);
+    planter(X(3.3), 0.8 * sx);
+    pendant(X(1.6), 3.6);
+    pendant(X(3.6), 3.6);
+    // Bay 1: reception desk with a lit front, the logo wall behind it.
+    sc.fillStyle = '#4a3a2c';
+    sc.fillRect(X(5.2), Y(4.4), 3.6 * sx, Y(2.6) - Y(4.4));
+    sc.fillStyle = '#e8dcc4';
+    sc.fillRect(X(5.7), Y(3.75), 2.6 * sx, Y(3.3) - Y(3.75));
+    sc.fillStyle = '#3a2e26';
+    for (let x = X(5.9); x < X(8.1); x += 30) sc.fillRect(x, Y(3.68), 20, Y(3.37) - Y(3.68));
+    sc.fillStyle = '#e4dccc';
+    sc.fillRect(X(5.0), Y(1.65), 3.9 * sx, Y(0.85) - Y(1.65));
+    sc.fillStyle = '#ffd9a0';
+    sc.fillRect(X(5.0), Y(1.15), 3.9 * sx, 6);
+    sc.fillStyle = '#2a2624';
+    sc.fillRect(X(4.95), Y(1.68), 3.95 * sx + 4, 6);
+    sc.fillStyle = rgba(0, 0, 0, 0.3);
+    sc.fillRect(X(5.0), Y(0.85), 3.9 * sx, 4);
+    pendant(X(5.7), 3.9);
+    pendant(X(7.0), 3.9);
+    pendant(X(8.3), 3.9);
+    // Bay 2: the entrance - a doormat inside, a directory panel on the far wall.
+    sc.fillStyle = '#4a4440';
+    sc.fillRect(X(10.7), Y(1.05), 2.6 * sx, Y(0.55) - Y(1.05));
+    sc.fillStyle = '#2e2a28';
+    sc.fillRect(X(11.4), Y(4.1), 1.2 * sx, Y(2.4) - Y(4.1));
+    sc.fillStyle = rgba(255, 244, 220, 0.8);
+    for (let yy = Y(3.9); yy < Y(2.5); yy += 12) sc.fillRect(X(11.5), yy, rng.range(30, 62), 3);
+    pendant(X(12.0), 4.0);
+    // Bay 3: two lift doors in brushed steel with a lit floor indicator, a planter beside them.
+    for (let k = 0; k < 2; k++) {
+      const lx = X(15.0 + k * 1.45);
+      sc.fillStyle = '#2c2a2c';
+      sc.fillRect(lx - 6, Y(3.85), 1.15 * sx + 12, Y(1.3) - Y(3.85));
+      const steel = sc.createLinearGradient(lx, 0, lx + 1.15 * sx, 0);
+      steel.addColorStop(0, '#9ea4aa');
+      steel.addColorStop(0.5, '#c8cdd2');
+      steel.addColorStop(1, '#8a9096');
+      sc.fillStyle = steel;
+      sc.fillRect(lx, Y(3.75), 1.15 * sx, Y(1.35) - Y(3.75));
+      sc.fillStyle = '#1e1c1e';
+      sc.fillRect(lx + 0.56 * sx, Y(3.75), 4, Y(1.35) - Y(3.75));
+      sc.fillStyle = '#ff9a3a';
+      sc.fillRect(lx + 0.45 * sx, Y(4.05), 16, 8);
     }
-    // Cornice band along the top and a dark granite base at the bottom.
-    m.ctx.fillStyle = '#6b707c';
-    m.ctx.fillRect(0, 0, W, cornice);
-    m.ctx.fillStyle = rgba(0, 0, 0, 0.35);
-    m.ctx.fillRect(0, cornice - 8, W, 8);
-    m.ctx.fillStyle = rgba(255, 255, 255, 0.12);
-    m.ctx.fillRect(0, 4, W, 5);
-    m.ctx.fillStyle = '#2f333b';
-    m.ctx.fillRect(0, base, W, H - base);
+    planter(X(18.3), 0.75 * sx);
+    pendant(X(15.4), 4.0);
+    pendant(X(17.8), 4.0);
+    // Bay 4: armchairs around a low table, a floor lamp and a wide planter, a second print.
+    sofa(X(19.9), 0.9 * sx, '#8a5a3a');
+    sofa(X(22.0), 0.9 * sx, '#8a5a3a');
+    sc.fillStyle = '#3a3230';
+    sc.fillRect(X(21.0), Y(1.05), 0.8 * sx, 5);
+    sc.fillRect(X(21.35), Y(1.05), 6, Y(0.7) - Y(1.05));
+    sc.fillStyle = '#2a2624';
+    sc.fillRect(X(23.3), Y(2.9), 3, Y(0.7) - Y(2.9));
+    sc.fillStyle = '#ffe2b0';
+    sc.fillRect(X(23.1), Y(3.1), 0.4 * sx, Y(2.85) - Y(3.1));
+    sc.fillStyle = '#3a2e26';
+    sc.fillRect(X(20.5), Y(4.0), 1.6 * sx, Y(3.0) - Y(4.0));
+    sc.fillStyle = '#6a9ac8';
+    sc.fillRect(X(20.5) + 6, Y(4.0) + 6, 1.6 * sx - 12, Y(3.0) - Y(4.0) - 12);
+    pendant(X(20.4), 3.7);
+    pendant(X(22.5), 3.7);
+    // --- Glazing per bay, the piers, the base course and the cornice ------------------------------------------
+    const frame = (c: CanvasRenderingContext2D, x: number, y: number, w: number, h: number): void => { c.fillRect(x, y, w, h); };
+    for (let i = 0; i < PLINTH_BAYS; i++) {
+      const door = i === PLINTH_DOOR_BAY;
+      const gx0 = X(i * BAY + PIER / 2) + 5, gx1 = X((i + 1) * BAY - PIER / 2) - 5;
+      const gy0 = Y(GLASS_TOP), gy1 = door ? Y(0.08) : Y(BASE);
+      // Albedo: light glass, the lobby behind it, a sky reflection at the top and a darker foot.
+      m.ctx.fillStyle = '#6f7d8a';
+      m.ctx.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+      m.ctx.globalAlpha = 0.66;
+      m.ctx.drawImage(scene.canvas, gx0, gy0, gx1 - gx0, gy1 - gy0, gx0, gy0, gx1 - gx0, gy1 - gy0);
+      m.ctx.globalAlpha = 1;
+      const refl = m.ctx.createLinearGradient(0, gy0, 0, gy1);
+      refl.addColorStop(0, rgba(205, 226, 240, 0.34));
+      refl.addColorStop(0.45, rgba(205, 226, 240, 0.05));
+      refl.addColorStop(1, rgba(20, 28, 36, 0.18));
+      m.ctx.fillStyle = refl;
+      m.ctx.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+      // Emissive: the lobby under warm light, brighter at the ceiling.
+      e.ctx.drawImage(scene.canvas, gx0, gy0, gx1 - gx0, gy1 - gy0, gx0, gy0, gx1 - gx0, gy1 - gy0);
+      e.ctx.save();
+      e.ctx.globalCompositeOperation = 'multiply';
+      const warm = e.ctx.createLinearGradient(0, gy0, 0, gy1);
+      warm.addColorStop(0, rgba(255, 222, 176, 1));
+      warm.addColorStop(0.6, rgba(215, 178, 130, 1));
+      warm.addColorStop(1, rgba(130, 100, 70, 1));
+      e.ctx.fillStyle = warm;
+      e.ctx.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+      e.ctx.restore();
+      // Frames: head, jambs, a transom at TRANSOM and one centre mullion; the door bay gets two glazed leaves with
+      // brass push bars, a meeting stile and the address box over the transom.
+      const mid = (gx0 + gx1) / 2;
+      for (const c of [m.ctx, e.ctx]) {
+        c.fillStyle = c === m.ctx ? '#2e3238' : '#000';
+        frame(c, gx0 - 5, gy0 - 5, gx1 - gx0 + 10, 7);
+        frame(c, gx0 - 5, gy0, 5, gy1 - gy0);
+        frame(c, gx1, gy0, 5, gy1 - gy0);
+        frame(c, gx0, Y(TRANSOM) - 3, gx1 - gx0, 6);
+        frame(c, mid - 3, gy0, 6, Y(TRANSOM) - gy0);
+        if (door) {
+          frame(c, gx0, Y(DOOR_TOP) - 4, gx1 - gx0, 8);
+          frame(c, mid - 4, Y(DOOR_TOP), 8, gy1 - Y(DOOR_TOP));
+          frame(c, gx0, gy1 - 6, gx1 - gx0, 6);
+          const dl0 = mid - 1.05 * sx, dl1 = mid + 1.05 * sx;
+          frame(c, dl0 - 4, Y(DOOR_TOP), 6, gy1 - Y(DOOR_TOP));
+          frame(c, dl1 - 2, Y(DOOR_TOP), 6, gy1 - Y(DOOR_TOP));
+          frame(c, dl0, Y(0.45), dl1 - dl0, 6);
+        } else {
+          frame(c, mid - 3, Y(TRANSOM), 6, gy1 - Y(TRANSOM));
+        }
+      }
+      this.softRect(m.ctx, gx0 - 5, gy0 - 5, gx1 - gx0 + 10, 3, '#a8b4c0', 0.6);
+      this.softRect(m.ctx, gx0, Y(TRANSOM) - 3, gx1 - gx0, 2, '#a8b4c0', 0.5);
+      n.ctx.fillStyle = grey(0.36);
+      n.ctx.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+      n.ctx.fillStyle = grey(0.6);
+      n.ctx.fillRect(gx0 - 5, gy0 - 5, gx1 - gx0 + 10, 7);
+      n.ctx.fillRect(gx0, Y(TRANSOM) - 3, gx1 - gx0, 6);
+      n.ctx.fillRect(mid - 3, gy0, 6, gy1 - gy0);
+      r.ctx.fillStyle = grey(0.2);
+      r.ctx.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
+      if (door) {
+        // Push bars, a threshold and the lit address number in a small box on the transom.
+        m.ctx.fillStyle = '#b8923c';
+        m.ctx.fillRect(mid - 0.9 * sx, Y(1.05), 0.7 * sx, 5);
+        m.ctx.fillRect(mid + 0.2 * sx, Y(1.05), 0.7 * sx, 5);
+        m.ctx.fillStyle = '#4a4d54';
+        m.ctx.fillRect(gx0, Y(0.08), gx1 - gx0, Y(0) - Y(0.08));
+        const ax = mid - 0.42 * sx, ay = Y(TRANSOM) + 8, aw = 0.84 * sx, ah = Y(DOOR_TOP) - Y(TRANSOM) - 16;
+        m.ctx.fillStyle = '#1e2024';
+        m.ctx.fillRect(ax - 3, ay - 3, aw + 6, ah + 6);
+        m.ctx.fillStyle = '#f2ecd8';
+        m.ctx.fillRect(ax, ay, aw, ah);
+        e.ctx.fillStyle = rgba(255, 236, 200, 1);
+        e.ctx.fillRect(ax, ay, aw, ah);
+        for (const c of [m.ctx, e.ctx]) {
+          c.font = `900 ${Math.round(ah * 0.8)}px 'Trebuchet MS', 'Segoe UI', 'DejaVu Sans', Arial, sans-serif`;
+          c.textAlign = 'center';
+          c.textBaseline = 'middle';
+          c.fillStyle = c === m.ctx ? '#1e2024' : '#2a2018';
+          c.fillText('No 47', mid, ay + ah / 2 + 1, aw - 8);
+        }
+        n.ctx.fillStyle = grey(0.62);
+        n.ctx.fillRect(ax - 3, ay - 3, aw + 6, ah + 6);
+        n.ctx.fillRect(gx0, Y(DOOR_TOP) - 4, gx1 - gx0, 8);
+        r.ctx.fillStyle = grey(0.45);
+        r.ctx.fillRect(gx0, Y(0.08), gx1 - gx0, Y(0) - Y(0.08));
+      }
+    }
+    // Piers: pale limestone with a lit left arris, a shadowed right one and coursing joints every 0.6 m.
+    for (let i = 0; i <= PLINTH_BAYS; i++) {
+      const px0 = X(i * BAY - PIER / 2), pw = X(PIER);
+      const draw = (x: number, w: number): void => {
+        m.ctx.fillStyle = '#cfc8b8';
+        m.ctx.fillRect(x, Y(CORNICE), w, Y(BASE) - Y(CORNICE));
+        this.softRect(m.ctx, x, Y(CORNICE), 5, Y(BASE) - Y(CORNICE), '#fff', 0.3);
+        this.softRect(m.ctx, x + w - 6, Y(CORNICE), 6, Y(BASE) - Y(CORNICE), '#000', 0.3);
+        m.ctx.fillStyle = rgba(0, 0, 0, 0.14);
+        for (let yb = BASE + 0.6; yb < CORNICE - 0.1; yb += 0.6) m.ctx.fillRect(x, Y(yb), w, 2);
+        e.ctx.fillStyle = '#000';
+        e.ctx.fillRect(x, 0, w, H);
+        n.ctx.fillStyle = grey(0.66);
+        n.ctx.fillRect(x, Y(CORNICE), w, Y(BASE) - Y(CORNICE));
+        r.ctx.fillStyle = grey(0.85);
+        r.ctx.fillRect(x, 0, w, H);
+      };
+      if (px0 < 0) { draw(0, pw + px0); draw(W + px0, -px0); } else if (px0 + pw > W) { draw(px0, W - px0); draw(0, px0 + pw - W); } else draw(px0, pw);
+    }
+    // Base course: polished dark granite with a light top edge; the door threshold interrupts it.
+    const dgx0 = X(PLINTH_DOOR_BAY * BAY + PIER / 2) + 5, dgx1 = X((PLINTH_DOOR_BAY + 1) * BAY - PIER / 2) - 5;
+    for (const [bx0, bx1] of [[0, dgx0], [dgx1, W]]) {
+      m.ctx.fillStyle = '#3b3e46';
+      m.ctx.fillRect(bx0, Y(BASE), bx1 - bx0, Y(0) - Y(BASE));
+      this.softRect(m.ctx, bx0, Y(BASE), bx1 - bx0, 4, '#fff', 0.3);
+      m.ctx.fillStyle = rgba(120, 140, 160, 0.12);
+      m.ctx.fillRect(bx0, Y(BASE) + 6, bx1 - bx0, Y(0.35) - Y(BASE));
+      e.ctx.fillStyle = '#000';
+      e.ctx.fillRect(bx0, Y(BASE), bx1 - bx0, Y(0) - Y(BASE));
+      n.ctx.fillStyle = grey(0.62);
+      n.ctx.fillRect(bx0, Y(BASE), bx1 - bx0, Y(0) - Y(BASE));
+      r.ctx.fillStyle = grey(0.45);
+      r.ctx.fillRect(bx0, Y(BASE), bx1 - bx0, Y(0) - Y(BASE));
+    }
+    // Cornice band along the top: a lighter stone fillet with a shadow line under it and a lit top edge.
+    m.ctx.fillStyle = '#d4cdbd';
+    m.ctx.fillRect(0, 0, W, Y(CORNICE));
+    this.softRect(m.ctx, 0, Y(CORNICE) - 7, W, 7, '#000', 0.32);
+    this.softRect(m.ctx, 0, 3, W, 5, '#fff', 0.2);
+    m.ctx.fillStyle = '#2e3238';
+    m.ctx.fillRect(0, Y(GLASS_TOP) - 5, W, Y(GLASS_TOP) - Y(CORNICE) + 5);
+    e.ctx.fillStyle = '#000';
+    e.ctx.fillRect(0, 0, W, Y(GLASS_TOP) - 5);
+    n.ctx.fillStyle = grey(0.66);
+    n.ctx.fillRect(0, 0, W, Y(CORNICE));
+    n.ctx.fillStyle = grey(0.5);
+    n.ctx.fillRect(0, Y(CORNICE), W, Y(GLASS_TOP) - Y(CORNICE));
     this.grime(m.ctx, W, H, rng, H * 0.6, 0);
     this.soften(m.ctx, W, H);
     const map = this.finish(key + ':map', m.canvas, true, true, true);
     const emissive = this.finish(key + ':emi', e.canvas, true, true, true);
-    // Relief and roughness only need the mullion / pier steps: derive both from a half-res copy.
-    const half = this.canvas(W / 2, H / 2);
-    half.ctx.drawImage(m.canvas, 0, 0, W / 2, H / 2);
-    const normal = this.normalFromLuminance(key + ':nrm', half.canvas, 5.5, 8);
-    const rough = this.roughFromLuminance(key + ':rgh', half.canvas, 0.26, 0.92);
+    const normal = this.normalFromLuminance(key + ':nrm', n.canvas, 5, 8);
+    const rough = this.finish(key + ':rgh', r.canvas, false, true, true);
     return { map, emissive, normal, rough };
   }
 
