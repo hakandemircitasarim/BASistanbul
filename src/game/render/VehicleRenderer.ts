@@ -4,10 +4,12 @@
 // Every body is merged ONCE at construction: one smooth lofted shell (a side silhouette and a plan curve sampled at
 // ~20 stations x 28 ring points, with duplicated rings for the belt and drip-rail creases) whose glass, gaskets, lamps
 // and valances are coloured regions of the same surface, plus a few small parts (pillars, mirrors, handles, grille,
-// plates, arches, exhaust). Every vertex carries a base colour and a `paintMix` weight, and the patched Physical shader
-// blends the per-instance paint only where paintMix > 0, so glass stays dark and lamps stay red on a bright yellow taxi
-// while the whole spec still costs one draw call. `parkedShellGeometry` is the same loft at a coarser ring and fewer
-// stations for the static parked cars of the lots (CityRendererProps).
+// plates, arches, lamp bezels, bumper strip, exhaust). Every vertex carries a base colour and a `paintMix` weight, and
+// the patched Physical shader blends the per-instance paint only where paintMix > 0 (a negative paintMix marks a lamp
+// lens, which glows per instance when the lights are on), so glass stays dark and lamps stay red on a bright yellow
+// taxi while the whole spec still costs one draw call. The paint is a clearcoated metallic with a view-angle rim, so
+// the shell reads as lacquered metal against the sky probe instead of clay. `parkedShellGeometry` is the same loft at
+// a coarser ring and fewer stations for the static parked cars of the lots (CityRendererProps).
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
@@ -40,6 +42,8 @@ export const VEHICLE_RENDER = {
 } as const;
 
 const KEYS: VehicleKey[] = ['sedan', 'sport', 'van', 'police', 'taxi'];
+/** Head / tail light quads are drawn a little smaller than their anchor so the lamp bezel and lens rim show around them. */
+const LIGHT_QUAD_SCALE = 0.86;
 
 // ---------------------------------------------------------------------------------------------- geometry primitives
 
@@ -65,6 +69,10 @@ const SIGN = 0xf6edd2;
 const PLATE = 0xd8d2c0;
 const PLATE_FRAME = 0x2a2c30;
 const EXHAUST = 0x3a3d42;
+/** Rubbing strip across the rear bumper: the horizontal bumper line the tail was missing. */
+const BUMPER_STRIP = 0x111315;
+/** paintMix value that marks a lamp lens: no paint tint, and emissive when the vehicle's lights are on. */
+const LENS_MIX = -1;
 
 /** A box deformed into a frustum: independent z / half-width / y for the (bottom, top) x (back, front) corners. */
 interface PrismDef {
@@ -282,7 +290,7 @@ interface Tone { col: number; paint: number }
 const T = {
   paint: { col: PAINT, paint: 1 }, dark: { col: PAINT_DARK, paint: 1 }, shade: { col: PAINT_SHADE, paint: 1 },
   glass: { col: GLASS, paint: 0.15 }, seal: { col: SEAL, paint: 0 }, bezel: { col: BEZEL, paint: 0 }, black: { col: BLACK, paint: 0 }, grey: { col: DARK, paint: 0 },
-  tail: { col: TAIL, paint: 0 }, tailLens: { col: TAIL_LENS, paint: 0 }, lamp: { col: LAMP, paint: 0 }, lampLens: { col: LAMP_LENS, paint: 0 },
+  tail: { col: TAIL, paint: 0 }, tailLens: { col: TAIL_LENS, paint: LENS_MIX }, lamp: { col: LAMP, paint: 0 }, lampLens: { col: LAMP_LENS, paint: LENS_MIX },
 } as const satisfies Record<string, Tone>;
 
 /**
@@ -542,6 +550,8 @@ interface ArchDef { x: number; z: number; r: number; w: number; /** x of the bla
 interface VehicleProfile {
   stations: Station[];
   parts: PrismDef[];
+  /** Sculpted extras (lamp bezels, bumper strip) merged with the parts. */
+  extras: THREE.BufferGeometry[];
   arches: ArchDef[];
   /** Exhaust tube anchor: x, y and the bumper face z it pokes out of. */
   exhaust: { x: number; y: number; zFace: number };
@@ -601,11 +611,14 @@ function archGeometry(a: ArchDef, side: number): THREE.BufferGeometry[] {
 }
 
 /** Segment tones of the end faces and their wraps onto the flanks: a dark bezel above and below every lens cell. */
-const REAR_WRAP: SegTone = { ...BODY, flank: T.tail, bezel: T.bezel, low: T.dark, sill: T.black };
-const REAR_FACE: SegTone = { sill: T.black, low: T.dark, flank: T.tail, bezel: T.bezel, lens: { at: 0, tone: T.tailLens }, side: T.paint, top: T.paint };
-const FRONT_WRAP: SegTone = { ...BODY, flank: T.lamp, bezel: T.bezel, low: T.dark, sill: T.black };
-const FRONT_FACE: SegTone = { sill: T.black, low: T.dark, flank: T.lamp, bezel: T.bezel, lens: { at: 1, tone: T.lampLens }, side: T.paint, top: T.paint };
-const FAN: SegTone = { sill: T.dark, low: T.dark, flank: T.dark, side: T.dark, top: T.dark };
+// The `low` band (sill to lower flank) is the bumper: PAINT_SHADE, so it reads as a separate moulded part under the
+// lamp clusters and the boot / bonnet, with the dark bezel band above it as the seam.
+const REAR_WRAP: SegTone = { ...BODY, flank: T.tail, bezel: T.bezel, low: T.shade, sill: T.black };
+const REAR_FACE: SegTone = { sill: T.black, low: T.shade, flank: T.tail, bezel: T.bezel, lens: { at: 0, tone: T.tailLens }, side: T.paint, top: T.paint };
+const FRONT_WRAP: SegTone = { ...BODY, flank: T.lamp, bezel: T.bezel, low: T.shade, sill: T.black };
+const FRONT_FACE: SegTone = { sill: T.black, low: T.shade, flank: T.lamp, bezel: T.bezel, lens: { at: 1, tone: T.lampLens }, side: T.paint, top: T.paint };
+/** End-face fan (shrunk ring to the centre point): the bumper band and the black sill continue across the middle. */
+const FAN: SegTone = { sill: T.black, low: T.shade, flank: T.dark, bezel: T.bezel, side: T.dark, top: T.dark };
 
 /**
  * Light quad anchored on a lamp cluster: centred on the flank band of the end face, a hair in front of the swept face
@@ -617,6 +630,65 @@ function lampAnchor(outer: Station, inner: Station, dir: number, w: number, h: n
   const yo = (outer.yLow + outer.yBelt) * 0.5, yi = cy + (yo - cy) * k;
   const zMid = (outer.z + inner.z) * 0.5;
   return { x: (xo + xi) * 0.5, y: (yo + yi) * 0.5, z: zMid + dir * 0.035, w, h, sweep: Math.atan2(Math.abs(inner.z - outer.z), xo - xi) };
+}
+
+/**
+ * Lamp bezel: a dark frame 1.6 cm proud of the swept lamp face with a lens plate standing another 1.4 cm out of it,
+ * both yawed to follow the face like the light quad, which sits just in front of the plate. From outside the lamp is
+ * a bevelled cluster (frame, lens rim, lit face) instead of a flat rectangle; the plate is a lens (LENS_MIX), so it
+ * glows around the quad when the lights are on.
+ */
+function lampBevel(a: Anchor, dir: 1 | -1, lensCol: number): THREE.BufferGeometry[] {
+  const out: THREE.BufferGeometry[] = [];
+  for (let side = -1; side <= 1; side += 2) {
+    const fw = a.w * 1.28, fh = a.h * 1.45, lw = a.w * 1.1, lh = a.h * 1.16;
+    const frame = new THREE.BoxGeometry(fw, fh, 0.016);
+    frame.translate(0, 0, dir * 0.008);
+    const lens = new THREE.BoxGeometry(lw, lh, 0.02);
+    lens.translate(0, 0, dir * 0.022);
+    for (const g of [frame, lens]) {
+      g.rotateY(dir * side * a.sweep);
+      g.translate(side * a.x, a.y, a.z - dir * 0.03);
+    }
+    out.push(decorate(frame, BEZEL, 0), decorate(lens, lensCol, LENS_MIX));
+  }
+  return out;
+}
+
+const stripT = new THREE.Vector3(), stripN = new THREE.Vector3(), stripB = new THREE.Vector3();
+
+/**
+ * Rear bumper strip: a 1.2 cm rubbing strip swept across the tail 1 cm proud of the fanned end face, so the rear gets
+ * the horizontal bumper line a flat loft cannot give it. `faceZ(x)` returns the depth of the end face at half-width x.
+ */
+function bumperStrip(faceZ: (x: number) => number, y: number, halfW: number): THREE.BufferGeometry {
+  const n = 9, pts: THREE.Vector3[] = [];
+  for (let i = 0; i < n; i++) {
+    const x = -halfW + (2 * halfW * i) / (n - 1);
+    pts.push(new THREE.Vector3(x, y, faceZ(x) - 0.012));
+  }
+  const radial = 6, r = 0.012;
+  const g = surface(n, radial, true, true, (i, j, out) => {
+    const a = pts[Math.max(0, i - 1)], b = pts[Math.min(n - 1, i + 1)];
+    stripT.subVectors(b, a).normalize();
+    stripN.crossVectors(stripT, stripB.set(0, 1, 0)).normalize();
+    stripB.crossVectors(stripT, stripN);
+    const ang = (j / radial) * Math.PI * 2;
+    out.copy(pts[i]).addScaledVector(stripN, Math.sin(ang) * r).addScaledVector(stripB, Math.cos(ang) * r);
+  });
+  return decorate(g, BUMPER_STRIP, 0);
+}
+
+/**
+ * Depth of a fanned end face at half-width x: linear from the outer ring (`zOuter`, half-width `wOuter`) through the
+ * shrunk ring (`zMid`, at `kMid` of the width) to the apex (`zApex`).
+ */
+function fanDepth(zOuter: number, wOuter: number, zMid: number, kMid: number, zApex: number): (x: number) => number {
+  return (x: number): number => {
+    const f = Math.min(1, Math.abs(x) / Math.max(1e-4, wOuter));
+    if (f >= kMid) return zMid + (zOuter - zMid) * ((f - kMid) / (1 - kMid));
+    return zApex + (zMid - zApex) * (f / kMid);
+  };
 }
 
 /**
@@ -695,13 +767,18 @@ function sedanProfile(s: VehicleSpec, kind: 'sedan' | 'police' | 'taxi'): Vehicl
   handle(parts, -L * 0.03, L * 0.04, width(belt - 0.11, 0), belt - 0.11);
   handle(parts, -L * 0.34, -L * 0.27, width(belt - 0.11, -L * 0.3), belt - 0.11);
 
+  const head = lampAnchor(nose, stations[stations.length - 2], 1, 0.22, 0.09);
+  const tail = lampAnchor(rear, stations[1], -1, 0.24, 0.10);
+  const extras = [...lampBevel(head, 1, LAMP_LENS), ...lampBevel(tail, -1, TAIL_LENS)];
+  extras.push(bumperStrip(fanDepth(-hl, rear.wLow, -hl - 0.05, 0.5, -hl - 0.07), rear.yLow + 0.045, rear.wLow * 0.9));
   const profile: VehicleProfile = {
     stations,
     parts,
+    extras,
     arches: archDefs,
     exhaust: { x: hw * 0.55, y: c + 0.01, zFace: -hl - 0.07 },
-    head: lampAnchor(nose, stations[stations.length - 2], 1, 0.22, 0.09),
-    tail: lampAnchor(rear, stations[1], -1, 0.24, 0.10),
+    head,
+    tail,
     roof: { x: 0, y: H, z: 0, w: 0.3, h: 0.12, sweep: 0 },
     roofKind: 'none',
     wheelScale: 1,
@@ -787,13 +864,18 @@ function sportProfile(s: VehicleSpec): VehicleProfile {
   rearDetails(parts, -hl - 0.06, c + 0.26);
   mirror(parts, cowlZ - 0.20, cowlZ - 0.07, width(belt + 0.02, cowlZ - 0.13), belt + 0.01, 0.09, 0.045);
   handle(parts, -L * 0.14, -L * 0.07, width(belt - 0.10, -L * 0.1), belt - 0.10);
+  const head = lampAnchor(nose, stations[stations.length - 2], 1, 0.24, 0.07);
+  const tail = lampAnchor(rear, stations[1], -1, 0.34, 0.07);
+  const extras = [...lampBevel(head, 1, LAMP_LENS), ...lampBevel(tail, -1, TAIL_LENS)];
+  extras.push(bumperStrip(fanDepth(-hl, rear.wLow, -hl - 0.045, 0.5, -hl - 0.06), rear.yLow + 0.04, rear.wLow * 0.9));
   return {
     stations,
     parts,
+    extras,
     arches: archDefs,
     exhaust: { x: hw * 0.50, y: c + 0.01, zFace: -hl - 0.06 },
-    head: lampAnchor(nose, stations[stations.length - 2], 1, 0.24, 0.07),
-    tail: lampAnchor(rear, stations[1], -1, 0.34, 0.07),
+    head,
+    tail,
     roof: { x: 0, y: H, z: 0, w: 0.3, h: 0.12, sweep: 0 },
     roofKind: 'none',
     wheelScale: 1.08,
@@ -855,13 +937,18 @@ function vanProfile(s: VehicleSpec): VehicleProfile {
   mirror(parts, cowlZ - 0.34, cowlZ - 0.14, width(belt + 0.20, cowlZ - 0.24), belt + 0.16, 0.20, 0.06);
   handle(parts, noseZ - 0.62, noseZ - 0.54, width(belt - 0.02, noseZ - 0.58), belt - 0.02);
   handle(parts, -L * 0.22 + 0.06, -L * 0.22 + 0.14, width(belt - 0.02, -L * 0.22 + 0.1), belt - 0.02);
+  const head = lampAnchor(nose, stations[stations.length - 2], 1, 0.24, 0.10);
+  const tail = lampAnchor(rear, stations[1], -1, 0.13, 0.22);
+  const extras = [...lampBevel(head, 1, LAMP_LENS), ...lampBevel(tail, -1, TAIL_LENS)];
+  extras.push(bumperStrip(fanDepth(-hl, rear.wLow, -hl - 0.04, 0.72, -hl - 0.05), rear.yLow + 0.05, rear.wLow * 0.92));
   return {
     stations,
     parts,
+    extras,
     arches: archDefs,
     exhaust: { x: hw * 0.55, y: c + 0.01, zFace: -hl - 0.05 },
-    head: lampAnchor(nose, stations[stations.length - 2], 1, 0.24, 0.10),
-    tail: lampAnchor(rear, stations[1], -1, 0.13, 0.22),
+    head,
+    tail,
     roof: { x: 0, y: H, z: 0, w: 0.3, h: 0.12, sweep: 0 },
     roofKind: 'none',
     wheelScale: 1.12,
@@ -902,6 +989,7 @@ export function bodyGeometry(s: VehicleSpec): THREE.BufferGeometry {
   const parts = profile.parts;
   const geos: THREE.BufferGeometry[] = [loft(profile.stations, FULL_RING)];
   for (let i = 0; i < parts.length; i++) geos.push(prism(parts[i]));
+  for (let i = 0; i < profile.extras.length; i++) geos.push(profile.extras[i]);
   for (let i = 0; i < profile.arches.length; i++) {
     const a = profile.arches[i];
     geos.push(...archGeometry(a, 1), ...archGeometry(a, -1));
@@ -915,8 +1003,8 @@ export function bodyGeometry(s: VehicleSpec): THREE.BufferGeometry {
   return merged;
 }
 
-/** Rim tone of the parked-car shell's baked wheel discs; the tread ring is shaded down to tyre black from it. */
-const LOD_RIM = 0x4a4e55;
+/** Hub tone of the parked-car shell's baked wheel discs (matches the lathed wheel's bright dish); the disc edge and tread fall to tyre black. */
+const LOD_RIM = 0x9aa0a8;
 
 /**
  * Cheap shell for the static parked cars of the lots: the same loft at the coarse ring through the `lod` stations only
@@ -937,12 +1025,14 @@ export function parkedShellGeometry(s: VehicleSpec): THREE.BufferGeometry {
     const disc = new THREE.CylinderGeometry(r, r, w, 8, 1, false);
     disc.rotateZ(Math.PI / 2); // axle y -> x
     disc.translate(x, r, z);
-    // Rim faces: the cap vertices sit at |x - axle| = half width; the tread ring stays tyre-black.
-    geos.push(shade(decorate(disc, LOD_RIM, 0), (px, py, pz) => (Math.abs(Math.abs(px - x) - w * 0.5) < 1e-4 && Math.hypot(py - r, pz - z) < r * 0.999 ? 1 : 0.36)));
+    // Rim faces: the cap centre vertex carries the bright hub, the cap edge and the tread ring stay tyre-black, so the
+    // fan interpolates a bright rim inside a dark tyre like the lathed wheel does at chase distance.
+    geos.push(shade(decorate(disc, LOD_RIM, 0), (px, py, pz) => (Math.abs(Math.abs(px - x) - w * 0.5) < 1e-4 && Math.hypot(py - r, pz - z) < r * 0.5 ? 1 : 0.22)));
   }
   const merged = mergeGeometries(geos, false);
   if (!merged) throw new Error('parked shell merge failed (attribute mismatch)');
   for (let i = 0; i < geos.length; i++) geos[i].dispose();
+  for (let i = 0; i < profile.extras.length; i++) profile.extras[i].dispose();
   bakeShading(merged, profile.floor, profile.belt);
   merged.computeBoundingSphere();
   return merged;
@@ -957,7 +1047,8 @@ export function parkedShellGeometry(s: VehicleSpec): THREE.BufferGeometry {
 function wheelGeometry(): THREE.BufferGeometry {
   const R = VEHICLE_RENDER;
   const parts: THREE.BufferGeometry[] = [];
-  const TYRE = 0x1a1b1e, DISH = 0x6e737a, SPOKE = 0x868b93;
+  // Bright alloy: at chase distance the blades are sub-pixel and the dish face is what reads, so it is the light part.
+  const TYRE = 0x1a1b1e, DISH = 0x9aa0a8, SPOKE = 0xd2d7dd;
   const add = (geo: THREE.BufferGeometry, hex: number, shade?: (x: number, y: number, z: number) => number): void => {
     const g = geo.index ? geo.toNonIndexed() : geo;
     if (g !== geo) geo.dispose();
@@ -989,9 +1080,9 @@ function wheelGeometry(): THREE.BufferGeometry {
   add(new THREE.LatheGeometry(pts, SEG), TYRE, (x, _y, z) => (Math.hypot(x, z) < r * 0.95 ? 0.72 : 1.1));
   // Rim: a dark dish deep in the bead; on each dish face seven thin tapered plates (2 cm deep, 1.5 cm proud) and a hub
   // cap. Both faces get them because the same instance geometry serves the left and right wheels.
-  add(new THREE.CylinderGeometry(rimR, rimR, dishFace * 2, SEG, 1, false), DISH, (_x, y) => (Math.abs(y) < dishFace - 0.001 ? 0.6 : 0.42));
+  add(new THREE.CylinderGeometry(rimR, rimR, dishFace * 2, SEG, 1, false), DISH, (_x, y) => (Math.abs(y) < dishFace - 0.001 ? 0.5 : 0.95));
   // A 4-point lathe ring is a diamond; turned 45 degrees and scaled it becomes a flat plate (in-plane width x, depth z).
-  const bladeW = r * 0.07, bladeD = 0.02;
+  const bladeW = r * 0.1, bladeD = 0.02;
   for (let face = -1; face <= 1; face += 2) {
     const zc = face * (dishFace + 0.005);
     const blade: Ring[] = [{ y: r * 0.12, rx: 1, rz: 1, z: zc }, { y: rimR + 0.004, rx: 0.5, rz: 0.8, z: zc }];
@@ -1007,7 +1098,7 @@ function wheelGeometry(): THREE.BufferGeometry {
     }
     const cap = new THREE.CylinderGeometry(r * 0.15, r * 0.15, 0.03, 8, 1, false);
     cap.translate(0, face * (dishFace + 0.012), 0);
-    add(cap, SPOKE, () => 0.85);
+    add(cap, SPOKE, () => 0.9);
   }
   const merged = mergeGeometries(parts, false);
   if (!merged) throw new Error('vehicle wheel merge failed (attribute mismatch)');
@@ -1017,31 +1108,66 @@ function wheelGeometry(): THREE.BufferGeometry {
 
 // ---------------------------------------------------------------------------------------------- paint material
 
+/** Paint look: a smooth metallic base under a hard clearcoat, plus the stylised view-angle rim toward the silhouette. */
+const PAINT_LOOK = { metalness: 0.45, roughness: 0.35, envMapIntensity: 1.2, clearcoat: 1.0, clearcoatRoughness: 0.08, rim: 0.32, rimPower: 3.0 } as const;
+/** Lit-lens emissive: bright enough by day to read as "on", over the night bloom threshold (1.4) after dark. */
+const LENS_GLOW_DAY = 1.2;
+const LENS_GLOW_NIGHT = 2.6;
+
 /**
  * Physical + `paintMix`: the per-instance paint colour is blended in only where the geometry asks for it, so glass,
  * bumpers, lamps and liveries keep their authored colour on every car. Shared by the vehicle bodies and the parked
- * shells of the lots (CityRendererProps). The base paint is a fairly rough metallic (colour comes from the paint layer)
- * and the glossy clearcoat lobe on top gives the sun / lamp glint that makes the shell read as lacquered metal.
+ * shells of the lots (CityRendererProps). The base is a smooth metallic (colour comes from the paint layer) under a
+ * hard clearcoat lobe, so the sky probe's horizon crease and sun disc show on the roof and bonnet, and a Fresnel rim
+ * brightens the paint toward the silhouette the way stylised low-poly cars are lit. With `lensGlow` the shader also
+ * reads a per-instance `instanceGlow` attribute (1 = lights on) and makes the lens cells (paintMix < 0) emissive,
+ * scaled by the material's `uLensGlow` uniform (VehicleRenderer.setNightFactor).
  */
-export function makeVehiclePaintMaterial(): THREE.MeshPhysicalMaterial {
+export function makeVehiclePaintMaterial(lensGlow = false): THREE.MeshPhysicalMaterial {
+  const L = PAINT_LOOK;
   const m = new THREE.MeshPhysicalMaterial({
-    vertexColors: true, metalness: 0.45, roughness: 0.5, envMapIntensity: 1.15, clearcoat: 0.6, clearcoatRoughness: 0.15,
+    vertexColors: true, metalness: L.metalness, roughness: L.roughness, envMapIntensity: L.envMapIntensity, clearcoat: L.clearcoat, clearcoatRoughness: L.clearcoatRoughness,
   });
+  const uLensGlow = { value: 0 };
+  m.userData.uLensGlow = uLensGlow;
   m.onBeforeCompile = (shader) => {
+    shader.uniforms.uLensGlow = uLensGlow;
+    shader.uniforms.uRim = { value: L.rim };
     shader.vertexShader = shader.vertexShader
-      .replace('#include <common>', '#include <common>\nattribute float paintMix;')
+      .replace('#include <common>', [
+        '#include <common>',
+        'attribute float paintMix;',
+        lensGlow ? 'attribute float instanceGlow;' : '',
+        'varying float vPaint;',
+        'varying float vLens;',
+      ].join('\n'))
       // three >= r155 declares vColor as vec4 (see color_pars_vertex), so write through .rgb.
       .replace('#include <color_vertex>', [
         'vColor = vec4( 1.0 );',
         '#ifdef USE_COLOR',
         '  vColor.rgb *= color;',
         '#endif',
+        'vPaint = clamp( paintMix, 0.0, 1.0 );',
+        lensGlow ? 'vLens = step( paintMix, -0.5 ) * instanceGlow;' : 'vLens = 0.0;',
         '#ifdef USE_INSTANCING_COLOR',
-        '  vColor.rgb *= mix( vec3( 1.0 ), instanceColor.rgb, clamp( paintMix, 0.0, 1.0 ) );',
+        '  vColor.rgb *= mix( vec3( 1.0 ), instanceColor.rgb, vPaint );',
         '#endif',
       ].join('\n'));
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nuniform float uLensGlow;\nuniform float uRim;\nvarying float vPaint;\nvarying float vLens;')
+      // Lit lens cells: emissive in their own (lens) colour.
+      .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += vColor.rgb * vLens * uLensGlow;')
+      // Fresnel rim on the paint only: view-angle brightening toward the silhouette, tinted a little toward white.
+      .replace('#include <opaque_fragment>', [
+        '{',
+        '  float rimNV = 1.0 - saturate( dot( normalize( normal ), normalize( vViewPosition ) ) );',
+        `  float rim = pow( rimNV, ${L.rimPower.toFixed(1)} ) * uRim * vPaint;`,
+        '  outgoingLight += mix( diffuseColor.rgb, vec3( 1.0 ), 0.55 ) * rim;',
+        '}',
+        '#include <opaque_fragment>',
+      ].join('\n'));
   };
-  m.customProgramCacheKey = () => 'vehiclePaintMix';
+  m.customProgramCacheKey = () => (lensGlow ? 'vehiclePaintMixGlow' : 'vehiclePaintMix');
   return m;
 }
 
@@ -1058,7 +1184,9 @@ export class VehicleRenderer {
   private readonly lights: THREE.InstancedMesh;
   private readonly shadows: ContactShadows;
   private readonly bodyMat: THREE.MeshPhysicalMaterial;
-  private readonly wheelMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.55, metalness: 0.45, envMapIntensity: 0.8 });
+  /** Per-instance lights-on flag read by the paint shader (lens emissive), one buffer per body / LOD mesh. */
+  private readonly glowAttrs: THREE.InstancedBufferAttribute[] = [];
+  private readonly wheelMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.38, metalness: 0.75, envMapIntensity: 1.0 });
   /** Instance colour only: PlaneGeometry has no colour attribute, and `vertexColors` would multiply by a zeroed one. */
   private readonly lightMat = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide, fog: false, toneMapped: false });
   private readonly spotL: THREE.SpotLight;
@@ -1076,14 +1204,14 @@ export class VehicleRenderer {
   constructor(scene: THREE.Scene) {
     this.scene = scene;
     const cap = BUDGET.MAX_VEHICLES;
-    this.bodyMat = makeVehiclePaintMaterial();
+    this.bodyMat = makeVehiclePaintMaterial(true);
     this.bodies = {} as Record<VehicleKey, THREE.InstancedMesh>;
     this.lodBodies = {} as Record<VehicleKey, THREE.InstancedMesh>;
     this.profiles = {} as Record<VehicleKey, VehicleProfile>;
     for (let i = 0; i < KEYS.length; i++) {
       const key = KEYS[i];
       this.profiles[key] = profileFor(SPECS[key]);
-      const mesh = new THREE.InstancedMesh(bodyGeometry(SPECS[key]), this.bodyMat, cap);
+      const mesh = new THREE.InstancedMesh(this.withGlow(bodyGeometry(SPECS[key]), cap), this.bodyMat, cap);
       mesh.name = `veh:body:${key}`;
       mesh.count = 0;
       mesh.frustumCulled = false;
@@ -1097,7 +1225,7 @@ export class VehicleRenderer {
     }
     for (let i = 0; i < KEYS.length; i++) {
       const key = KEYS[i];
-      const lod = new THREE.InstancedMesh(parkedShellGeometry(SPECS[key]), this.bodyMat, cap);
+      const lod = new THREE.InstancedMesh(this.withGlow(parkedShellGeometry(SPECS[key]), cap), this.bodyMat, cap);
       lod.name = `veh:lod:${key}`;
       lod.count = 0;
       lod.frustumCulled = false;
@@ -1132,6 +1260,15 @@ export class VehicleRenderer {
     this.spotR = this.makeSpot();
   }
 
+  /** Adds the `instanceGlow` attribute (lights on/off per instance) the paint shader reads for the lens emissive. */
+  private withGlow(g: THREE.BufferGeometry, cap: number): THREE.BufferGeometry {
+    const a = new THREE.InstancedBufferAttribute(new Float32Array(cap), 1);
+    a.setUsage(THREE.DynamicDrawUsage);
+    g.setAttribute('instanceGlow', a);
+    this.glowAttrs.push(a);
+    return g;
+  }
+
   private makeSpot(): THREE.SpotLight {
     const R = VEHICLE_RENDER;
     const s = new THREE.SpotLight(0xfff1d0, 0, R.headlightDistance, R.headlightAngle, R.headlightPenumbra, R.headlightDecay);
@@ -1145,6 +1282,7 @@ export class VehicleRenderer {
   setNightFactor(f: number): void {
     this.nightFactor = clamp(f, 0, 1);
     this.shadows.setNightFactor(this.nightFactor);
+    (this.bodyMat.userData.uLensGlow as { value: number }).value = LENS_GLOW_DAY + (LENS_GLOW_NIGHT - LENS_GLOW_DAY) * this.nightFactor;
   }
 
   sync(world: World, alpha: number, time: number, camX: number, camZ: number): void {
@@ -1192,6 +1330,7 @@ export class VehicleRenderer {
       mesh.setMatrixAt(idx, this.mat);
       this.paintColor(v);
       mesh.setColorAt(idx, this.color);
+      (mesh.geometry.getAttribute('instanceGlow') as THREE.InstancedBufferAttribute).setX(idx, v.lightsOn && !v.destroyed ? 1 : 0);
       if (visible) {
         if (near && d2 < R.wheelDist * R.wheelDist) wheelIdx = this.syncWheels(v, t, sc, profile.wheelScale, wheelIdx);
         lightIdx = this.syncLights(v, t, sc, profile, sirenPhase, lightIdx);
@@ -1209,6 +1348,7 @@ export class VehicleRenderer {
       lod.instanceMatrix.needsUpdate = true;
       if (lod.instanceColor) lod.instanceColor.needsUpdate = true;
     }
+    for (let i = 0; i < this.glowAttrs.length; i++) this.glowAttrs[i].needsUpdate = true;
     this.wheels.count = wheelIdx;
     this.wheels.instanceMatrix.needsUpdate = true;
     this.lights.count = lightIdx;
@@ -1277,7 +1417,7 @@ export class VehicleRenderer {
       const a = roof ? p.roof : rear ? p.tail : p.head;
       const side = k % 2 === 0 ? -1 : 1;
       // Lamp quads follow the swept lamp faces of the shell (inner edge forward at the nose, backward at the tail).
-      let ox = side * a.x, oz = a.z, rot = yaw + side * a.sweep, sx = a.w, sy = a.h;
+      let ox = side * a.x, oz = a.z, rot = yaw + side * a.sweep, sx = a.w * LIGHT_QUAD_SCALE, sy = a.h * LIGHT_QUAD_SCALE;
       if (rear) rot = yaw + Math.PI - side * a.sweep;
       if (roof) {
         if (p.roofKind === 'none') { sx = 0; sy = 0; }

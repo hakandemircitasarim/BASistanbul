@@ -6,17 +6,19 @@ export type District = 'downtown' | 'beachfront' | 'suburb';
 export interface Building { id: number; x: number; z: number; w: number; d: number; h: number; style: BuildingStyle; color: number; accent: number; roofKind: 'flat' | 'stepped' | 'spire'; hasNeonSign: boolean; neonColor: number; district: District; facing: 0 | 1 | 2 | 3 /* +Z, +X, -Z, -X */ }
 export interface Lot { blockCol: number; blockRow: number; x: number; z: number; w: number; d: number }
 export interface Block { id: number; col: number; row: number; x0: number; z0: number; x1: number; z1: number; kind: 'buildings' | 'park' | 'landmark' | 'plaza'; buildings: number[] }
-export interface Prop { kind: 'palm' | 'lamp' | 'bench' | 'hydrant' | 'bin' | 'sign' | 'shelter' | 'bollard'; x: number; z: number; yaw: number; scale: number }
+/** Street prop; `tree` is the round-crown sidewalk tree of the downtown / suburb blocks, `hedge` a 2 m clipped hedge unit on a lot's street edge. */
+export interface Prop { kind: 'palm' | 'lamp' | 'bench' | 'hydrant' | 'bin' | 'sign' | 'shelter' | 'bollard' | 'tree' | 'hedge'; x: number; z: number; yaw: number; scale: number }
 export interface Landmark { kind: 'tower' | 'arena' | 'lighthouse' | 'ferris' | 'hospital' | 'police' | 'pier'; x: number; z: number; yaw: number; w: number; d: number; h: number; name: string }
 export interface ParkedSpot { x: number; z: number; yaw: number }
 export interface NeonSign { x: number; y: number; z: number; yaw: number; text: string; color: number; w: number; h: number }
 export interface NamedPoint { x: number; z: number; yaw: number }
 export type ParkedSpec = 'sedan' | 'sport' | 'van';
 /**
- * A static car filling a lot bay: set dressing with a collider, never a Vehicle (CityRendererProps draws a cheap shell
- * of `spec` tinted `colour`). The nose points along `yaw` (0 = +Z), always a multiple of a quarter turn.
+ * A static car filling a lot bay (`at: 'lot'`, on the lot floor) or parked along a kerb (`at: 'kerb'`, up on the
+ * pavement strip against the kerb): set dressing with a collider, never a Vehicle (CityRendererProps draws a cheap
+ * shell of `spec` tinted `colour`). The nose points along `yaw` (0 = +Z), always a multiple of a quarter turn.
  */
-export interface ParkedCar { x: number; z: number; yaw: number; spec: ParkedSpec; colour: number }
+export interface ParkedCar { x: number; z: number; yaw: number; spec: ParkedSpec; colour: number; at: 'lot' | 'kerb' }
 /** Lot furniture: kerb islands at the heads of the bay strips and the planters standing on them (`booth` is reserved). */
 export interface LotProp { kind: 'planter' | 'island' | 'booth'; x: number; z: number; yaw: number }
 export interface CityData {
@@ -24,7 +26,7 @@ export interface CityData {
   staticColliders: StaticCollider[]; neonSigns: NeonSign[]; bounds: AABB;
   /** Empty lot cells used as off-street parking (kerb ring, bays and wheel stops are drawn from these). */
   lots?: Lot[];
-  /** Static cars in the lot bays (about 40 % of the bays gameplay does not use) and the lot furniture. */
+  /** Static cars in the lot bays (about 40 % of the bays gameplay does not use) and along the kerbs, and the lot furniture. */
   parked?: ParkedCar[];
   lotProps?: LotProp[];
   points: { playerSpawn: NamedPoint; hospital: NamedPoint; policeStation: NamedPoint; pier: NamedPoint; missionStarts: NamedPoint[]; garage: NamedPoint; beachDelivery: NamedPoint };

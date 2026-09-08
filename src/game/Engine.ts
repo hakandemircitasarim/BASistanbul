@@ -32,6 +32,7 @@ import { CameraController } from './render/CameraController';
 import { TextureFactory } from './render/TextureFactory';
 import { Materials } from './render/Materials';
 import { CityRenderer } from './render/CityRenderer';
+import { BackdropRenderer } from './render/BackdropRenderer';
 import { SkySystem } from './render/SkySystem';
 import { MarkerRenderer } from './render/MarkerRenderer';
 import { EffectsRenderer } from './render/EffectsRenderer';
@@ -117,6 +118,7 @@ export class Engine {
   private tex: TextureFactory | null = null;
   private materials: Materials | null = null;
   private cityRenderer: CityRenderer | null = null;
+  private backdrop: BackdropRenderer | null = null;
   private sky: SkySystem | null = null;
   private markers: MarkerRenderer | null = null;
   private effects: EffectsRenderer | null = null;
@@ -193,6 +195,7 @@ export class Engine {
     this.materials = materials;
     this.cityRenderer = new CityRenderer(renderer.scene, this.world.city, this.world.roads, materials, tex);
     this.cityRenderer.build();
+    this.backdrop = new BackdropRenderer(renderer.scene, materials);
     this.sky = new SkySystem(renderer.scene, renderer.camera, tex, renderer.gl);
     this.markers = new MarkerRenderer(renderer.scene, materials, (out) => this.missions.availableMarkers(out));
     this.effects = new EffectsRenderer(renderer.scene, this.events, tex);
@@ -393,6 +396,7 @@ export class Engine {
     if (this.effects) this.effects.dispose();
     if (this.markers) this.markers.dispose();
     if (this.sky) this.sky.dispose();
+    if (this.backdrop) this.backdrop.dispose();
     if (this.cityRenderer) this.cityRenderer.dispose();
     if (this.materials) this.materials.dispose();
     if (this.tex) this.tex.dispose();

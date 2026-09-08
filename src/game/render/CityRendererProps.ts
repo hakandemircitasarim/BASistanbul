@@ -1,6 +1,7 @@
-// Instanced street props for CityRenderer: palms (two seeded variants: trunk + fronds), lamps (pole + head + glow), benches,
-// hydrants, bins, signs, shelters (frame + glazing), bollards; plus the lot dressing: static parked cars (one cheap
-// shell per spec, paint per instance), kerb islands and planters. Track B.
+// Instanced street props for CityRenderer: palms (two seeded variants: trunk + alpha fronds near, one solid flat-shaded
+// far LOD beyond PROP_RANGE.palmNear), round-crown sidewalk trees, hedge units, lamps (pole + head + glow), benches,
+// hydrants, bins, signs, shelters (frame + glazing), bollards; plus the static parked cars (one cheap shell per spec,
+// paint per instance) of the lot bays and the kerbs, kerb islands and planters. Track B.
 //
 // Everything is sculpted from lathes, swept tubes and rounded slabs rather than raw boxes: a gooseneck lamp arm, a
 // chamfered bollard, a slatted bench with cast-iron ends, a glazed shelter with a rounded roof, fronds that arch from
@@ -24,6 +25,9 @@ const FURN = {
   post: 0x4a5058, roof: 0x2f353b, fascia: 0xb8702c, frame: 0x30353a, seat: 0x9a6a3c, iron: 0x2b2f33,
   bollard: 0x3c4147, bollardCap: 0xc3c8cd, hydrant: 0xd8302a, hydrantDark: 0x8e1f1a,
   kerb: 0x9c988f, kerbTop: 0xaaa69d, gravel: 0x5a5148, pot: 0x8f897d, potRim: 0x9d978b, soil: 0x3d3229, shrub: 0x3f6d38, shrubLit: 0x6f9a4c,
+  // Trees (flat-shaded foliage material): bark, crown mass, its lit top and shaded underside; the far palm's trunk and fans.
+  bark: 0x5c4634, barkDark: 0x3d2e22, crown: 0x477536, crownLit: 0x84b258, crownDark: 0x2f5228, hedgeDark: 0x2c4d28,
+  palmBarkFar: 0x8b7252, frondFar: 0x5b8f3c, frondFarTip: 0x7fae4e,
 } as const;
 
 /** Lot floor height (CityRenderer's STREET.lotFloorY: the asphalt sits 2 cm above the block pavement). */
@@ -424,6 +428,75 @@ export function frondsGeometry(topX: number, topY: number, seed: number): THREE.
   return fuse(parts);
 }
 
+/**
+ * Sidewalk tree: an 8-sided tapered trunk with a darker foot and a crown of three overlapping icosahedral lobes, lit
+ * from the top through the vertex colours (crownLit at the top of the mass, crownDark on the underside) so the flat
+ * shading reads as one round volume of leaves. About 300 triangles; scale and yaw vary per instance.
+ */
+function treeGeometry(seed: number): THREE.BufferGeometry {
+  const rng = new Random(seed);
+  const trunk = lathe([R(0, 0.26), R(0.12, 0.2), R(1.5, 0.15), R(3.0, 0.12), R(3.6, 0.09)], 8, FURN.bark);
+  blendTo(trunk, FURN.barkDark, (_x, y) => (y < 0.4 ? 1 - y / 0.4 : 0) * 0.8);
+  const parts: THREE.BufferGeometry[] = [trunk];
+  const lobes = [[0, 4.55, 0, 1.8], [0.85, 5.0, 0.5, 1.35], [-0.8, 4.9, -0.55, 1.3]];
+  let yLo = Infinity, yHi = -Infinity;
+  for (let i = 0; i < lobes.length; i++) { yLo = Math.min(yLo, lobes[i][1] - lobes[i][3] * 0.85); yHi = Math.max(yHi, lobes[i][1] + lobes[i][3] * 0.85); }
+  for (let i = 0; i < lobes.length; i++) {
+    const [ox, oy, oz, r] = lobes[i];
+    const g = bare(new THREE.IcosahedronGeometry(r, 1));
+    g.scale(1, 0.85, 1);
+    g.rotateY(rng.range(0, Math.PI));
+    g.translate(ox + rng.range(-0.1, 0.1), oy, oz + rng.range(-0.1, 0.1));
+    paint(g, FURN.crown);
+    const jitter = rng.range(-0.06, 0.06);
+    blendTo(g, FURN.crownLit, (_x, y) => Math.max(0, Math.min(1, (y - yLo) / (yHi - yLo) - 0.25)) * (0.9 + jitter));
+    blendTo(g, FURN.crownDark, (_x, y) => Math.max(0, Math.min(1, 1 - (y - yLo) / 1.4)) * 0.8);
+    parts.push(g);
+  }
+  return fuse(parts);
+}
+
+/**
+ * Hedge unit: a clipped 2 m x 0.6 m rounded block on the lot's street edge, its nose along z (CityLots.HEDGE); the
+ * top is lit, the base shaded, so a row reads as trimmed shrubs rather than green boxes.
+ */
+function hedgeGeometry(): THREE.BufferGeometry {
+  const g = slab(0.6, 0.8, 2.0, 0, 0.4, 0, FURN.shrub, 0.2, 1);
+  blendTo(g, FURN.shrubLit, (_x, y) => Math.max(0, Math.min(1, (y - 0.35) / 0.45)) * 0.85);
+  blendTo(g, FURN.hedgeDark, (_x, y) => Math.max(0, Math.min(1, 1 - y / 0.3)) * 0.8);
+  return g;
+}
+
+/**
+ * Far palm (beyond PROP_RANGE.palmNear): a six-sided trunk leaning to the seeded trunk's top, bark baked as a vertex
+ * colour, and a crown of ten opaque two-tone fans (three rows, V section, back faces darker), all on the flat-shaded
+ * foliage material. No alpha, so nothing lets the sky through at distance; about a third of the near palm's triangles.
+ */
+function farPalmGeometry(seed: number): THREE.BufferGeometry {
+  const rng = new Random(seed + 13);
+  const full = trunkGeometry(seed);
+  const topX = full.userData.topX as number, topY = full.userData.topY as number;
+  full.dispose();
+  // Six-sided trunk on three rings (base, mid, crown) leaning to the same top as the near trunk: ~40 triangles.
+  const trunk = lathe([R(0, 0.27), R(topY * 0.5, 0.2, topX * 0.3), R(topY - 0.3, 0.16, topX), R(topY + 0.25, 0.3, topX)], 6, FURN.palmBarkFar, true);
+  const parts: THREE.BufferGeometry[] = [trunk];
+  const L = PROP_DIMS.palmFrondLen, W = PROP_DIMS.palmFrondW;
+  const n = 10;
+  for (let i = 0; i < n; i++) {
+    const inner = i % 2 === 0;
+    const pitch = inner ? rng.range(0.3, 0.6) : rng.range(0.8, 1.15);
+    const bend = inner ? rng.range(0.9, 1.2) : rng.range(1.1, 1.45);
+    const g = frondGeometry(L * rng.range(0.85, 1.05), W * 0.8, pitch, (i / n) * Math.PI * 2 + rng.range(-0.15, 0.15), bend, 0.22, 0.12, 3, 2);
+    g.translate(topX, topY + (inner ? 0.1 : -0.05), 0);
+    paint(g, FURN.frondFar);
+    blendTo(g, FURN.frondFarTip, () => rng.range(0.15, 0.55));
+    const both = withBackFaces(g, 0.62);
+    g.dispose();
+    parts.push(bare(both));
+  }
+  return fuse(parts);
+}
+
 /** Lamp glow: the pavement pool and the facade spill merged into one quad pair; the spill is 40% as bright. */
 function glowGeometry(): THREE.BufferGeometry {
   const pool = new THREE.PlaneGeometry(PROP_DIMS.poolRadius * 2, PROP_DIMS.poolRadius * 2);
@@ -439,9 +512,11 @@ function glowGeometry(): THREE.BufferGeometry {
 
 /**
  * Draw radius per prop kind: past this the prop is a couple of pixels, so it is left out of the instance buffer.
- * Parked shells and lot furniture stop at 120 m: beyond that a lot interior is hidden behind its own street wall.
+ * Parked shells and lot furniture stop at 120 m: beyond that a lot interior is hidden behind its own street wall;
+ * kerbside cars sit in plain view down a street and go further. Palms switch from the alpha fronds to the solid far
+ * LOD at `palmNear`.
  */
-export const PROP_RANGE = { palm: 165, lamp: 240, bench: 170, hydrant: 140, bin: 130, sign: 175, shelter: 210, bollard: 120, parked: 120, island: 120, planter: 110, repackMove: 15 } as const;
+export const PROP_RANGE = { palm: 165, palmNear: 60, tree: 120, hedge: 100, lamp: 240, bench: 170, hydrant: 140, bin: 130, sign: 175, shelter: 210, bollard: 120, parked: 120, kerb: 135, island: 120, planter: 110, repackMove: 15 } as const;
 
 /** Seeds of the two palm variants; palms alternate between them by index. */
 const PALM_SEEDS = [1201, 2417] as const;
@@ -451,26 +526,45 @@ const GLOW_OPACITY = 0.45;
 
 const PARKED_SPECS: ParkedSpec[] = ['sedan', 'sport', 'van'];
 
+/** Floats per placement in PropGroup.data: x, z, yaw, scale, y (the ground height the instance stands on). */
+const STRIDE = 5;
+
 interface PropGroup {
-  /** Source placements: x, z, yaw, scale per prop (never mutated). */
+  /** Source placements, STRIDE floats each (never mutated). */
   data: Float32Array;
   /** Per-instance paint (r, g, b) for the parked shells; null for props drawn in their baked colours. */
   colors: Float32Array | null;
-  /** Ground height the instances stand on (kerb for street props, the lot floor for lot dressing). */
-  y: number;
   count: number;
   range2: number;
+  /** Meshes every in-range instance is written to. */
   meshes: THREE.InstancedMesh[];
+  /** LOD split: instances closer than `nearRange2` also go to `near`, the rest to `far` (both optional). */
+  nearRange2: number;
+  near: THREE.InstancedMesh[];
+  far: THREE.InstancedMesh[];
+}
+
+function makeGroup(n: number, range: number, meshes: THREE.InstancedMesh[], near: THREE.InstancedMesh[] = [], far: THREE.InstancedMesh[] = [], nearRange = 0, colors = false): PropGroup {
+  return { data: new Float32Array(Math.max(1, n) * STRIDE), colors: colors ? new Float32Array(Math.max(1, n) * 3) : null, count: 0, range2: range * range, meshes, nearRange2: nearRange * nearRange, near, far };
+}
+
+function pushPlacement(g: PropGroup, x: number, z: number, yaw: number, scale: number, y: number): void {
+  const o = g.count * STRIDE;
+  g.data[o] = x; g.data[o + 1] = z; g.data[o + 2] = yaw; g.data[o + 3] = scale; g.data[o + 4] = y;
+  g.count++;
 }
 
 /**
- * Builds and adds the instanced prop meshes; 19 draw calls total (two palm variants x 2 parts, three lamp parts,
- * bench, hydrant, bin, sign, shelter frame, shelter glass, bollard, three parked shells, island, planter).
+ * Builds and adds the instanced prop meshes; 22 draw calls total (two palm variants x 2 parts + the shared far palm,
+ * tree, hedge, three lamp parts, bench, hydrant, bin, sign, shelter frame, shelter glass, bollard, three parked
+ * shells, island, planter).
  *
- * The city holds ~1300 lamps and ~500 palms — drawing them all costs ~125k triangles per frame even when
- * they are half a kilometre behind the camera. Instead the source placements are kept on the CPU and only the
- * ones inside PROP_RANGE are written into the instance buffers, repacked whenever the camera has moved
- * `repackMove` metres. Draw calls stay fixed; the triangle count drops by roughly 6x.
+ * The city holds ~1300 lamps, ~500 palms and a few thousand cars, trees and hedges — drawing them all costs hundreds
+ * of thousands of triangles per frame even when they are half a kilometre behind the camera. Instead the source
+ * placements are kept on the CPU and only the ones inside PROP_RANGE are written into the instance buffers, repacked
+ * whenever the camera has moved `repackMove` metres. Groups may share a mesh (the lot and kerb cars of one spec both
+ * fill the spec's shell; both palm variants fill the far palm), so a repack appends to each mesh's `count` in group
+ * order. Draw calls stay fixed; the triangle count drops by roughly 6x.
  */
 export class PropRenderer {
   private readonly meshes: THREE.InstancedMesh[] = [];
@@ -479,15 +573,18 @@ export class PropRenderer {
   private readonly materials: Materials;
   private readonly glowMat: THREE.MeshBasicMaterial;
   private readonly paintMat: THREE.MeshPhysicalMaterial;
+  /** Flat-shaded vertex-colour foliage: tree crowns and trunks, hedges, the far palm LOD. */
+  private readonly foliageMat: THREE.MeshStandardMaterial;
   private lastX = Infinity;
   private lastZ = Infinity;
 
   constructor(scene: THREE.Scene, props: Prop[], materials: Materials, parked: ParkedCar[] = [], lotProps: LotProp[] = []) {
     this.materials = materials;
-    const counts: Record<Prop['kind'], number> = { palm: 0, lamp: 0, bench: 0, hydrant: 0, bin: 0, sign: 0, shelter: 0, bollard: 0 };
+    const counts: Record<Prop['kind'], number> = { palm: 0, lamp: 0, bench: 0, hydrant: 0, bin: 0, sign: 0, shelter: 0, bollard: 0, tree: 0, hedge: 0 };
     for (let i = 0; i < props.length; i++) counts[props[i].kind]++;
     const parkedCounts: Record<ParkedSpec, number> = { sedan: 0, sport: 0, van: 0 };
-    for (let i = 0; i < parked.length; i++) parkedCounts[parked[i].spec]++;
+    const kerbCounts: Record<ParkedSpec, number> = { sedan: 0, sport: 0, van: 0 };
+    for (let i = 0; i < parked.length; i++) (parked[i].at === 'kerb' ? kerbCounts : parkedCounts)[parked[i].spec]++;
     const lotCounts: Record<LotProp['kind'], number> = { island: 0, planter: 0, booth: 0 };
     for (let i = 0; i < lotProps.length; i++) lotCounts[lotProps[i].kind]++;
     const pole = poleGeometry();
@@ -502,12 +599,17 @@ export class PropRenderer {
     const bollard = bollardGeometry();
     const island = islandGeometry();
     const planter = planterGeometry();
-    this.geometries.push(pole, head, glow, bench, hydrant, bin, sign, shelter, shelterGlass, bollard, island, planter);
+    const tree = treeGeometry(4111);
+    const hedge = hedgeGeometry();
+    const farPalm = farPalmGeometry(PALM_SEEDS[0]);
+    this.geometries.push(pole, head, glow, bench, hydrant, bin, sign, shelter, shelterGlass, bollard, island, planter, tree, hedge, farPalm);
     // Pool and spill share one additive material (same glow sprite and tint as Materials' lightPool); the spill's
     // lower intensity is baked into its vertex colour and the night opacity is synced in update().
     const poolSrc = materials.lightPool();
     this.glowMat = new THREE.MeshBasicMaterial({ map: poolSrc.map, color: poolSrc.color, vertexColors: true, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, fog: false, toneMapped: false });
     this.paintMat = makeVehiclePaintMaterial();
+    this.foliageMat = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 0.85, metalness: 0, envMapIntensity: 0.35 });
+    this.foliageMat.name = 'foliage';
     const mk = (name: string, g: THREE.BufferGeometry, m: THREE.Material, n: number, shadow: boolean): THREE.InstancedMesh => {
       const im = new THREE.InstancedMesh(g, m, Math.max(1, n));
       im.name = 'prop:' + name;
@@ -527,6 +629,11 @@ export class PropRenderer {
       const n = Math.ceil(counts.palm / PALM_SEEDS.length);
       palmMeshes.push([mk('palmTrunk' + v, trunk, materials.palmTrunk, n, true), mk('palmFronds' + v, fronds, materials.palmFrond, n, true)]);
     }
+    // The far palm is one mesh for both variants: past 60 m the variants' lean is a few pixels, and it never enters
+    // the shadow box, so it casts nothing.
+    const farPalmM = mk('palmFar', farPalm, this.foliageMat, counts.palm, false);
+    const treeM = mk('tree', tree, this.foliageMat, counts.tree, true);
+    const hedgeM = mk('hedge', hedge, this.foliageMat, counts.hedge, true);
     const poleM = mk('lampPole', pole, materials.lampPole, counts.lamp, true);
     const headM = mk('lampHead', head, materials.lampHead(), counts.lamp, false);
     const glowM = mk('lampGlow', glow, this.glowMat, counts.lamp, false);
@@ -540,34 +647,35 @@ export class PropRenderer {
     const bollardM = mk('bollard', bollard, materials.furniture, counts.bollard, false);
     const islandM = mk('island', island, materials.furniture, lotCounts.island, false);
     const planterM = mk('planter', planter, materials.furniture, lotCounts.planter, true);
-    // Parked shells: one mesh per spec on the vehicle paint material; the instance colour tints the paint regions.
+    // Parked shells: one mesh per spec (lot and kerb cars together) on the vehicle paint material; the instance
+    // colour tints the paint regions.
     const parkedMeshes: THREE.InstancedMesh[] = [];
     scratchColor.setRGB(1, 1, 1);
     for (let i = 0; i < PARKED_SPECS.length; i++) {
       const spec = PARKED_SPECS[i];
       const shell = parkedShellGeometry(SPECS[spec]);
       this.geometries.push(shell);
-      const m = mk('parked:' + spec, shell, this.paintMat, parkedCounts[spec], true);
+      const m = mk('parked:' + spec, shell, this.paintMat, parkedCounts[spec] + kerbCounts[spec], true);
       m.receiveShadow = true;
       m.setColorAt(0, scratchColor); // allocates instanceColor before the first compile, so the shader is built with it
       parkedMeshes.push(m);
     }
     // `parity`/`mod` split one kind over several groups (palm variants) by its index within the kind.
-    const group = (kind: Prop['kind'], n: number, range: number, meshes: THREE.InstancedMesh[], parity = 0, mod = 1): PropGroup => {
-      const g: PropGroup = { data: new Float32Array(Math.max(1, n) * 4), colors: null, y: CURB_H, count: 0, range2: range * range, meshes };
+    const group = (kind: Prop['kind'], n: number, range: number, meshes: THREE.InstancedMesh[], parity = 0, mod = 1, near: THREE.InstancedMesh[] = [], far: THREE.InstancedMesh[] = [], nearRange = 0): PropGroup => {
+      const g = makeGroup(n, range, meshes, near, far, nearRange);
       this.groups.push(g);
       let idx = 0;
       for (let i = 0; i < props.length; i++) {
         const p = props[i];
         if (p.kind !== kind) continue;
         if (idx++ % mod !== parity) continue;
-        const o = g.count * 4;
-        g.data[o] = p.x; g.data[o + 1] = p.z; g.data[o + 2] = p.yaw; g.data[o + 3] = p.scale;
-        g.count++;
+        pushPlacement(g, p.x, p.z, p.yaw, p.scale, CURB_H);
       }
       return g;
     };
-    for (let v = 0; v < PALM_SEEDS.length; v++) group('palm', Math.ceil(counts.palm / PALM_SEEDS.length), PROP_RANGE.palm, palmMeshes[v], v, PALM_SEEDS.length);
+    for (let v = 0; v < PALM_SEEDS.length; v++) group('palm', Math.ceil(counts.palm / PALM_SEEDS.length), PROP_RANGE.palm, [], v, PALM_SEEDS.length, palmMeshes[v], [farPalmM], PROP_RANGE.palmNear);
+    group('tree', counts.tree, PROP_RANGE.tree, [treeM]);
+    group('hedge', counts.hedge, PROP_RANGE.hedge, [hedgeM]);
     group('lamp', counts.lamp, PROP_RANGE.lamp, [poleM, headM, glowM]);
     group('bench', counts.bench, PROP_RANGE.bench, [benchM]);
     group('hydrant', counts.hydrant, PROP_RANGE.hydrant, [hydrantM]);
@@ -577,31 +685,31 @@ export class PropRenderer {
     group('bollard', counts.bollard, PROP_RANGE.bollard, [bollardM]);
     // Lot dressing stands on the lot floor.
     const lotGroup = (kind: LotProp['kind'], range: number, mesh: THREE.InstancedMesh): void => {
-      const n = lotCounts[kind];
-      const g: PropGroup = { data: new Float32Array(Math.max(1, n) * 4), colors: null, y: LOT_FLOOR_Y, count: 0, range2: range * range, meshes: [mesh] };
+      const g = makeGroup(lotCounts[kind], range, [mesh]);
       this.groups.push(g);
       for (let i = 0; i < lotProps.length; i++) {
         const p = lotProps[i];
-        if (p.kind !== kind) continue;
-        const o = g.count * 4;
-        g.data[o] = p.x; g.data[o + 1] = p.z; g.data[o + 2] = p.yaw; g.data[o + 3] = 1;
-        g.count++;
+        if (p.kind === kind) pushPlacement(g, p.x, p.z, p.yaw, 1, LOT_FLOOR_Y);
       }
     };
     lotGroup('island', PROP_RANGE.island, islandM);
     lotGroup('planter', PROP_RANGE.planter, planterM);
+    // Parked cars: per spec one group for the lot bays (lot floor, short range) and one for the kerbs (pavement,
+    // longer range), both filling the spec's shell mesh.
     for (let s = 0; s < PARKED_SPECS.length; s++) {
-      const spec = PARKED_SPECS[s], n = parkedCounts[spec];
-      const g: PropGroup = { data: new Float32Array(Math.max(1, n) * 4), colors: new Float32Array(Math.max(1, n) * 3), y: LOT_FLOOR_Y, count: 0, range2: PROP_RANGE.parked * PROP_RANGE.parked, meshes: [parkedMeshes[s]] };
-      this.groups.push(g);
-      for (let i = 0; i < parked.length; i++) {
-        const p = parked[i];
-        if (p.spec !== spec) continue;
-        const o = g.count * 4, c = g.count * 3;
-        g.data[o] = p.x; g.data[o + 1] = p.z; g.data[o + 2] = p.yaw; g.data[o + 3] = 1;
-        scratchColor.setHex(p.colour);
-        g.colors[c] = scratchColor.r; g.colors[c + 1] = scratchColor.g; g.colors[c + 2] = scratchColor.b;
-        g.count++;
+      const spec = PARKED_SPECS[s];
+      for (const at of ['lot', 'kerb'] as const) {
+        const n = at === 'lot' ? parkedCounts[spec] : kerbCounts[spec];
+        const g = makeGroup(n, at === 'lot' ? PROP_RANGE.parked : PROP_RANGE.kerb, [parkedMeshes[s]], [], [], 0, true);
+        this.groups.push(g);
+        for (let i = 0; i < parked.length; i++) {
+          const p = parked[i];
+          if (p.spec !== spec || p.at !== at) continue;
+          const c = g.count * 3;
+          scratchColor.setHex(p.colour);
+          g.colors![c] = scratchColor.r; g.colors![c + 1] = scratchColor.g; g.colors![c + 2] = scratchColor.b;
+          pushPlacement(g, p.x, p.z, p.yaw, 1, at === 'lot' ? LOT_FLOOR_Y : CURB_H);
+        }
       }
     }
     // Instanced meshes cannot be culled per instance, and their bounds span the whole city: pack by distance instead.
@@ -617,36 +725,44 @@ export class PropRenderer {
     this.repack(camX, camZ);
   }
 
+  /** Writes one placement into every mesh of `list` at that mesh's cursor (`count`). */
+  private static write(list: THREE.InstancedMesh[], colored: boolean): void {
+    for (let m = 0; m < list.length; m++) {
+      const mesh = list[m];
+      mesh.setMatrixAt(mesh.count, mat);
+      if (colored) mesh.setColorAt(mesh.count, scratchColor);
+      mesh.count++;
+    }
+  }
+
   private repack(camX: number, camZ: number): void {
     this.lastX = camX;
     this.lastZ = camZ;
+    for (let i = 0; i < this.meshes.length; i++) this.meshes[i].count = 0;
     for (let gi = 0; gi < this.groups.length; gi++) {
       const g = this.groups[gi];
-      let written = 0;
+      const colored = g.colors !== null;
       for (let i = 0; i < g.count; i++) {
-        const o = i * 4;
+        const o = i * STRIDE;
         const x = g.data[o], z = g.data[o + 1];
         const ddx = x - camX, ddz = z - camZ;
-        if (ddx * ddx + ddz * ddz > g.range2) continue;
-        dummy.position.set(x, g.y, z);
+        const d2 = ddx * ddx + ddz * ddz;
+        if (d2 > g.range2) continue;
+        dummy.position.set(x, g.data[o + 4], z);
         dummy.rotation.set(0, g.data[o + 2], 0);
         const sc = g.data[o + 3];
         dummy.scale.set(sc, sc, sc);
         dummy.updateMatrix();
         mat.copy(dummy.matrix);
-        for (let m = 0; m < g.meshes.length; m++) g.meshes[m].setMatrixAt(written, mat);
-        if (g.colors) {
-          scratchColor.setRGB(g.colors[i * 3], g.colors[i * 3 + 1], g.colors[i * 3 + 2]);
-          for (let m = 0; m < g.meshes.length; m++) g.meshes[m].setColorAt(written, scratchColor);
-        }
-        written++;
+        if (colored) scratchColor.setRGB(g.colors![i * 3], g.colors![i * 3 + 1], g.colors![i * 3 + 2]);
+        PropRenderer.write(g.meshes, colored);
+        if (g.near.length || g.far.length) PropRenderer.write(d2 < g.nearRange2 ? g.near : g.far, colored);
       }
-      for (let m = 0; m < g.meshes.length; m++) {
-        const mesh = g.meshes[m];
-        mesh.count = written;
-        mesh.instanceMatrix.needsUpdate = true;
-        if (g.colors && mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-      }
+    }
+    for (let i = 0; i < this.meshes.length; i++) {
+      const mesh = this.meshes[i];
+      mesh.instanceMatrix.needsUpdate = true;
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     }
   }
 
@@ -661,6 +777,7 @@ export class PropRenderer {
     for (let i = 0; i < this.geometries.length; i++) this.geometries[i].dispose();
     this.glowMat.dispose();
     this.paintMat.dispose();
+    this.foliageMat.dispose();
     this.meshes.length = 0;
     this.geometries.length = 0;
   }

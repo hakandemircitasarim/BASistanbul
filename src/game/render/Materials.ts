@@ -30,6 +30,11 @@ const HDR_BOOST = 2;
  * CityRenderer dims wide signs further through the vertex tint.
  */
 const NEON_BOOST = 1.5;
+/** Palm frond tint (multiplies the leaflet map) and its daylight translucency emissive (faded out at night). */
+const PALM_FROND_TINT = 0x7fa050;
+const PALM_FROND_EMISSIVE_DAY = 0.06;
+/** Half width of the frond alpha ramp around alphaTest (see the palmFrond shader patch). */
+const PALM_ALPHA_RAMP = 0.08;
 
 /**
  * Roughness / metalness / sky-probe strength per surface family. Everything lit is MeshStandardMaterial so the PMREM
@@ -158,10 +163,27 @@ export class Materials {
     // Front side only: the frond geometry carries its own back faces, whose normals still point at the sky. With
     // DoubleSide three flips the normal on back faces, so at midday every frond seen from below turned black.
     // Vertex colours tint the dead skirt fronds brown and the underside copies darker; live fronds carry white.
-    // A whisper of leaf-coloured emissive stands in for translucency, so a frond against the sky is not a cut-out.
-    this.palmFrond = new THREE.MeshStandardMaterial({ map: tex.palmFrond(), alphaTest: 0.34, side: THREE.FrontSide, color: 0xb8c8a0, vertexColors: true, emissive: 0xb8c8a0, emissiveIntensity: 0.06, roughness: 0.65, metalness: 0, envMapIntensity: SURF.foliage.env });
-    // Alpha-to-coverage lets the MSAA resolve feather the leaf edges instead of the hard alpha-test stair-step.
+    // A whisper of leaf-coloured emissive stands in for translucency by day (applyNight fades it out, so the crowns
+    // go dark with everything else instead of glowing grey after sunset). The tint is a deep saturated green: the
+    // old pale sage read as mint once the sky fill and the coverage bleed (below) got at it.
+    this.palmFrond = new THREE.MeshStandardMaterial({ map: tex.palmFrond(), alphaTest: 0.34, side: THREE.FrontSide, color: PALM_FROND_TINT, vertexColors: true, emissive: PALM_FROND_TINT, emissiveIntensity: PALM_FROND_EMISSIVE_DAY, roughness: 0.65, metalness: 0, envMapIntensity: SURF.foliage.env });
+    // Alpha-to-coverage lets the MSAA resolve feather the leaf edges instead of the hard alpha-test stair-step. Past
+    // ~25 m the mip chain averages the leaflet gaps into a coverage of ~0.4-0.6, and three's own smoothstep over
+    // [alphaTest, alphaTest + fwidth] then lets that much sky through every frond (the mint / cut-out look). The
+    // ramp below is re-centred on the test and fixed at +-PALM_ALPHA_RAMP (no screen derivatives: a fwidth-based
+    // ramp blacked out the whole MSAA frame on the software GL used by the screenshot harness), so a distant frond is
+    // solid wherever its alpha clears the test and only the real leaf edges, which cross the ramp in a texel or two,
+    // stay feathered.
     this.palmFrond.alphaToCoverage = true;
+    this.palmFrond.onBeforeCompile = (shader) => {
+      shader.fragmentShader = shader.fragmentShader.replace('#include <alphatest_fragment>', [
+        '{',
+        `  diffuseColor.a = smoothstep( alphaTest - ${PALM_ALPHA_RAMP.toFixed(3)}, alphaTest + ${PALM_ALPHA_RAMP.toFixed(3)}, diffuseColor.a );`,
+        '  if ( diffuseColor.a <= 0.0 ) discard;',
+        '}',
+      ].join('\n'));
+    };
+    this.palmFrond.customProgramCacheKey = () => 'palmFrondSharpen';
     this.lampPole = new THREE.MeshStandardMaterial({ color: 0x3a3d44, roughness: SURF.metal.roughness, metalness: SURF.metal.metalness, envMapIntensity: SURF.metal.env });
     this.bench = new THREE.MeshStandardMaterial({ color: 0x8a5a30, roughness: SURF.wood.roughness, metalness: 0, envMapIntensity: SURF.wood.env });
     this.hydrant = new THREE.MeshStandardMaterial({ color: 0xd8302a, roughness: SURF.paint.roughness, metalness: SURF.paint.metalness, envMapIntensity: SURF.paint.env });
@@ -261,6 +283,8 @@ export class Materials {
     this.lampHeadMat.color.lerpColors(this.lampDay, this.lampNight, n);
     this.lightPoolMat.opacity = n * 0.45;
     this.lampSpillMat.opacity = n * 0.18;
+    // Palm crowns: the translucency stand-in is a daylight effect only.
+    this.palmFrond.emissiveIntensity = PALM_FROND_EMISSIVE_DAY * (1 - n);
     // Damp asphalt after dark: dropping the road's roughness lets the sky probe, the lamps and the neon smear along
     // the street the way a wet Vice City night does, without any reflection pass.
     this.road.roughness = SURF.road.roughnessDay + n * (SURF.road.roughnessNight - SURF.road.roughnessDay);

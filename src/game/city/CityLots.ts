@@ -1,10 +1,12 @@
 // Lot subdivision and building placement per block: lot grids, merges, empty parking lots, heights, styles, neon signs;
-// lot furnishing (static parked cars, kerb islands, planters) once the gameplay spots are placed. Track A.
+// lot furnishing (static parked cars, kerb islands, planters, street-edge hedges) once the gameplay spots are placed,
+// followed by the street dressing (CityProps.furnishStreets). Track A.
 import { BLOCK } from './CityConfig';
 import { NEONS, SIGN_WORDS, pickStyle } from './Palette';
 import type { Block, Building, Lot, NeonSign, ParkedSpec } from './CityData';
-import { addAabb, addLotProp, addParkedCar, blockIndex, districtOf } from './CityBuild';
+import { addAabb, addLotProp, addParkedCar, addPropBox, blockIndex, districtOf, rectClear } from './CityBuild';
 import type { GenContext } from './CityBuild';
+import { furnishStreets } from './CityProps';
 import type { LanePos, RoadGraph } from './RoadGraph';
 import type { Random } from '../core/Random';
 import { SPECS } from '../entities/VehicleSpecs';
@@ -267,6 +269,12 @@ const PARKED_MIX: { key: ParkedSpec; weight: number }[] = [{ key: 'sedan', weigh
 /** Kerb island at a strip head: bay-long, a car door wide, kerb high. Planters (r 0.45) stand on the islands. */
 const ISLAND = { w: 1.5, l: 5.6, h: 0.16, p: 0.5, p2: 0.3 } as const;
 const PARKED_H = 1.5;
+/**
+ * Clipped hedge units screening a lot from the street: 2 m long, standing `off` outside the lot's kerb ring in the
+ * block's inset band (the pavement between the lot and the sidewalk), broken at the gate (`gateClear` either side of
+ * the drive lane) and short of the lot corners by `cornerClear`.
+ */
+export const HEDGE = { len: 2.0, depth: 0.6, h: 0.8, off: 1.0, pitch: 2.1, gateClear: 1.5, cornerClear: 0.4 } as const;
 
 /** Axis-aligned rectangle in world space. */
 export interface Rect { x0: number; z0: number; x1: number; z1: number }
@@ -397,9 +405,40 @@ export function furnishLots(ctx: GenContext): void {
         const forward = rng.chance(0.5);
         const yaw = lay.alongX ? (forward ? Math.PI / 2 : -Math.PI / 2) : (forward ? 0 : Math.PI);
         const x = (r.x0 + r.x1) / 2, z = (r.z0 + r.z1) / 2;
-        addParkedCar(ctx, x, z, yaw, key, colour, spec.width / 2, spec.length / 2, PARKED_H);
+        addParkedCar(ctx, x, z, yaw, key, colour, spec.width / 2, spec.length / 2, PARKED_H, 'lot');
         blocked.push(r);
       }
+    }
+    addLotHedges(ctx, rng, lot, lay);
+  }
+  // Everything that needs the finished lots and the named points hangs off this last generation step
+  // (CityGenerator's call order is fixed): the sidewalk trees, then the kerbside cars that keep clear of them.
+  furnishStreets(ctx);
+}
+
+/**
+ * Hedge rows on the street-facing edges of one lot (the edges on the block's inset line): a run of 2 m units in the
+ * inset band, with a break at the gate. Units carry a box collider, so the player walks around them.
+ */
+function addLotHedges(ctx: GenContext, rng: Random, lot: Lot, lay: LotLayout): void {
+  const blk = ctx.blocks[blockIndex(lot.blockCol, lot.blockRow)];
+  const x0 = lot.x - lot.w / 2, x1 = lot.x + lot.w / 2, z0 = lot.z - lot.d / 2, z1 = lot.z + lot.d / 2;
+  const H = HEDGE;
+  for (let edge = 0; edge < 4; edge++) {
+    // Street-facing = the lot edge sits on the block's inset line.
+    const street = edge === 0 ? blk.z1 - z1 <= INSET + 1e-3 : edge === 1 ? blk.x1 - x1 <= INSET + 1e-3 : edge === 2 ? z0 - blk.z0 <= INSET + 1e-3 : x0 - blk.x0 <= INSET + 1e-3;
+    if (!street) continue;
+    const alongX = edge === 0 || edge === 2;
+    const a0 = (alongX ? x0 : z0) + H.cornerClear, a1 = (alongX ? x1 : z1) - H.cornerClear;
+    const across = edge === 0 ? z1 + H.off : edge === 1 ? x1 + H.off : edge === 2 ? z0 - H.off : x0 - H.off;
+    const gateA = alongX ? lot.x : lot.z, gateHalf = lay.gate === edge ? LOT_BAYS.gateW / 2 + H.gateClear : -1;
+    const yaw = alongX ? Math.PI / 2 : 0;
+    for (let a = a0 + H.len / 2; a + H.len / 2 <= a1 + 1e-6; a += H.pitch) {
+      if (gateHalf > 0 && Math.abs(a - gateA) < gateHalf + H.len / 2) continue;
+      const x = alongX ? a : across, z = alongX ? across : a;
+      const ex = alongX ? H.len / 2 : H.depth / 2, ez = alongX ? H.depth / 2 : H.len / 2;
+      if (!rectClear(ctx.hash, x - ex, z - ez, x + ex, z + ez, 0.04)) continue;
+      addPropBox(ctx, 'hedge', x, z, yaw, rng.range(0.94, 1.06), H.depth / 2, H.len / 2, H.h);
     }
   }
 }

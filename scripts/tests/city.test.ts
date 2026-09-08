@@ -1,13 +1,13 @@
-// City tests: graph counts/links, pathing, walk graph, validateCity, points/spots, reservations, lookups, determinism, minimap, lot dressing. Track A.
+// City tests: graph counts/links, pathing, walk graph, validateCity, points/spots, reservations, lookups, determinism, minimap, lot dressing, street dressing (trees, hedges, kerbside cars). Track A.
 import { test, expect, approx } from './harness';
 import { generateCity, validateCity } from '../../src/game/city/CityGenerator';
 import type { GeneratedCity } from '../../src/game/city/CityGenerator';
 import { BUDGET } from '../../src/game/core/Budget';
 import { Random } from '../../src/game/core/Random';
-import { INTERSECTION_R, LANE_W, PITCH } from '../../src/game/city/CityConfig';
-import { colliderDistance, onRoad } from '../../src/game/city/CityBuild';
-import { LOT_BAYS, lotLayout } from '../../src/game/city/CityLots';
-import type { Lot } from '../../src/game/city/CityData';
+import { BLOCK, INTERSECTION_R, LANE_W, PITCH, ROAD_W, SIDEWALK_W } from '../../src/game/city/CityConfig';
+import { ASPHALT_HALF, colliderDistance, districtOf, onRoad } from '../../src/game/city/CityBuild';
+import { HEDGE, LOT_BAYS, lotLayout } from '../../src/game/city/CityLots';
+import type { Lot, ParkedCar } from '../../src/game/city/CityData';
 import { SPECS } from '../../src/game/entities/VehicleSpecs';
 import type { LanePos } from '../../src/game/city/RoadGraph';
 import { MINIMAP_BLIP_CAPACITY, MinimapRenderer, createMinimapSnapshot } from '../../src/game/minimap/MinimapRenderer';
@@ -30,10 +30,12 @@ function city(): GeneratedCity {
 test('city: counts and generation time', () => {
   const g = city();
   const c = g.city;
-  let lamps = 0, palms = 0, benches = 0, hydrants = 0;
-  for (const p of c.props) { if (p.kind === 'lamp') lamps++; else if (p.kind === 'palm') palms++; else if (p.kind === 'bench') benches++; else hydrants++; }
+  let lamps = 0, palms = 0, benches = 0, hydrants = 0, trees = 0, hedges = 0, other = 0;
+  for (const p of c.props) { if (p.kind === 'lamp') lamps++; else if (p.kind === 'palm') palms++; else if (p.kind === 'bench') benches++; else if (p.kind === 'hydrant') hydrants++; else if (p.kind === 'tree') trees++; else if (p.kind === 'hedge') hedges++; else other++; }
+  let lotCars = 0, kerbCars = 0;
+  for (const p of c.parked ?? []) { if (p.at === 'kerb') kerbCars++; else lotCars++; }
   console.log(`    summary: nodes ${g.roads.nodes.length}, segments ${g.roads.segments.length}, lanes ${g.roads.lanes.length}, walk nodes ${g.sidewalks.nodes.length}, loops ${g.sidewalks.loops.length}`);
-  console.log(`    summary: buildings ${c.buildings.length}, neon ${c.neonSigns.length}, landmarks ${c.landmarks.length}, lamps ${lamps}, palms ${palms}, benches ${benches}, hydrants ${hydrants}, parked ${c.parkedSpots.length}, colliders ${c.staticColliders.length}`);
+  console.log(`    summary: buildings ${c.buildings.length}, neon ${c.neonSigns.length}, landmarks ${c.landmarks.length}, lamps ${lamps}, palms ${palms}, trees ${trees}, hedges ${hedges}, benches ${benches}, hydrants ${hydrants}, other props ${other}, spots ${c.parkedSpots.length}, lot cars ${lotCars}, kerb cars ${kerbCars}, colliders ${c.staticColliders.length}`);
   console.log(`    summary: generation ${genMs.toFixed(1)} ms (cold), ${warmMs.toFixed(1)} ms (warm)`);
   expect(g.roads.nodes.length === 121, 'nodes = 121');
   expect(g.roads.segments.length === 220, 'segments = 220');
@@ -337,9 +339,9 @@ test('minimap: snapshot capacity and renderer draws with a fake canvas', () => {
 test('lots: static parked cars fill free bays only, keep the gameplay spots, their exit side and the gate lane clear, and carry colliders', () => {
   const g = city();
   const c = g.city;
-  const lots = c.lots ?? [], parked = c.parked ?? [], lotProps = c.lotProps ?? [];
+  const lots = c.lots ?? [], parked = (c.parked ?? []).filter((p) => p.at === 'lot'), lotProps = c.lotProps ?? [];
   const B = LOT_BAYS;
-  expect(parked.length >= 400 && parked.length <= 2000, `400-2000 static parked cars (got ${parked.length})`);
+  expect(parked.length >= 400 && parked.length <= 2000, `400-2000 static lot cars (got ${parked.length})`);
   let islands = 0, planters = 0;
   for (const p of lotProps) { if (p.kind === 'island') islands++; else if (p.kind === 'planter') planters++; }
   expect(islands >= lots.length && planters >= lots.length / 2, `islands (${islands}) and planters (${planters}) for ${lots.length} lots`);
@@ -400,5 +402,137 @@ test('lots: static parked cars fill free bays only, keep the gameplay spots, the
   expect(parked.some((p) => Math.hypot(p.x - sp.x, p.z - sp.z) < 45), 'static cars in the spawn lot');
   // Determinism of the dressing alone.
   const b = generateCity(1907).city;
-  expect(JSON.stringify(b.parked) === JSON.stringify(parked) && JSON.stringify(b.lotProps) === JSON.stringify(lotProps), 'lot dressing deterministic for the seed');
+  expect(JSON.stringify((b.parked ?? []).filter((p) => p.at === 'lot')) === JSON.stringify(parked) && JSON.stringify(b.lotProps) === JSON.stringify(lotProps), 'lot dressing deterministic for the seed');
 });
+
+/** Road centre line nearest a point on a block face: the block edge it sits outside of and the offset from that edge. */
+function faceOffset(c: { blocks: { x0: number; z0: number; x1: number; z1: number }[] }, x: number, z: number): { edge: number; off: number; along: number } | null {
+  for (const b of c.blocks) {
+    const half = ROAD_W / 2;
+    if (x >= b.x0 && x <= b.x1) {
+      if (z > b.z1 && z < b.z1 + half) return { edge: 0, off: z - b.z1, along: x - b.x0 };
+      if (z < b.z0 && z > b.z0 - half) return { edge: 2, off: b.z0 - z, along: x - b.x0 };
+    }
+    if (z >= b.z0 && z <= b.z1) {
+      if (x > b.x1 && x < b.x1 + half) return { edge: 1, off: x - b.x1, along: z - b.z0 };
+      if (x < b.x0 && x > b.x0 - half) return { edge: 3, off: b.x0 - x, along: z - b.z0 };
+    }
+  }
+  return null;
+}
+
+test('kerbside parking: on the pavement against the kerb, off every lane / intersection / crossing, clear of props, points and each other, with colliders, deterministic', () => {
+  const g = city();
+  const c = g.city;
+  const kerb = (c.parked ?? []).filter((p) => p.at === 'kerb');
+  expect(kerb.length >= 900 && kerb.length <= 2200, `900-2200 kerbside cars (got ${kerb.length})`);
+  const aabbs = c.staticColliders.filter((k) => k.tag === 'prop' && k.shape.kind === 'aabb');
+  const circles = c.staticColliders.filter((k) => k.shape.kind === 'circle' && k.tag !== 'water' && k.tag !== 'boundary');
+  const hasCollider = (x: number, z: number): boolean => aabbs.some((k) => k.shape.kind === 'aabb' && x > k.shape.minX && x < k.shape.maxX && z > k.shape.minZ && z < k.shape.maxZ);
+  const rectOf = (p: ParkedCar) => {
+    const hw = SPECS[p.spec].width / 2, hl = SPECS[p.spec].length / 2;
+    const cs = Math.abs(Math.cos(p.yaw)), sn = Math.abs(Math.sin(p.yaw));
+    const ex = hw * cs + hl * sn, ez = hw * sn + hl * cs;
+    return { x0: p.x - ex, z0: p.z - ez, x1: p.x + ex, z1: p.z + ez };
+  };
+  const overlap = (a: { x0: number; z0: number; x1: number; z1: number }, b: { x0: number; z0: number; x1: number; z1: number }): boolean => a.x0 < b.x1 && a.x1 > b.x0 && a.z0 < b.z1 && a.z1 > b.z0;
+  const rects = (c.parked ?? []).filter((p) => p.at === 'lot').map(rectOf);
+  const pts: [number, number][] = [];
+  for (const k of ['playerSpawn', 'hospital', 'policeStation', 'garage', 'beachDelivery'] as const) pts.push([c.points[k].x, c.points[k].z]);
+  for (const m of c.points.missionStarts) pts.push([m.x, m.z]);
+  const hydrants = c.props.filter((p) => p.kind === 'hydrant'), shelters = c.props.filter((p) => p.kind === 'shelter');
+  const dist = (r: { x0: number; z0: number; x1: number; z1: number }, x: number, z: number): number => Math.hypot(Math.max(r.x0 - x, 0, x - r.x1), Math.max(r.z0 - z, 0, z - r.z1));
+  const halfW = LANE_W / 2;
+  let sedans = 0;
+  for (const p of kerb) {
+    expect(p.spec === 'sedan' || p.spec === 'sport' || p.spec === 'van', 'kerb spec valid');
+    if (p.spec === 'sedan') sedans++;
+    expect(SPECS[p.spec].colors.indexOf(p.colour) >= 0, 'kerb colour from the spec palette');
+    approx(p.yaw, Math.round(p.yaw / (Math.PI / 2)) * Math.PI / 2, 1e-9, 'kerb yaw is a quarter turn');
+    const r = rectOf(p);
+    // On a block face's pavement strip: road-side flank just off the asphalt, far flank inside the block edge.
+    const f = faceOffset(c, p.x, p.z);
+    expect(f !== null, `kerb car at (${p.x.toFixed(1)}, ${p.z.toFixed(1)}) lies on a block face`);
+    const hw = SPECS[p.spec].width / 2;
+    const roadSide = f!.off + hw, blockSide = f!.off - hw;
+    expect(roadSide <= SIDEWALK_W - 0.05 + 1e-6 && roadSide >= SIDEWALK_W - 0.2, `road-side flank ${(ROAD_W / 2 - roadSide).toFixed(2)} m from the road centre (kerb at ${ASPHALT_HALF})`);
+    expect(blockSide >= 0.5, 'far flank leaves room on the pavement');
+    // Nose along the edge, well clear of the block corners (intersection boxes + crossings).
+    const alongX = f!.edge === 0 || f!.edge === 2;
+    expect(alongX === (Math.abs(Math.sin(p.yaw)) > 0.5), 'kerb car noses along the street');
+    const hl = SPECS[p.spec].length / 2;
+    expect(f!.along - hl >= 5.9 && f!.along + hl <= BLOCK - 5.9, `kerb car stays ${6} m clear of the block corners (along ${f!.along.toFixed(1)})`);
+    // Never on a lane or in an intersection (validator rule at every corner), and the yaw follows the adjacent lane.
+    for (const [x, z] of [[r.x0, r.z0], [r.x1, r.z0], [r.x0, r.z1], [r.x1, r.z1], [p.x, p.z]]) expect(!onRoad(g.roads, x, z, halfW), 'kerb car footprint off the road');
+    const lp = { lane: 0, t: 0 };
+    g.roads.nearestLane(p.x, p.z, lp);
+    const d = g.roads.lanes[lp.lane].dir;
+    approx(Math.atan2(d.x, d.z), p.yaw, 1e-6, 'nose along the adjacent lane direction');
+    // Clear of every prop / building collider (circles), other parked cars, hydrants, shelters and the named points.
+    for (const k of circles) { const s = k.shape as { cx: number; cz: number; r: number }; expect(dist(r, s.cx, s.cz) >= s.r + 0.29, `kerb car clears ${k.tag} collider at (${s.cx.toFixed(1)}, ${s.cz.toFixed(1)})`); }
+    for (const o of rects) expect(!overlap(r, o), 'kerb cars never overlap another parked car');
+    rects.push(r);
+    for (const h of hydrants) expect(dist(r, h.x, h.z) >= 1.5 - 1e-6, 'kerb car keeps 1.5 m from a hydrant');
+    for (const h of shelters) expect(dist(r, h.x, h.z) >= 3.2 - 1e-6, 'kerb car keeps 3.2 m from a bus shelter');
+    for (const [x, z] of pts) expect(dist(r, x, z) >= 3.5 - 1e-6, 'kerb car keeps 3.5 m from the named points');
+    expect(hasCollider(p.x, p.z), 'kerb car has an AABB prop collider');
+  }
+  expect(sedans > kerb.length * 0.45 && sedans < kerb.length * 0.8, `sedans dominate the mix (${sedans}/${kerb.length})`);
+  // The spawn street has kerbside cars in view, and the spawn point itself stays free.
+  const sp = c.points.playerSpawn;
+  expect(kerb.some((p) => Math.hypot(p.x - sp.x, p.z - sp.z) < 60), 'kerbside cars within 60 m of the spawn');
+  const b = generateCity(1907).city;
+  expect(JSON.stringify((b.parked ?? []).filter((p) => p.at === 'kerb')) === JSON.stringify(kerb), 'kerbside parking deterministic for the seed');
+});
+
+test('street trees and lot hedges: placement, clearances, colliders', () => {
+  const g = city();
+  const c = g.city;
+  const trees = c.props.filter((p) => p.kind === 'tree'), hedges = c.props.filter((p) => p.kind === 'hedge');
+  expect(trees.length >= 500 && trees.length <= 1600, `500-1600 sidewalk trees (got ${trees.length})`);
+  expect(hedges.length >= 600 && hedges.length <= 3000, `600-3000 hedge units (got ${hedges.length})`);
+  const circles = c.staticColliders.filter((k) => k.shape.kind === 'circle' && k.tag !== 'water' && k.tag !== 'boundary');
+  const shelters = c.props.filter((p) => p.kind === 'shelter');
+  let downtown = 0;
+  for (const t of trees) {
+    const f = faceOffset(c, t.x, t.z);
+    expect(f !== null, 'tree stands on a block face');
+    approx(f!.off, 2.3, 1e-6, 'tree on the kerb line (2.3 m outside the block edge)');
+    expect(f!.along >= 6 && f!.along <= BLOCK - 6, 'tree clear of the block corners');
+    expect(!onRoad(g.roads, t.x, t.z, halfWOf()), 'tree off the road');
+    const blk = c.blocks.find((b) => t.x >= b.x0 - 3 && t.x <= b.x1 + 3 && t.z >= b.z0 - 3 && t.z <= b.z1 + 3)!;
+    const d = districtOf(blk.col, blk.row);
+    expect(d !== 'beachfront' && blk.kind === 'buildings', 'trees only on downtown / suburb building blocks');
+    if (d === 'downtown') downtown++;
+    expect(t.scale >= 0.85 && t.scale <= 1.15, 'tree scale in range');
+    let nearest = Infinity;
+    for (const k of circles) {
+      const s = k.shape as { cx: number; cz: number; r: number };
+      const dd = Math.hypot(s.cx - t.x, s.cz - t.z) - s.r;
+      if (dd > 1e-6 && dd < nearest) nearest = dd; // skip its own collider (distance -r)
+    }
+    expect(nearest >= 1.2 - 1e-6, `tree keeps 1.2 m from the nearest collider (got ${nearest.toFixed(2)})`);
+    for (const h of shelters) expect(Math.hypot(h.x - t.x, h.z - t.z) >= 4.5, 'tree keeps 4.5 m from a bus shelter');
+    expect(circles.some((k) => { const s = k.shape as { cx: number; cz: number; r: number }; return Math.abs(s.cx - t.x) < 1e-6 && Math.abs(s.cz - t.z) < 1e-6; }), 'tree has a circle collider');
+  }
+  expect(downtown > 0 && downtown < trees.length, 'trees in both downtown and the suburbs');
+  const lots = c.lots ?? [];
+  const aabbs = c.staticColliders.filter((k) => k.tag === 'prop' && k.shape.kind === 'aabb');
+  for (const h of hedges) {
+    // In the inset band outside a lot's street-facing edge, never across its gate.
+    const lot = lots.find((l) => Math.abs(h.x - l.x) <= l.w / 2 + HEDGE.off + 0.5 && Math.abs(h.z - l.z) <= l.d / 2 + HEDGE.off + 0.5 && (Math.abs(Math.abs(h.x - l.x) - (l.w / 2 + HEDGE.off)) < 1e-6 || Math.abs(Math.abs(h.z - l.z) - (l.d / 2 + HEDGE.off)) < 1e-6));
+    expect(lot !== undefined, `hedge at (${h.x.toFixed(1)}, ${h.z.toFixed(1)}) sits ${HEDGE.off} m outside a lot edge`);
+    const blk = c.blocks[lot!.blockRow * 10 + lot!.blockCol];
+    expect(h.x > blk.x0 && h.x < blk.x1 && h.z > blk.z0 && h.z < blk.z1, 'hedge inside the block (inset band)');
+    const lay = lotLayout(g.roads, c.blocks, lot!);
+    const onX = Math.abs(Math.abs(h.z - lot!.z) - (lot!.d / 2 + HEDGE.off)) < 1e-6;
+    const gateEdge = lay.gate === 0 || lay.gate === 2 ? onX && Math.sign(h.z - lot!.z) === (lay.gate === 0 ? 1 : -1) : !onX && Math.sign(h.x - lot!.x) === (lay.gate === 1 ? 1 : -1);
+    if (gateEdge) expect(Math.abs((onX ? h.x : h.z) - (onX ? lot!.x : lot!.z)) >= LOT_BAYS.gateW / 2 + HEDGE.gateClear + HEDGE.len / 2 - 1e-6, 'hedge stays out of the gate');
+    expect(aabbs.some((k) => k.shape.kind === 'aabb' && h.x > k.shape.minX && h.x < k.shape.maxX && h.z > k.shape.minZ && h.z < k.shape.maxZ), 'hedge has an AABB collider');
+    for (const b of c.buildings) expect(Math.abs(b.x - h.x) > b.w / 2 + 0.3 || Math.abs(b.z - h.z) > b.d / 2 + 0.3, 'hedge never touches a building');
+  }
+  const b = generateCity(1907).city;
+  expect(JSON.stringify(b.props.filter((p) => p.kind === 'tree' || p.kind === 'hedge')) === JSON.stringify([...c.props.filter((p) => p.kind === 'tree' || p.kind === 'hedge')]), 'trees and hedges deterministic for the seed');
+});
+
+function halfWOf(): number { return LANE_W / 2; }

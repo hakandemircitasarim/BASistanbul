@@ -34,8 +34,13 @@ const SKY_TUNING = {
   cloudScale: 0.6, cloudCut: 0.28, cloudSoft: 0.3, cloudDay: 0.45, cloudNight: 0.22, cloudDrift: 0.018,
   // Dome radiance multiplier (linear HDR): a bright day sky that ACES rolls off, unity at night so the stars keep their size.
   exposureDay: 1.8, exposureNight: 1.0,
-  // Reflection probe resolution (equirect) and refresh cadence in game hours.
-  probeW: 128, probeH: 64, probeRefreshHours: 0.3,
+  // Reflection probe resolution (equirect) and refresh cadence in game hours. 256x128 is the smallest size at which the
+  // horizon crease, the skyline row and the hard sun disc survive PMREM filtering on a clearcoat car roof.
+  probeW: 256, probeH: 128, probeRefreshHours: 0.3,
+  // Probe skyline: number of silhouette blocks around the horizon, their height range in sin(elevation) and gap chance.
+  probeBlocks: 44, probeBlockMinH: 0.012, probeBlockMaxH: 0.075, probeGapChance: 0.3,
+  // Probe sun: the hard disc radius (rad) and its linear radiance, plus the soft bloom sigma / amplitude around it.
+  probeSunDisc: 0.014, probeSunDiscI: 14, probeSunSigma: 0.055, probeSunI: 3.5,
 } as const;
 
 const VERT = `
@@ -110,8 +115,11 @@ void main() {
   #include <colorspace_fragment>
 }`;
 
-/** Skyline silhouette rectangle in the reflection probe: azimuth centre / half width (rad), top and bottom in sin(elevation). */
-interface Silhouette { az: number; halfW: number; top: number; bottom: number }
+/**
+ * Skyline silhouette block in the reflection probe: azimuth centre / half width (rad), top and bottom in sin(elevation),
+ * and `lit` (0..1) for the block's tone, so the row reads as a jagged city edge rather than one flat wall.
+ */
+interface Silhouette { az: number; halfW: number; top: number; bottom: number; lit: number }
 
 export class SkySystem {
   readonly sun: THREE.DirectionalLight;
@@ -198,9 +206,18 @@ export class SkySystem {
       pos[i * 3 + 1] = Math.sin(e) * r;
       pos[i * 3 + 2] = Math.sin(a) * Math.cos(e) * r;
     }
-    // Skyline silhouettes for the probe: 12 seeded towers of varying width/height straddling the horizon.
-    for (let i = 0; i < 12; i++) {
-      this.silhouettes.push({ az: rnd() * Math.PI * 2, halfW: 0.06 + rnd() * 0.2, top: 0.02 + rnd() * 0.08, bottom: -0.03 });
+    // Skyline silhouettes for the probe: a contiguous row of seeded blocks around the whole horizon (varying width and
+    // height, a gap now and then, a taller tower every so often), so a car roof reflects a broken city edge under the sky.
+    const nb = SKY_TUNING.probeBlocks;
+    let az = 0;
+    for (let i = 0; i < nb; i++) {
+      const halfW = (Math.PI * 2 / nb) * (0.35 + rnd() * 0.3);
+      az += halfW;
+      const gap = rnd() < SKY_TUNING.probeGapChance;
+      const tall = rnd() < 0.12;
+      const h = SKY_TUNING.probeBlockMinH + rnd() * (SKY_TUNING.probeBlockMaxH - SKY_TUNING.probeBlockMinH);
+      if (!gap) this.silhouettes.push({ az, halfW, top: tall ? h * 1.8 : h, bottom: -0.06, lit: rnd() });
+      az += halfW + (gap ? halfW * 0.6 : 0);
     }
     const starGeo = new THREE.BufferGeometry();
     starGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
@@ -270,9 +287,9 @@ export class SkySystem {
   }
 
   /**
-   * Paints the probe (sky gradient x exposure, a Gaussian sun blob, a hard horizon over a dark ground half with a
-   * brighter band just above it, and the skyline silhouettes) and refilters it. Cheap (128x64 source) and only runs when
-   * the sky has moved on, so car paint and glass show a horizon crease and a sun glint that track the day.
+   * Paints the probe (sky gradient x exposure, a hard sun disc inside a soft bloom, a bright horizon band over a hazy
+   * ground half, and the skyline silhouette row) and refilters it. Cheap (256x128 source, ~1 ms) and only runs when the
+   * sky has moved on, so car paint and glass show a horizon crease, a city edge and a sun glint that track the day.
    */
   private refreshEnvironment(sunDir: Vec3, exposure: number, sunLow: number): void {
     const data = this.envData, tex = this.envTex, pm = this.pmrem;
@@ -280,14 +297,17 @@ export class SkySystem {
     const W = SKY_TUNING.probeW, H = SKY_TUNING.probeH;
     const top = this.cTop, warmHor = this.cHor, sun = this.cSun;
     const coolHor = this.cA.copy(warmHor).lerp(top, 0.4).multiplyScalar(1.1);
-    const ground = this.cB.copy(this.cFog).multiplyScalar(0.35);
-    const sil = this.cD.copy(this.cFog).multiplyScalar(0.16);
+    // Ground half: a hazy band right under the horizon that falls to a dark floor, so the crease between the bright
+    // horizon and the ground is the strongest line in the probe (it is what a roof or bonnet reflects most).
+    const groundNear = this.cB.copy(this.cFog).multiplyScalar(0.5);
+    const groundFar = this.cD.copy(this.cFog).multiplyScalar(0.18);
     const px = this.cE, hor = this.cC, mid = this.cF;
     const sunUp = sunDir.y > -0.08;
     const sl = Math.hypot(sunDir.x, sunDir.z) || 1;
     const sdx = sunDir.x / sl, sdz = sunDir.z / sl;
     const sil0 = this.silhouettes;
     const TWO_PI = Math.PI * 2;
+    const S = SKY_TUNING;
     for (let j = 0; j < H; j++) {
       const v = (j + 0.5) / H;
       const el = (v - 0.5) * Math.PI;
@@ -302,18 +322,24 @@ export class SkySystem {
         // Mirror of the dome's low-sun desaturation (see FRAG) so the probe agrees with the visible sky.
         { const l = mid.r * 0.299 + mid.g * 0.587 + mid.b * 0.114; mid.lerp(scratchLuma.setRGB(l * 0.9, l * 0.95, l * 1.06), 0.5 * sunLow); }
         if (y >= 0) {
-          if (y < 0.035) px.copy(hor).multiplyScalar(1.12);
-          else if (y < 0.3) px.lerpColors(hor, mid, Math.pow(y / 0.3, 0.7));
+          // Horizon band: brightest haze right on the line, easing into the gradient over the first few degrees.
+          if (y < 0.06) px.copy(hor).multiplyScalar(1.3 - 0.3 * (y / 0.06));
+          else if (y < 0.3) px.lerpColors(hor, mid, Math.pow((y - 0.06) / 0.24, 0.7));
           else px.lerpColors(mid, top, Math.pow((y - 0.3) / 0.7, 0.45));
         } else {
-          px.copy(ground);
+          px.lerpColors(groundNear, groundFar, Math.min(1, -y / 0.2));
         }
         for (let k = 0; k < sil0.length; k++) {
           const s = sil0[k];
           if (y > s.top || y < s.bottom) continue;
           let da = phi - s.az;
           da -= Math.round(da / TWO_PI) * TWO_PI;
-          if (Math.abs(da) < s.halfW) { px.copy(sil); break; }
+          if (Math.abs(da) < s.halfW) {
+            // Block face: dark haze-tinted mass, a shade lighter on its sunward side and along its top edge.
+            const face = 0.14 + 0.1 * s.lit + 0.08 * ss * ss + (s.top - y < 0.006 ? 0.12 : 0);
+            px.copy(this.cFog).multiplyScalar(face);
+            break;
+          }
         }
         const yy = Math.max(y, 0);
         const sm = yy >= 0.5 ? 1 : (yy / 0.5) * (yy / 0.5) * (3 - 2 * (yy / 0.5));
@@ -322,7 +348,10 @@ export class SkySystem {
         if (sunUp && y > -0.02) {
           const d = clamp(x * sunDir.x + y * sunDir.y + z * sunDir.z, -1, 1);
           const ang = Math.acos(d);
-          const r = (6 * Math.exp(-(ang * ang) / (2 * 0.07 * 0.07)) + 0.35 * Math.exp(-(ang * ang) / (2 * 0.35 * 0.35))) * exposure;
+          // Hard disc + soft bloom + wide corona: the disc is what a clearcoat glint picks up, the bloom what the
+          // rougher base paint smears into a highlight.
+          const disc = ang < S.probeSunDisc ? S.probeSunDiscI : 0;
+          const r = (disc + S.probeSunI * Math.exp(-(ang * ang) / (2 * S.probeSunSigma * S.probeSunSigma)) + 0.35 * Math.exp(-(ang * ang) / (2 * 0.35 * 0.35))) * exposure;
           px.r += sun.r * r; px.g += sun.g * r; px.b += sun.b * r;
         }
         const o = (j * W + i) * 4;

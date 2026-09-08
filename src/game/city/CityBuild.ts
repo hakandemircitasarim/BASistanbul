@@ -3,7 +3,7 @@ import type { Random } from '../core/Random';
 import type { StaticCollider } from '../core/Collision';
 import { SpatialHash } from '../core/SpatialHash';
 import { BLOCK, DISTRICTS, GRID_COLS, INTERSECTION_R, LANDMARK_BLOCKS, LANES_PER_DIR, LANE_W, PITCH, PLAZA_BLOCKS, ROAD_W } from './CityConfig';
-import type { Block, Building, District, Landmark, Lot, LotProp, NeonSign, ParkedCar, ParkedSpec, ParkedSpot, Prop } from './CityData';
+import type { Block, Building, CityData, District, Landmark, Lot, LotProp, NeonSign, ParkedCar, ParkedSpec, ParkedSpot, Prop } from './CityData';
 import type { RoadGraph, LanePos } from './RoadGraph';
 import type { SidewalkGraph } from './SidewalkGraph';
 
@@ -22,6 +22,8 @@ export interface GenContext {
   lotProps: LotProp[];
   roads: RoadGraph;
   sidewalks: SidewalkGraph;
+  /** Named points, once CityProps.makePoints has produced them (the street dressing keeps clear of them). */
+  points?: CityData['points'];
 }
 
 export const STATIC_CELL = 32;
@@ -77,7 +79,13 @@ export function addCircle(ctx: GenContext, cx: number, cz: number, r: number, ta
 
 export function addProp(ctx: GenContext, kind: Prop['kind'], x: number, z: number, yaw: number, scale: number, colliderR: number): void {
   ctx.props.push({ kind, x, z, yaw, scale });
-  if (colliderR > 0) addCircle(ctx, x, z, colliderR * scale, 'prop', kind === 'palm' ? 7 * scale : kind === 'lamp' ? 6 : kind === 'sign' ? 2.6 : kind === 'shelter' ? 2.5 : 1);
+  if (colliderR > 0) addCircle(ctx, x, z, colliderR * scale, 'prop', kind === 'palm' ? 7 * scale : kind === 'tree' ? 6.5 * scale : kind === 'lamp' ? 6 : kind === 'sign' ? 2.6 : kind === 'shelter' ? 2.5 : 1);
+}
+
+/** Prop with a box footprint (a hedge unit): half sizes `hw` across x `hl` along the nose at a quarter-turn yaw. */
+export function addPropBox(ctx: GenContext, kind: Prop['kind'], x: number, z: number, yaw: number, scale: number, halfW: number, halfL: number, height: number): void {
+  ctx.props.push({ kind, x, z, yaw, scale });
+  addFootprint(ctx, x, z, yaw, halfW * scale, halfL * scale, height);
 }
 
 /**
@@ -90,9 +98,9 @@ function addFootprint(ctx: GenContext, x: number, z: number, yaw: number, hw: nu
   addAabb(ctx, x - ex, z - ez, x + ex, z + ez, 'prop', height);
 }
 
-/** Static parked car (lot set dressing) with its footprint collider, like the sign / shelter props. */
-export function addParkedCar(ctx: GenContext, x: number, z: number, yaw: number, spec: ParkedSpec, colour: number, halfW: number, halfL: number, height: number): void {
-  ctx.parked.push({ x, z, yaw, spec, colour });
+/** Static parked car (lot or kerb set dressing) with its footprint collider, like the sign / shelter props. */
+export function addParkedCar(ctx: GenContext, x: number, z: number, yaw: number, spec: ParkedSpec, colour: number, halfW: number, halfL: number, height: number, at: ParkedCar['at']): void {
+  ctx.parked.push({ x, z, yaw, spec, colour, at });
   addFootprint(ctx, x, z, yaw, halfW, halfL, height);
 }
 
@@ -124,6 +132,28 @@ export function clearance(hash: SpatialHash<StaticCollider>, x: number, z: numbe
     if (d < best) best = d;
   }
   return best;
+}
+
+/**
+ * True when the axis-aligned rectangle, grown by `pad`, touches no collider (water and boundary walls ignored): the
+ * footprint test for kerbside cars and hedge units.
+ */
+export function rectClear(hash: SpatialHash<StaticCollider>, x0: number, z0: number, x1: number, z1: number, pad: number): boolean {
+  const cx = (x0 + x1) / 2, cz = (z0 + z1) / 2;
+  const r = Math.hypot(x1 - x0, z1 - z0) / 2 + pad + 1;
+  const n = hash.queryCircle(cx, cz, r, queryOut);
+  for (let i = 0; i < n; i++) {
+    const c = queryOut[i];
+    if (c.tag === 'water' || c.tag === 'boundary') continue;
+    const s = c.shape;
+    if (s.kind === 'aabb') {
+      if (s.minX < x1 + pad && s.maxX > x0 - pad && s.minZ < z1 + pad && s.maxZ > z0 - pad) return false;
+    } else {
+      const dx = Math.max(x0 - s.cx, 0, s.cx - x1), dz = Math.max(z0 - s.cz, 0, s.cz - z1);
+      if (dx * dx + dz * dz < (s.r + pad) * (s.r + pad)) return false;
+    }
+  }
+  return true;
 }
 
 const lanePos: LanePos = { lane: 0, t: 0 };

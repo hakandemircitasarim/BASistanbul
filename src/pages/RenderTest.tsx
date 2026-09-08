@@ -5,6 +5,7 @@ import { Renderer } from '@/game/render/Renderer';
 import { TextureFactory } from '@/game/render/TextureFactory';
 import { Materials } from '@/game/render/Materials';
 import { CityRenderer } from '@/game/render/CityRenderer';
+import { BackdropRenderer } from '@/game/render/BackdropRenderer';
 import { SkySystem } from '@/game/render/SkySystem';
 import { MarkerRenderer } from '@/game/render/MarkerRenderer';
 import { EffectsRenderer } from '@/game/render/EffectsRenderer';
@@ -75,7 +76,8 @@ export default function RenderTest() {
     const materials = new Materials(tex);
     const city = new CityRenderer(renderer.scene, gen.city, gen.roads, materials, tex);
     city.build();
-    const sky = new SkySystem(renderer.scene, renderer.camera, tex);
+    const backdrop = new BackdropRenderer(renderer.scene, materials);
+    const sky = new SkySystem(renderer.scene, renderer.camera, tex, renderer.gl);
     const dayNight = new DayNightSystem();
     dayNight.setHour(hour);
     const markers = new MarkerRenderer(renderer.scene, materials, (out) => {
@@ -139,6 +141,7 @@ export default function RenderTest() {
       effects.dispose();
       markers.dispose();
       sky.dispose();
+      backdrop.dispose();
       city.dispose();
       materials.dispose();
       tex.dispose();

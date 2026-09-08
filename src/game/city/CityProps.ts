@@ -1,9 +1,11 @@
-// Landmarks, water/boundary colliders, plaza/park furnishing, street props (lamps, palms, hydrants), parked spots and named points. Track A.
-import { BEACH_X0, BLOCK, CITY_MAX_X, CITY_MAX_Z, CITY_MIN_X, CITY_MIN_Z, LAMP_SPACING, LANDMARK_BLOCKS, LANE_W, OCEAN_SIZE, OCEAN_X0, PALMS_PER_BLOCK_EDGE, PLAZA_BLOCKS, ROAD_W } from './CityConfig';
+// Landmarks, water/boundary colliders, plaza/park furnishing, street props (lamps, palms, trees, hydrants), kerbside parking, parked spots and named points. Track A.
+import { BEACH_X0, BLOCK, CITY_MAX_X, CITY_MAX_Z, CITY_MIN_X, CITY_MIN_Z, LAMP_SPACING, LANDMARK_BLOCKS, LANE_W, OCEAN_SIZE, OCEAN_X0, PALMS_PER_BLOCK_EDGE, PLAZA_BLOCKS, ROAD_W, SIDEWALK_W } from './CityConfig';
 import { BUDGET } from '../core/Budget';
-import type { Block, CityData, Landmark, Lot, NamedPoint } from './CityData';
-import { ASPHALT_HALF, addAabb, addCircle, addProp, blockIndex, clearance, distToNearestRoadNode, districtOf, nearestLaneYaw, onRoad, spotTooClose } from './CityBuild';
+import type { Block, CityData, District, Landmark, Lot, NamedPoint, ParkedSpec } from './CityData';
+import { ASPHALT_HALF, addAabb, addCircle, addParkedCar, addProp, blockIndex, clearance, distToNearestRoadNode, districtOf, nearestLaneYaw, onRoad, rectClear, spotTooClose } from './CityBuild';
 import type { GenContext } from './CityBuild';
+import type { Random } from '../core/Random';
+import { SPECS } from '../entities/VehicleSpecs';
 
 export const PIER_Z = 590;
 export const PIER_W = 12;
@@ -40,6 +42,18 @@ const SPOT_LOT_INSET = 3.5;
 const SPOT_LOT_CAP = 6;
 const SPOT_LOT_CAP_OTHER = 4;
 const SPAWN_SPOT_RADIUS = 40;
+
+/** Sidewalk trees (downtown / suburb): pitch along a block edge, the first one this far from the corner, jitter, offset from the block edge (0.7 m off the kerb, like the palms). */
+const TREE = { pitch: 18, first: 9, jitter: 2.5, offset: 2.3, r: 0.3, clear: 1.2, shelterClear: 4.5, scaleMin: 0.85, scaleMax: 1.15 } as const;
+/**
+ * Kerbside parking: cars stand on the pavement strip hard against the kerb (their road-side flank `kerbGap` off the
+ * asphalt edge, i.e. wholly outside the outer lane), noses along the adjacent lane's direction of travel, in runs
+ * between the street furniture. `endClear` keeps them off the corner boxes and crossings, the fill share varies by
+ * district, and hydrants / bus shelters / named points get their own no-parking clearances.
+ */
+const KERB = { kerbGap: 0.08, endClear: 6, gapMin: 0.7, gapMax: 1.8, pad: 0.3, hydrantClear: 1.5, shelterClear: 3.2, pointClear: 3.5, height: 1.5 } as const;
+const KERB_FILL: Record<District, number> = { downtown: 0.58, suburb: 0.46, beachfront: 0.52 };
+const KERB_MIX: { key: ParkedSpec; weight: number }[] = [{ key: 'sedan', weight: 62 }, { key: 'sport', weight: 18 }, { key: 'van', weight: 20 }];
 
 const blockCenterX = (b: Block): number => (b.x0 + b.x1) / 2;
 const blockCenterZ = (b: Block): number => (b.z0 + b.z1) / 2;
@@ -292,7 +306,7 @@ export function makePoints(ctx: GenContext): CityData['points'] {
   const missionStarts: NamedPoint[] = [];
   for (let i = 0; i < PLAZA_BLOCKS.length; i++) missionStarts.push(pointAt(ctx, loopOf(PLAZA_BLOCKS[i][0], PLAZA_BLOCKS[i][1])[8], 0));
   const prom = ctx.sidewalks.nearestNode(PROMENADE_X, PIER_Z);
-  return {
+  const points: CityData['points'] = {
     playerSpawn: pointAt(ctx, loopOf(SPAWN_BLOCK[0], SPAWN_BLOCK[1])[4], Math.PI / 2),
     hospital: pointAt(ctx, loopOf(LANDMARK_BLOCKS.hospital[0], LANDMARK_BLOCKS.hospital[1])[8], 0),
     policeStation: pointAt(ctx, loopOf(LANDMARK_BLOCKS.police[0], LANDMARK_BLOCKS.police[1])[8], 0),
@@ -301,6 +315,116 @@ export function makePoints(ctx: GenContext): CityData['points'] {
     garage: pointAt(ctx, loopOf(7, 2)[8], 0),
     beachDelivery: { x: prom.x, z: prom.z, yaw: 0 },
   };
+  ctx.points = points;
+  return points;
+}
+
+// ---------------------------------------------------------------------------------------------- street dressing
+
+/**
+ * Edge walker: (x, z) of the point `t` along block edge `edge` (0 +Z south, 1 +X east, 2 -Z north, 3 -X west),
+ * `off` metres outside the block. `t` runs west to east on the south / north edges, north to south on the others.
+ */
+function edgePoint(b: Block, edge: number, t: number, off: number, out: { x: number; z: number }): void {
+  if (edge === 0) { out.x = b.x0 + t; out.z = b.z1 + off; } else if (edge === 1) { out.x = b.x1 + off; out.z = b.z0 + t; } else if (edge === 2) { out.x = b.x0 + t; out.z = b.z0 - off; } else { out.x = b.x0 - off; out.z = b.z0 + t; }
+}
+const ep = { x: 0, z: 0 };
+
+/**
+ * Round-crown sidewalk trees on the downtown and suburb blocks (the beachfront has its palms): one every ~18 m along
+ * every edge, on the kerb line like the palms, skipped where a lamp, sign, palm, bin or hydrant already stands and
+ * within `shelterClear` of a bus shelter (which has no collider). Seeded from `rng` only.
+ */
+export function addStreetTrees(ctx: GenContext, rng: Random): void {
+  const shelters: { x: number; z: number }[] = [];
+  for (let i = 0; i < ctx.props.length; i++) if (ctx.props[i].kind === 'shelter') shelters.push({ x: ctx.props[i].x, z: ctx.props[i].z });
+  for (let bi = 0; bi < ctx.blocks.length; bi++) {
+    const b = ctx.blocks[bi];
+    if (b.kind !== 'buildings' || districtOf(b.col, b.row) === 'beachfront') continue;
+    for (let edge = 0; edge < 4; edge++) {
+      for (let t = TREE.first; t <= BLOCK - TREE.first + 1e-6; t += TREE.pitch) {
+        const tt = t + rng.range(-TREE.jitter, TREE.jitter);
+        edgePoint(b, edge, tt, TREE.offset, ep);
+        const x = ep.x, z = ep.z;
+        if (clearance(ctx.hash, x, z, 6) < TREE.clear) continue;
+        let nearShelter = false;
+        for (let k = 0; k < shelters.length && !nearShelter; k++) nearShelter = Math.hypot(shelters[k].x - x, shelters[k].z - z) < TREE.shelterClear;
+        if (nearShelter) continue;
+        addProp(ctx, 'tree', x, z, rng.range(0, Math.PI * 2), rng.range(TREE.scaleMin, TREE.scaleMax), TREE.r);
+      }
+    }
+  }
+}
+
+function pickKerbSpec(rng: Random): ParkedSpec {
+  let total = 0;
+  for (let i = 0; i < KERB_MIX.length; i++) total += KERB_MIX[i].weight;
+  let r = rng.next() * total;
+  for (let i = 0; i < KERB_MIX.length; i++) { r -= KERB_MIX[i].weight; if (r < 0) return KERB_MIX[i].key; }
+  return 'sedan';
+}
+
+/** Squared distance from (x, z) to the rectangle [x0, x1] x [z0, z1] (0 inside). */
+function rectDist2(x0: number, z0: number, x1: number, z1: number, x: number, z: number): number {
+  const dx = Math.max(x0 - x, 0, x - x1), dz = Math.max(z0 - z, 0, z - z1);
+  return dx * dx + dz * dz;
+}
+
+/**
+ * Kerbside parking along every block face: the strip walks each edge from `endClear` past the corner to `endClear`
+ * before the next one, dropping a car (or an empty slot) at a time with a small gap. A car is kept when its footprint,
+ * padded by `pad`, clears every collider (lamps, trees, signs, bins, palms, other cars), stays `hydrantClear` /
+ * `shelterClear` / `pointClear` from hydrants, bus shelters and the named points (spawn, hospital, police, garage,
+ * mission starts), and its road-side flank sits `kerbGap` outside the asphalt, so the outer lane and the intersection
+ * boxes stay free for the AI. Each car gets the footprint collider of the lot cars. Seeded from `rng` only.
+ */
+export function addKerbsideParking(ctx: GenContext, rng: Random): void {
+  const pts = ctx.points;
+  const avoid: { x: number; z: number; r: number }[] = [];
+  if (pts) {
+    for (const k of ['playerSpawn', 'hospital', 'policeStation', 'garage', 'beachDelivery', 'pier'] as const) avoid.push({ x: pts[k].x, z: pts[k].z, r: KERB.pointClear });
+    for (let i = 0; i < pts.missionStarts.length; i++) avoid.push({ x: pts.missionStarts[i].x, z: pts.missionStarts[i].z, r: KERB.pointClear });
+  }
+  for (let i = 0; i < ctx.props.length; i++) {
+    const p = ctx.props[i];
+    if (p.kind === 'hydrant') avoid.push({ x: p.x, z: p.z, r: KERB.hydrantClear });
+    else if (p.kind === 'shelter') avoid.push({ x: p.x, z: p.z, r: KERB.shelterClear });
+  }
+  const kerbOff = SIDEWALK_W - KERB.kerbGap; // road-side flank this far outside the block edge (0.08 m off the asphalt)
+  for (let bi = 0; bi < ctx.blocks.length; bi++) {
+    const b = ctx.blocks[bi];
+    const fill = KERB_FILL[districtOf(b.col, b.row)];
+    for (let edge = 0; edge < 4; edge++) {
+      const alongX = edge === 0 || edge === 2;
+      let t = KERB.endClear + rng.range(0, 3);
+      while (t < BLOCK - KERB.endClear) {
+        const key = pickKerbSpec(rng);
+        const spec = SPECS[key];
+        const len = spec.length, hw = spec.width / 2, hl = len / 2;
+        const t1 = t + len;
+        if (t1 > BLOCK - KERB.endClear) break;
+        const keep = rng.chance(fill);
+        const colour = rng.pick(spec.colors);
+        // Footprint: centred `hw` inside the road-side flank, spanning [t, t1] along the edge.
+        edgePoint(b, edge, (t + t1) / 2, kerbOff - hw, ep);
+        const x = ep.x, z = ep.z;
+        const x0 = alongX ? x - hl : x - hw, x1 = alongX ? x + hl : x + hw, z0 = alongX ? z - hw : z - hl, z1 = alongX ? z + hw : z + hl;
+        let ok = keep && rectClear(ctx.hash, x0, z0, x1, z1, KERB.pad);
+        for (let k = 0; k < avoid.length && ok; k++) ok = rectDist2(x0, z0, x1, z1, avoid[k].x, avoid[k].z) >= avoid[k].r * avoid[k].r;
+        if (ok) {
+          const yaw = nearestLaneYaw(ctx.roads, x, z);
+          addParkedCar(ctx, x, z, yaw, key, colour, hw, hl, KERB.height, 'kerb');
+        }
+        t = t1 + rng.range(KERB.gapMin, KERB.gapMax);
+      }
+    }
+  }
+}
+
+/** Street dressing that needs the finished city (props, points): trees first, then the kerbside cars that avoid them. */
+export function furnishStreets(ctx: GenContext): void {
+  addStreetTrees(ctx, ctx.rng.fork());
+  addKerbsideParking(ctx, ctx.rng.fork());
 }
 
 export function spawnSpotCount(ctx: GenContext, spawn: NamedPoint): number {
