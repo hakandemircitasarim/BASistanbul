@@ -9,7 +9,7 @@ import type { Materials } from './Materials';
 import { STYLES, TILE_M } from './Materials';
 import type { TextureFactory } from './TextureFactory';
 import { GLOW_U, MARK_UV } from './TextureFactory';
-import { BAND, FACE, GeoBuilder, appendBuilding, appendBuildingDetail, appendStreetLevel, bandHeight, landmarkGeometries } from './BuildingGeometry';
+import { BAND, BASE_WALL_Y, FACE, GeoBuilder, appendBuilding, appendBuildingDetail, appendStreetLevel, bandHeight, landmarkGeometries } from './BuildingGeometry';
 import type { WallSign } from './BuildingGeometry';
 import { Random } from '../core/Random';
 import { PropRenderer } from './CityRendererProps';
@@ -217,8 +217,9 @@ export class CityRenderer {
       const plinth = b.district === 'downtown';
       const mask = this.streetFaces(b, blockIdx);
       // A shop arcade recesses the ground floor: the windowed walls start at the arcade ceiling (inside the cap).
+      // The street mask picks the faces that get plan jogs, recessed bays and corner chamfers.
       const bandTop = street ? bandHeight(b, plinth) : 0;
-      appendBuilding(builders[b.style], b, street && !plinth ? bandTop - 0.3 : undefined);
+      appendBuilding(builders[b.style], b, street && !plinth ? bandTop - 0.3 : BASE_WALL_Y, mask);
       appendBuildingDetail(builders[b.style], trim, b, rng, this.wallSigns, mask, bandTop);
       if (street) appendStreetLevel(builders[b.style], plinth ? plinthBand : shopBand, b, rng, plinth, awning, mask);
     }
