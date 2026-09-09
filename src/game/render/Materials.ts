@@ -36,7 +36,7 @@ const PALM_FROND_EMISSIVE_DAY = 0.06;
 /** Leaf emissive kept at full night (the frond tint x this): a dark green, well under anything that blooms. */
 const LEAF_EMISSIVE_NIGHT = 0.045;
 /** How far the leaf albedo (fronds and solid foliage) drops at full night: moonlit leaves stay dark green, never pale. */
-const FOLIAGE_NIGHT_DIM = 0.25;
+const FOLIAGE_NIGHT_DIM = 0.65;
 /** Daylight roughness of the alpha fronds (0.97 at full night: no moon highlight on the leaves). */
 const PALM_FROND_ROUGHNESS = 0.65;
 /** Half width of the frond alpha ramp around alphaTest (see the palmFrond shader patch). */

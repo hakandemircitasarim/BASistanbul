@@ -665,8 +665,14 @@ const REAR_WRAP: SegTone = { ...BODY, flank: T.tail, bezel: T.bezel, low: T.shad
 const REAR_FACE: SegTone = { sill: T.black, low: T.shade, flank: T.tail, bezel: T.bezel, lens: { at: 0, tone: T.tailLens }, side: T.paint, top: T.paint };
 const FRONT_WRAP: SegTone = { ...BODY, flank: T.lamp, bezel: T.bezel, low: T.shade, sill: T.black };
 const FRONT_FACE: SegTone = { sill: T.black, low: T.shade, flank: T.lamp, bezel: T.bezel, lens: { at: 1, tone: T.lampLens }, side: T.paint, top: T.paint };
-/** End-face fan (shrunk ring to the centre point): the bumper band and the black sill continue across the middle. */
-const FAN: SegTone = { sill: T.black, low: T.shade, flank: T.dark, bezel: T.bezel, side: T.dark, top: T.dark };
+/** Nose fan (shrunk ring to the centre point): a dark grille field, the bumper band and the black sill continuing across the middle. */
+const NOSE_FAN: SegTone = { sill: T.black, low: T.shade, flank: T.dark, bezel: T.bezel, side: T.dark, top: T.dark };
+/**
+ * Tail fan, in the plane of the half ring: one clean painted panel. Any band change here fans out from the apex as a
+ * wedge (the old dark flank / bezel / sill wedges met at the centre as an X crease); the bumper prism, valance, plate
+ * and lamp blocks of rearEnd() give the tail its structure instead.
+ */
+const TAIL_FAN: SegTone = { sill: T.paint, low: T.paint, flank: T.paint, bezel: T.paint, side: T.paint, top: T.paint };
 
 /**
  * Lamp cluster depths: the bezel block proud of the swept lamp face and the lens block standing out of it, for the
@@ -763,7 +769,7 @@ function sedanProfile(s: VehicleSpec, kind: 'sedan' | 'police' | 'taxi'): Vehicl
   // the bumper, lamp blocks and shut line of rearEnd() give it its structure.
   const zFace = -hl - 0.05;
   const stations: Station[] = [
-    shrunk(rear, zFace, 0, yCRear, FAN, true),
+    shrunk(rear, zFace, 0, yCRear, TAIL_FAN, true),
     shrunk(rear, zFace, 0.5, yCRear, REAR_FACE, true),
     rear,
     station(-hl + 0.24, c, belt + 0.115, hp * 0.76, belt + 0.035, hp * 0.925, { wFloor: hp * 0.86, yLow: belt - 0.17, wLow: hp * 0.91, edge: 0.03, crown: 0.015, lod: true }),
@@ -782,8 +788,8 @@ function sedanProfile(s: VehicleSpec, kind: 'sedan' | 'police' | 'taxi'): Vehicl
     station(1.45, c, belt + 0.02, hp * 0.70, belt - 0.04, hp * 0.90, { edge: 0.04, crown: 0.02, bulge: 0.03 }),
     station(hl - 0.30, c, belt - 0.05, hp * 0.66, belt - 0.09, hp * 0.87, { wFloor: hp * 0.80, yLow: belt - 0.28, wLow: hp * 0.86, edge: 0.04, crown: 0.015, seg: FRONT_WRAP, lod: true }),
     nose,
-    shrunk(nose, hl + 0.05, 0.5, yCFront, FAN, true),
-    shrunk(nose, hl + 0.06, 0, yCFront, FAN, true),
+    shrunk(nose, hl + 0.05, 0.5, yCFront, NOSE_FAN, true),
+    shrunk(nose, hl + 0.06, 0, yCFront, NOSE_FAN, true),
   );
   const width = (y: number, z: number): number => shellWidth(stations, y, z);
   // A pillars (raked posts over the quarter glass), rocker strip, door shut lines, bonnet gap.
@@ -863,7 +869,7 @@ function sportProfile(s: VehicleSpec): VehicleProfile {
   const deck = station(deckZ, c, belt + 0.17, hp * 0.78, belt + 0.045, hp * 0.945, { edge: 0.02, crown: 0.005, seg: SCREEN_EDGE });
   const zFace = -hl - 0.045;
   const stations: Station[] = [
-    shrunk(rear, zFace, 0, yCRear, FAN, true),
+    shrunk(rear, zFace, 0, yCRear, TAIL_FAN, true),
     shrunk(rear, zFace, 0.5, yCRear, REAR_FACE, true),
     rear,
     station(-hl + 0.28, c, belt + 0.19, hp * 0.82, belt + 0.06, hp * 0.95, { wFloor: hp * 0.88, yLow: belt - 0.06, wLow: hp * 0.94, edge: 0.03, crown: 0.005, lod: true }),
@@ -880,8 +886,8 @@ function sportProfile(s: VehicleSpec): VehicleProfile {
     station(1.40, c, belt - 0.01, hp * 0.70, belt - 0.06, hp * 0.91, { edge: 0.04, crown: 0.02, bulge: 0.03 }),
     station(hl - 0.32, c, belt - 0.08, hp * 0.66, belt - 0.12, hp * 0.88, { wFloor: hp * 0.82, yLow: belt - 0.24, wLow: hp * 0.87, edge: 0.03, crown: 0.015, seg: FRONT_WRAP, lod: true }),
     nose,
-    shrunk(nose, hl + 0.045, 0.5, yCFront, FAN, true),
-    shrunk(nose, hl + 0.055, 0, yCFront, FAN, true),
+    shrunk(nose, hl + 0.045, 0.5, yCFront, NOSE_FAN, true),
+    shrunk(nose, hl + 0.055, 0, yCFront, NOSE_FAN, true),
   );
   const width = (y: number, z: number): number => shellWidth(stations, y, z);
   pillar(parts, cowlZ + 0.02, width(belt + 0.01, cowlZ), belt, roofFrontZ + 0.03, hp * 0.69, roof - 0.055);
@@ -938,7 +944,7 @@ function vanProfile(s: VehicleSpec): VehicleProfile {
   const cowlZ = noseZ + 0.16, roofFrontZ = noseZ - 0.28, bPillarZ = noseZ - 1.02;
   const zFace = -hl - 0.04;
   const stations: Station[] = [
-    shrunk(rear, zFace, 0, belt - 0.15, FAN, true),
+    shrunk(rear, zFace, 0, belt - 0.15, TAIL_FAN, true),
     shrunk(rear, zFace, 0.72, belt - 0.15, REAR_FACE, true),
     rear,
     station(-hl + 0.22, c, roof, hp * 0.88, belt + 0.02, hp * 0.95, { wFloor: hp * 0.88, yLow: belt - 0.32, wLow: hp * 0.94, edge: 0.05, crown: 0.02, lod: true }),
@@ -951,8 +957,8 @@ function vanProfile(s: VehicleSpec): VehicleProfile {
     station(cowlZ, c, belt + 0.10, hp * 0.86, belt - 0.02, hp * 0.93, { edge: 0.03, crown: 0.01, lod: true }),
     station(hl - 0.32, c, belt - 0.02, hp * 0.78, belt - 0.08, hp * 0.88, { wFloor: hp * 0.82, yLow: belt - 0.28, wLow: hp * 0.87, edge: 0.04, crown: 0.02, seg: FRONT_WRAP, lod: true }),
     nose,
-    shrunk(nose, hl + 0.05, 0.5, belt - 0.20, FAN, true),
-    shrunk(nose, hl + 0.06, 0, belt - 0.20, FAN, true),
+    shrunk(nose, hl + 0.05, 0.5, belt - 0.20, NOSE_FAN, true),
+    shrunk(nose, hl + 0.06, 0, belt - 0.20, NOSE_FAN, true),
   ];
   const width = (y: number, z: number): number => shellWidth(stations, y, z);
   pillar(parts, cowlZ + 0.02, width(belt, cowlZ), belt - 0.01, roofFrontZ + 0.03, hp * 0.87, roof - 0.055);
@@ -1087,8 +1093,10 @@ export function parkedShellGeometry(s: VehicleSpec): THREE.BufferGeometry {
 function wheelGeometry(): THREE.BufferGeometry {
   const R = VEHICLE_RENDER;
   const parts: THREE.BufferGeometry[] = [];
-  // Bright alloy: at chase distance the blades are sub-pixel and the dish face is what reads, so it is the light part.
-  const TYRE = 0x1a1b1e, DISH = 0x9aa0a8, SPOKE = 0xd2d7dd;
+  // Alloy: at chase distance the blades are sub-pixel and the dish face is what reads, so it is the light part. Mid
+  // greys on a half-metal, 0.5-rough material: the old near-white spokes on a 0.75-metal mirror flashed pure white
+  // whenever a wheel squared up to the sky probe (the same alloy the parked shells bake into their discs, matte).
+  const TYRE = 0x1a1b1e, DISH = 0x7d838b, SPOKE = 0xaeb4bb;
   const add = (geo: THREE.BufferGeometry, hex: number, shade?: (x: number, y: number, z: number) => number): void => {
     const g = geo.index ? geo.toNonIndexed() : geo;
     if (g !== geo) geo.dispose();
@@ -1236,7 +1244,7 @@ export class VehicleRenderer {
   private readonly bodyMat: THREE.MeshPhysicalMaterial;
   /** Per-instance lights-on flag read by the paint shader (lens emissive), one buffer per body / LOD mesh. */
   private readonly glowAttrs: THREE.InstancedBufferAttribute[] = [];
-  private readonly wheelMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.38, metalness: 0.75, envMapIntensity: 1.0 });
+  private readonly wheelMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.5, metalness: 0.5, envMapIntensity: 0.8 });
   /** Instance colour only: PlaneGeometry has no colour attribute, and `vertexColors` would multiply by a zeroed one. */
   private readonly lightMat = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide, fog: false, toneMapped: false });
   private readonly spotL: THREE.SpotLight;
