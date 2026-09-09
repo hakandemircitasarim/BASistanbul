@@ -9,10 +9,11 @@ import type { Materials } from './Materials';
 import { STYLES, TILE_M } from './Materials';
 import type { TextureFactory } from './TextureFactory';
 import { GLOW_U, MARK_UV } from './TextureFactory';
-import { BAND, BASE_WALL_Y, FACE, GeoBuilder, appendBuilding, appendBuildingDetail, appendStreetLevel, bandHeight, landmarkGeometries } from './BuildingGeometry';
-import type { WallSign } from './BuildingGeometry';
+import { BAND, BASE_WALL_Y, FACE, FacadeCellList, GeoBuilder, appendBuilding, appendBuildingDetail, appendStreetLevel, bandHeight, landmarkGeometries } from './BuildingGeometry';
+import type { FacadeKeepOut, WallSign } from './BuildingGeometry';
 import { Random } from '../core/Random';
 import { PropRenderer } from './CityRendererProps';
+import { FacadeDetailRenderer } from './FacadeDetailRenderer';
 
 /** Asphalt half width: ROAD_W/2 - SIDEWALK_W = 7 m (curbs cover the rest). */
 export const ASPHALT_HALF = 7;
@@ -91,9 +92,11 @@ const laneScratch: LanePos = { lane: 0, t: 0 };
 /**
  * Neon sign bodies. `wallGap` is how far CityLots hangs the sign centre off the facade (0.15 m); the backing box runs
  * from the wall to `backing` in front of it and the glyph quad sits `lift` in front of the box. Signs up to
- * `fullWidth` m keep their full tint, wider ones dim by sqrt(fullWidth / w) down to `minTint`.
+ * `fullWidth` m keep their full tint, wider ones dim by sqrt(fullWidth / w) down to `minTint`. The box stands clear
+ * of every facade relief (floor slabs are 0.25 m proud: a box of the same depth z-fought them into a hairline across
+ * the letters); built units (windows, AC boxes) are kept out of its rectangle altogether (facadeKeepOut).
  */
-const NEON = { wallGap: 0.15, backing: 0.25, lift: 0.05, margin: 0.25, body: 0x24262b, strut: 0x3a3d44, fullWidth: 8, minTint: 0.72 } as const;
+const NEON = { wallGap: 0.15, backing: 0.42, lift: 0.05, margin: 0.25, body: 0x24262b, strut: 0x3a3d44, fullWidth: 8, minTint: 0.72 } as const;
 /** World face bit of building face 0..3 (+Z, +X, -Z, -X), the order CityLots' FACING_YAW uses. */
 const FACE_BIT = [FACE.pz, FACE.px, FACE.nz, FACE.nx];
 
@@ -106,6 +109,9 @@ export class CityRenderer {
   private readonly meshes: THREE.Object3D[] = [];
   private readonly geometries: THREE.BufferGeometry[] = [];
   private props: PropRenderer | null = null;
+  private facade: FacadeDetailRenderer | null = null;
+  /** Every built facade unit of the city, listed by the building detail pass and range-packed by FacadeDetailRenderer. */
+  readonly facadeCells = new FacadeCellList();
   private ferris: THREE.Group | null = null;
   private beam: THREE.Mesh | null = null;
   private beamMat: THREE.MeshBasicMaterial | null = null;
@@ -157,6 +163,30 @@ export class CityRenderer {
     this.props = new PropRenderer(this.scene, this.city.props, this.materials, this.city.parked ?? [], this.city.lotProps ?? []);
     this._staticDraws += this.props.drawCount;
     this.buildNeon();
+    // One batch for every window frame, balcony, AC unit and downpipe within range of the camera.
+    this.facade = new FacadeDetailRenderer(this.scene, this.facadeCells, this.materials.facade);
+    this._staticDraws += 1;
+  }
+
+  /**
+   * Rectangles of the building's neon sign boxes in their rect faces' frames (s along the face from its start corner,
+   * y up), padded for the struts and the box margin, written into `out` (emptied first). Built facade units stay out
+   * of them: a frame or an AC box behind the box is hidden, one beside it pokes through the glyph quad.
+   */
+  private facadeKeepOut(b: Building, out: FacadeKeepOut[]): FacadeKeepOut[] {
+    out.length = 0;
+    if (!b.hasNeonSign) return out;
+    const signs = this.city.neonSigns;
+    for (let i = 0; i < signs.length; i++) {
+      const s = signs[i];
+      if (Math.abs(s.x - b.x) > b.w / 2 + 1 || Math.abs(s.z - b.z) > b.d / 2 + 1) continue;
+      const f = (((Math.round(s.yaw / (Math.PI / 2)) % 4) + 4) % 4);
+      // Face frames in BuildingGeometry's order: +Z runs +X from the west corner, +X runs -Z from the south corner, -Z runs -X, -X runs +Z.
+      const along = f === 0 ? s.x - (b.x - b.w / 2) : f === 1 ? (b.z + b.d / 2) - s.z : f === 2 ? (b.x + b.w / 2) - s.x : s.z - (b.z - b.d / 2);
+      const hw = s.w / 2 + NEON.margin + 0.3, hh = s.h / 2 + NEON.margin * 0.6;
+      out.push({ face: f, s0: along - hw, s1: along + hw, y0: s.y - hh - 0.55, y1: s.y + hh + 0.25 });
+    }
+    return out;
   }
 
   /**
@@ -210,6 +240,7 @@ export class CityRenderer {
     for (let i = 0; i < blocks.length; i++) for (let k = 0; k < blocks[i].buildings.length; k++) { const id = blocks[i].buildings[k]; if (id >= 0 && id < list.length) blockOf[id] = i; }
     // Seeded from the city so parapets, roof clutter, awnings and painted signs are identical for a given seed.
     const rng = new Random(this.city.seed ^ 0x5eed);
+    const keep: FacadeKeepOut[] = [];
     for (let i = 0; i < list.length; i++) {
       const b = list[i];
       const blockIdx = blockOf[b.id];
@@ -220,7 +251,7 @@ export class CityRenderer {
       // The street mask picks the faces that get plan jogs, recessed bays and corner chamfers.
       const bandTop = street ? bandHeight(b, plinth) : 0;
       appendBuilding(builders[b.style], b, street && !plinth ? bandTop - 0.3 : BASE_WALL_Y, mask);
-      appendBuildingDetail(builders[b.style], trim, b, rng, this.wallSigns, mask, bandTop);
+      appendBuildingDetail(builders[b.style], trim, b, rng, this.wallSigns, mask, bandTop, this.facadeCells, this.facadeKeepOut(b, keep));
       if (street) appendStreetLevel(builders[b.style], plinth ? plinthBand : shopBand, b, rng, plinth, awning, mask);
     }
     for (let i = 0; i < STYLES.length; i++) {
@@ -369,7 +400,7 @@ export class CityRenderer {
       }
       if (l.index === 0) {
         const off = LANE_W + 0.25;
-        decal(marks, to.x - hx * STREET.stopBarDist + rx * off, to.z - hz * STREET.stopBarDist + rz * off, hx, hz, STREET.stopBarW, STREET.stopBarL, my, MARK_UV.bar);
+        decal(marks, to.x - hx * STREET.stopBarDist + rx * off, to.z - hz * STREET.stopBarDist + rz * off, hx, hz, STREET.stopBarW, STREET.stopBarL, my, MARK_UV.stop);
       }
     }
   }
@@ -425,7 +456,7 @@ export class CityRenderer {
     }
   }
 
-  /** Bay lines + wheel stops for one lot, following the heading of the nearest lane like the parked spots do. */
+  /** Bay lines + wheel stops for one lot, following the heading of the nearest lane like the parked spots do. The 0.12 m lines sample the atlas' narrow `line` strip (see MARK_UV). */
   private paintBays(lot: Lot, walk: GeoBuilder, marks: GeoBuilder): void {
     const S = STREET;
     this.roads.nearestLane(lot.x, lot.z, laneScratch);
@@ -442,7 +473,7 @@ export class CityRenderer {
       let c = c0;
       for (; c <= across1 + S.bayPitch / 2 + 1e-6; c += S.bayPitch) {
         const px = alongX ? a : c, pz = alongX ? c : a;
-        decal(marks, px, pz, hx, hz, S.bayLineW, S.bayLen, y, MARK_UV.bar);
+        decal(marks, px, pz, hx, hz, S.bayLineW, S.bayLen, y, MARK_UV.line);
       }
       const cEnd = c - S.bayPitch;
       // Wheel-stop kerb at the head of the strip, spanning every bay in it.
@@ -526,6 +557,7 @@ export class CityRenderer {
     this.materials.setNight(nightFactor);
     this.materials.update(time);
     if (this.props) this.props.update(playerX, playerZ);
+    if (this.facade) this.facade.update(playerX, playerZ);
     if (this.ferris) this.ferris.rotation.x = time * CITY_RENDER.ferrisRate;
     if (this.beam && this.beamMat) {
       this.beam.rotation.y = time * CITY_RENDER.beamRate;
@@ -541,6 +573,8 @@ export class CityRenderer {
     }
     for (let i = 0; i < this.geometries.length; i++) this.geometries[i].dispose();
     if (this.props) this.props.dispose();
+    if (this.facade) this.facade.dispose();
+    this.facade = null;
     if (this.beamMat) this.beamMat.dispose();
     this.meshes.length = 0;
     this.geometries.length = 0;

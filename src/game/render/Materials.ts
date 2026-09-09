@@ -69,6 +69,8 @@ export class Materials {
   readonly plinth: THREE.MeshStandardMaterial;
   /** Striped canvas for shop awnings (vertex colour sets the hue, u runs along the stripes' width, v up the drop). */
   readonly awning: THREE.MeshStandardMaterial;
+  /** Built facade detail (window frames, sills, balconies, AC units, downpipes): vertex colour x batch instance colour, painted-metal sheen. */
+  readonly facade: THREE.MeshStandardMaterial;
   readonly road: THREE.MeshStandardMaterial;
   readonly crosswalk: THREE.MeshStandardMaterial;
   /** Painted lane arrows / stop bars laid on the asphalt (alpha-tested decals). */
@@ -130,6 +132,7 @@ export class Materials {
       roughness: SURF.building.roughness, metalness: SURF.building.metalness, envMapIntensity: SURF.building.env,
     });
     this.awning = new THREE.MeshStandardMaterial({ map: tex.awningTex(), vertexColors: true, side: THREE.DoubleSide, roughness: SURF.canvas.roughness, metalness: SURF.canvas.metalness, envMapIntensity: SURF.canvas.env });
+    this.facade = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.62, metalness: SURF.paint.metalness, envMapIntensity: 0.6 });
     // The 1024 px ground tiles carry aggregate, cracks and joints; the relief is derived from them at full res (so a
     // 3 px joint still reads as a groove) and the roughness is painted while drawing (paint and iron smoother than
     // stone), at half res. Normal strengths are tuned so joints catch a 15:00 sun without the aggregate sparkling.
@@ -313,7 +316,7 @@ export class Materials {
 
   dispose(): void {
     for (let i = 0; i < STYLES.length; i++) this.building[STYLES[i]].dispose();
-    this.plain.dispose(); this.glow.dispose(); this.shopfront.dispose(); this.plinth.dispose(); this.awning.dispose();
+    this.plain.dispose(); this.glow.dispose(); this.shopfront.dispose(); this.plinth.dispose(); this.awning.dispose(); this.facade.dispose();
     this.road.dispose(); this.crosswalk.dispose(); this.roadMark.dispose(); this.sidewalk.dispose(); this.sand.dispose();
     this.grass.dispose(); this.plaza.dispose(); this.pavement.dispose(); this.dirt.dispose(); this.water.dispose(); this.foam.dispose();
     this.furniture.dispose(); this.palmTrunk.dispose(); this.palmFrond.dispose(); this.lampPole.dispose(); this.bench.dispose(); this.hydrant.dispose();

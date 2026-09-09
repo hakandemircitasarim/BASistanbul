@@ -2,7 +2,7 @@
 import * as THREE from 'three';
 import type { Building, BuildingStyle, Landmark } from '../city/CityData';
 import type { Random } from '../core/Random';
-import { GLOW_U, PLINTH_BAND_H, PLINTH_BAYS, PLINTH_DOOR_BAY, PLINTH_TILE_W, ROOF_STRIP_PX, ROOF_V, SHOP_BAND_H, SHOP_BAYS, SHOP_BAY_W, SHOP_DOOR_W, SHOP_FASCIA_Y, SHOP_PLAIN_UV, SHOP_ROWS, SHOP_TILE_W, WINDOW_TILE_H, WINDOW_TILE_PX_H, WINDOW_TILE_W } from './TextureFactory';
+import { GLOW_U, PLINTH_BAND_H, PLINTH_BAYS, PLINTH_DOOR_BAY, PLINTH_TILE_W, ROOF_STRIP_PX, ROOF_V, SHOP_BAND_H, SHOP_BAYS, SHOP_BAY_W, SHOP_DOOR_W, SHOP_FASCIA_Y, SHOP_PLAIN_UV, SHOP_ROWS, SHOP_TILE_W, WINDOW_CELL, WINDOW_TILE_H, WINDOW_TILE_PX_H, WINDOW_TILE_W } from './TextureFactory';
 
 /** Material key for a landmark part: a windowed building style (plain parts use the white strip UV) or 'glow' (emissive neon parts). */
 export type LandmarkStyle = BuildingStyle | 'glow';
@@ -67,8 +67,10 @@ const CHAMFER_MIN = 2.2, CHAMFER_VAR = 0.8;
 const SLAB_OUT = 0.25, SLAB_H = 0.22;
 /** Parapet: 1.0-1.2 m walls on the cornice with a coping slab on top. */
 const PARAPET_MIN = 1.0, PARAPET_VAR = 0.2, COPING_H = 0.12, COPING_OUT = 0.08;
-/** Door cell of a shop bay steps this far into the wall (dark reveal faces either side). */
-const DOOR_RECESS = 0.6;
+/** Door cell of a shop bay steps this far into the wall (dark reveal faces either side, a door leaf and a threshold step at the back). */
+const DOOR_RECESS = 1.2;
+/** Door leaf: proud of the recess back, inset from the door cell's jambs; the threshold step in front of it. */
+const DOOR_LEAF_OUT = 0.06, DOOR_LEAF_INSET = 0.1, DOOR_LEAF_H = 2.35, DOOR_STEP_H = 0.12, DOOR_STEP_D = 0.5;
 
 /** 32-bit integer hash (murmur3 finaliser) of a small integer key. */
 function hashU(n: number): number {
@@ -802,7 +804,11 @@ function bandRows(y0: number, y1: number, rowH: number, th: number, key: number,
   out.n = n;
   for (let j = 0; j < n; j++) {
     const ya = out.y[j], yb = out.y[j + 1];
-    const lo = Math.ceil((-ya - 0.02 * th) / rowH - 1e-6), hi = Math.floor((ROWS_V_TOP * th - yb) / rowH + 1e-6);
+    let lo = Math.ceil((-ya - 0.02 * th) / rowH - 1e-6);
+    const hi = Math.floor((ROWS_V_TOP * th - yb) / rowH + 1e-6);
+    // The tile's ground row (big shop-like panes, lit at night) only ever lands on the ground: a band that starts
+    // above the first floor line stays off it, otherwise the top floor of a tower came out with stretched cells.
+    if (ya > 0.6 * rowH) lo = Math.max(lo, Math.ceil(1 - ya / rowH - 1e-6));
     let kv = lo;
     if (hi > lo) {
       const h = hashU(key * 13 + j * 3 + 7);
@@ -1044,6 +1050,49 @@ export function landmarkGeometries(l: Landmark): LandmarkPart[] {
 /** A big painted/neon wall sign derived deterministically for a blank facade (CityRenderer turns it into an atlas quad). */
 export interface WallSign { x: number; y: number; z: number; yaw: number; w: number; h: number; color: number; word: number }
 
+/** Kinds of built facade detail listed for FacadeDetailRenderer (low bits of a cell's code). */
+export const CELL_KIND = { window: 0, balcony: 1, ac: 2, pipe: 3 } as const;
+/** Style index of a cell's code (bits 3..5), in this order. */
+export const CELL_STYLES: readonly BuildingStyle[] = ['artdeco', 'glass', 'concrete', 'neon', 'residential'];
+/** Floats per unit in FacadeCellList.data: x, y, z (unit origin on the wall plane), nx, nz (outward wall normal), w, h (size in the wall plane; a pipe's h is its length), code, colour (0xRRGGBB). */
+export const CELL_STRIDE = 9;
+/** Packs a unit's kind, style index, ground-row flag and an 8-bit variant into one float (exact: it stays under 2^24). */
+export function cellCode(kind: number, style: number, ground: boolean, variant: number): number {
+  return kind | (style << 3) | ((ground ? 1 : 0) << 6) | ((variant & 255) << 8);
+}
+/**
+ * Every built facade unit of the city (window frames, balconies, AC units, downpipes) as a flat float list, filled by
+ * appendBuildingDetail and packed by distance at runtime (FacadeDetailRenderer). ~15 k units for the whole city.
+ */
+export class FacadeCellList {
+  data = new Float32Array(CELL_STRIDE * 4096);
+  n = 0;
+
+  push(x: number, y: number, z: number, nx: number, nz: number, w: number, h: number, code: number, color: number): void {
+    if ((this.n + 1) * CELL_STRIDE > this.data.length) {
+      const grown = new Float32Array(this.data.length * 2);
+      grown.set(this.data);
+      this.data = grown;
+    }
+    const o = this.n * CELL_STRIDE, d = this.data;
+    d[o] = x; d[o + 1] = y; d[o + 2] = z; d[o + 3] = nx; d[o + 4] = nz; d[o + 5] = w; d[o + 6] = h; d[o + 7] = code; d[o + 8] = color;
+    this.n++;
+  }
+
+  /** Field `k` (0..CELL_STRIDE-1) of unit i. */
+  get(i: number, k: number): number { return this.data[i * CELL_STRIDE + k]; }
+}
+/** Rectangle of a rect face (0..3) in that face's frame (s along it from its start corner, y up) that no built unit may overlap: a neon sign box, a painted sign panel. */
+export interface FacadeKeepOut { face: number; s0: number; s1: number; y0: number; y1: number }
+function keptOut(keep: FacadeKeepOut[] | null, face: number, s0: number, s1: number, y0: number, y1: number): boolean {
+  if (!keep) return false;
+  for (let i = 0; i < keep.length; i++) {
+    const k = keep[i];
+    if (k.face === face && s1 > k.s0 && s0 < k.s1 && y1 > k.y0 && y0 < k.y1) return true;
+  }
+  return false;
+}
+
 /** Street-level band geometry constants: band heights come from the band textures, `out` is how far the band steps in front of the wall, `doorRecess` how far a shop door cell steps back. */
 export const BAND = { shopH: SHOP_BAND_H, shopTile: SHOP_TILE_W, shopOut: 0.16, plinthH: PLINTH_BAND_H, plinthTile: PLINTH_TILE_W, plinthOut: 0.34, doorRecess: DOOR_RECESS } as const;
 
@@ -1148,6 +1197,25 @@ function revealQuad(gb: GeoBuilder, fr: FaceFrame, s: number, dIn: number, dOut:
   const u = SHOP_PLAIN_UV.u, v = SHOP_PLAIN_UV.v;
   if (plus) { at(fr, s, dOut, y0, pA); at(fr, s, dIn, y0, pB); at(fr, s, dIn, y1, pC); at(fr, s, dOut, y1, pD); }
   else { at(fr, s, dIn, y0, pA); at(fr, s, dOut, y0, pB); at(fr, s, dOut, y1, pC); at(fr, s, dIn, y1, pD); }
+  gb.texQuad(pA[0], pA[1], pA[2], pB[0], pB[1], pB[2], pC[0], pC[1], pC[2], pD[0], pD[1], pD[2], u, v, u, v, u, v, u, v);
+}
+
+/**
+ * The doorway behind a shop door cell dL..dR (band frame coordinates): a door leaf DOOR_LEAF_OUT proud of the recess
+ * back and DOOR_LEAF_INSET inside its jambs carrying the painted door (the back wall around it keeps the frame), and
+ * a threshold step (top and front). Three quads a door: ~2700 doorways sit in one always-drawn mesh, so the leaf's
+ * 6 cm flanks and a soffit the arcade cap already stands in for were not worth their triangles.
+ */
+function doorLeaf(gb: GeoBuilder, fr: FaceFrame, dL: number, dR: number, yF: number, uAt: (s: number) => number, v0: number, v1: number, tint: number, dark: number): void {
+  const u = SHOP_PLAIN_UV.u, v = SHOP_PLAIN_UV.v;
+  const back = -DOOR_RECESS, front = back + DOOR_LEAF_OUT;
+  const lL = dL + DOOR_LEAF_INSET, lR = dR - DOOR_LEAF_INSET, ins = DOOR_LEAF_INSET / (dR - dL);
+  const uL = uAt(dL) + (uAt(dR) - uAt(dL)) * ins, uR = uAt(dR) - (uAt(dR) - uAt(dL)) * ins;
+  bandQuad(gb, fr, lL, lR, front, DOOR_STEP_H, DOOR_LEAF_H, uL, uR, v0 + (v1 - v0) * (DOOR_STEP_H / yF), v0 + (v1 - v0) * (DOOR_LEAF_H / yF), tint);
+  gb.setColor(lighten(dark, 0.55));
+  at(fr, dL, back, DOOR_STEP_H, pA); at(fr, dR, back, DOOR_STEP_H, pB); at(fr, dR, back + DOOR_STEP_D, DOOR_STEP_H, pC); at(fr, dL, back + DOOR_STEP_D, DOOR_STEP_H, pD);
+  gb.texQuad(pD[0], pD[1], pD[2], pC[0], pC[1], pC[2], pB[0], pB[1], pB[2], pA[0], pA[1], pA[2], u, v, u, v, u, v, u, v);
+  at(fr, dL, back + DOOR_STEP_D, 0, pA); at(fr, dR, back + DOOR_STEP_D, 0, pB); at(fr, dR, back + DOOR_STEP_D, DOOR_STEP_H, pC); at(fr, dL, back + DOOR_STEP_D, DOOR_STEP_H, pD);
   gb.texQuad(pA[0], pA[1], pA[2], pB[0], pB[1], pB[2], pC[0], pC[1], pC[2], pD[0], pD[1], pD[2], u, v, u, v, u, v, u, v);
 }
 
@@ -1349,6 +1417,7 @@ export function appendStreetLevel(styleGb: GeoBuilder, bandGb: GeoBuilder, b: Bu
         bandQuad(bandGb, fr, dR, s1, 0, 0, yF, uAt(dR), uAt(s1), vG0, vF0, tint);
         revealQuad(bandGb, fr, dL, -DOOR_RECESS, 0, 0, yF, true, revealCol);
         revealQuad(bandGb, fr, dR, -DOOR_RECESS, 0, 0, yF, false, revealCol);
+        doorLeaf(bandGb, fr, dL, dR, yF, uAt, vG0, vF0, tint, revealCol);
       } else bandQuad(bandGb, fr, s0, s1, 0, 0, yF, uAt(s0), uAt(s1), vG0, vF0, tint);
       // Fascia in one of the building's hues (the vacant panel keeps a faded neutral; a sign box never takes the
       // charcoal, whose dark letters would vanish on it).
@@ -1411,6 +1480,75 @@ function depthAt(lay: FaceLayout, s: number): number {
   return lay.depth[Math.max(0, lay.n - 1)];
 }
 
+const keepFr: FaceFrame = { sx: 0, sz: 0, tx: 0, tz: 0, nx: 0, nz: 0, len: 0 };
+/** Balcony: width per bay (capped), the height its unit spans (slab + parapet) for the keep-out test. */
+const BALCONY_W_MAX = 2.6, BALCONY_UNIT_H = 1.3;
+/** Downpipe diameter and the split-unit condenser box hung under a sill. */
+const PIPE_D = 0.1, AC_W = 0.82, AC_H = 0.56;
+
+/**
+ * Lists the built detail of one street wall for FacadeDetailRenderer: a window unit on every painted cell (the tile's
+ * cell grid with the same per-band row offsets `facade` mapped the texture with, so the frame lands on the painted
+ * opening), a balcony on four bays in five of every residential floor above the ground band (flush bays only), a
+ * split-unit air conditioner under one sill in six, and a downpipe 0.25 m past every wall segment line plus one at
+ * the far end of the face. Units overlapping a `keep` rectangle (sign boxes, sign panels) are left out; nothing is
+ * listed under `hiddenBelow` (the ground-floor band). Every hash is stable per building, edge, row and bay.
+ */
+function facadeUnits(cells: FacadeCellList, keep: FacadeKeepOut[] | null, b: Building, fr: FaceFrame, f: number, edge: number, lay: FaceLayout, m: Massing, wallY0: number, wallY1: number, yBase: number, yTop: number, hiddenBelow: number, base: number): void {
+  const rowH = m.rowH, bayW = m.bayW;
+  const key = b.id * 8 + edge;
+  const bands = bandRows(wallY0, wallY1, rowH, m.th, key);
+  // Keep-outs are given in the rect face's frame; a chamfered corner shortens this edge from that corner.
+  const rf = faceFrame(b.x - b.w / 2, b.z - b.d / 2, b.x + b.w / 2, b.z + b.d / 2, f, keepFr);
+  const off = (fr.sx - rf.sx) * rf.tx + (fr.sz - rf.sz) * rf.tz;
+  const styleI = CELL_STYLES.indexOf(b.style);
+  const win = WINDOW_CELL[b.style];
+  const balconies = b.style === 'residential';
+  const balSlab = lighten(base, 0.45), pipeCol = darken(lighten(base, WALL_LIGHTEN), 0.62);
+  // Frames come in the style's colour, nudged a little darker on some buildings so a row of blocks is not one white.
+  const frameTint = perturb(0xffffff, 0, -0.08 * (hashU(b.id * 5 + 7) % 3));
+  const nCols = Math.floor(fr.len / bayW + 1e-6);
+  const bw = Math.min(bayW - 0.7, BALCONY_W_MAX);
+  for (let j = 0; j < bands.n; j++) {
+    const kv = bands.kv[j];
+    for (let r = Math.ceil(bands.y[j] / rowH - 1e-6); (r + 1) * rowH <= bands.y[j + 1] + 1e-6; r++) {
+      const tileRow = r + kv;
+      if (tileRow < 0 || tileRow > 7) continue;
+      const ground = tileRow === 0;
+      const wc = ground ? WINDOW_CELL.ground : win;
+      const cy = (r + 1 - wc.wy - wc.wh / 2) * rowH, hh = wc.wh * rowH;
+      if (cy - hh / 2 < hiddenBelow) continue;
+      const floorY = r * rowH;
+      const balconyRow = balconies && !ground && floorY >= yBase && floorY < yTop;
+      for (let c = 0; c < nCols; c++) {
+        const sMid = (c + 0.5) * bayW, dep = depthAt(lay, sMid);
+        const sc = (c + wc.wx + wc.ww / 2) * bayW, ww = wc.ww * bayW;
+        if (keptOut(keep, f, sc + off - ww / 2, sc + off + ww / 2, cy - hh / 2, cy + hh / 2)) continue;
+        const hv = hashU(b.id * 131 + edge * 977 + r * 17 + c * 3);
+        at(fr, sc, dep, cy, pA);
+        cells.push(pA[0], pA[1], pA[2], fr.nx, fr.nz, ww, hh, cellCode(CELL_KIND.window, styleI, ground, hv & 255), frameTint);
+        if (balconyRow && dep === 0 && hv % 5 !== 0 && !keptOut(keep, f, sMid + off - bw / 2, sMid + off + bw / 2, floorY, floorY + BALCONY_UNIT_H)) {
+          at(fr, sMid, 0, floorY, pA);
+          cells.push(pA[0], pA[1], pA[2], fr.nx, fr.nz, bw, BALCONY_UNIT_H, cellCode(CELL_KIND.balcony, styleI, false, (b.id >> 1) & 255), balSlab);
+        } else if (!ground && b.style !== 'neon' && (hv >>> 4) % 6 === 0) {
+          const side = (hv & 8) === 0 ? -1 : 1;
+          at(fr, sc + side * (ww / 2 - AC_W / 2 - 0.04), dep, cy - hh / 2 - 0.12 - AC_H / 2, pA);
+          cells.push(pA[0], pA[1], pA[2], fr.nx, fr.nz, AC_W, AC_H, cellCode(CELL_KIND.ac, styleI, false, 0), 0xffffff);
+        }
+      }
+    }
+  }
+  // Downpipes from the band cap to under the cornice; the unit's origin is its foot, h its length.
+  const py0 = hiddenBelow > 0 ? hiddenBelow + 0.05 : 0.05, py1 = wallY1 - 0.85;
+  if (py1 - py0 < 2.5) return;
+  for (let k = 1; k <= lay.nSeg; k++) {
+    const s = k === lay.nSeg ? fr.len - 0.3 : lay.segS[k] + 0.25;
+    if (s < 0.3 || s > fr.len - 0.2) continue;
+    at(fr, s, depthAt(lay, s), py0, pA);
+    cells.push(pA[0], pA[1], pA[2], fr.nx, fr.nz, PIPE_D, py1 - py0, cellCode(CELL_KIND.pipe, styleI, false, 0), pipeCol);
+  }
+}
+
 /**
  * Roof clutter, parapets, ledges, piers, slabs, balconies, crowns and blank-wall sign panels for one building.
  * Textured tiers, facade relief and sign panels go to `gb` (the building's style mesh, casts shadows); cornices,
@@ -1418,9 +1556,11 @@ function depthAt(lay: FaceLayout, s: number): number {
  * a roof throws a shadow the street can see). Glow parts of both land in whatever glow sink the builders share.
  * `streetMask` = faces that see a street (FACE_BIT order; relief goes only there), `bandTop` = height of the
  * ground-floor band the relief must clear (0 without one). The relief follows the same footprint / face layout /
- * band offsets as appendBuilding, so slabs step with the jogs and balconies land under the painted rails.
+ * band offsets as appendBuilding, so slabs step with the jogs and the built window units (listed into `cells` for
+ * FacadeDetailRenderer, see facadeUnits) land on the painted cells. `keep` holds the rectangles no unit may overlap
+ * (the building's neon sign boxes, in the rect faces' frames); the painted side-wall sign panel is pushed onto it.
  */
-export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Building, rng: Random, signs: WallSign[], streetMask = 15, bandTop = 0): void {
+export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Building, rng: Random, signs: WallSign[], streetMask = 15, bandTop = 0, cells: FacadeCellList | null = null, keep: FacadeKeepOut[] | null = null): void {
   const x0 = b.x - b.w / 2, x1 = b.x + b.w / 2, z0 = b.z - b.d / 2, z1 = b.z + b.d / 2;
   const base = buildingTint(b);
   const roof = darken(base, ROOF_DARKEN);
@@ -1568,9 +1708,35 @@ export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Buildi
     trim.boxPlain(ax - 0.2, mastTop, az - 0.2, ax + 0.2, mastTop + 0.55, az + 0.2, 0xff2418, false, GLOW_U.red);
   }
 
+  // --- Blank side wall with a big painted sign ---------------------------------------------------
+  if (!b.hasNeonSign && wallTop >= 16 && rng.chance(0.24)) {
+    const face = ((b.facing + (rng.chance(0.5) ? 1 : 3)) % 4) as 0 | 1 | 2 | 3;
+    const fw = face === 0 || face === 2 ? b.w : b.d;
+    const w = Math.min(fw - 2.5, 15);
+    const sh = Math.min(w * 0.4, wallTop - 11);
+    if (w >= 6 && sh >= 3) {
+      const dir = FACE_DIR[face];
+      const off = (face === 0 || face === 2 ? b.d : b.w) / 2;
+      const cy = rng.range(9 + sh / 2, wallTop - 2.5 - sh / 2);
+      const panel = darken(base, 0.45);
+      if (dir[0] === 0) {
+        const zf = b.z + dir[1] * off;
+        gb.boxPlain(b.x - w / 2, cy - sh / 2, Math.min(zf, zf + dir[1] * 0.28), b.x + w / 2, cy + sh / 2, Math.max(zf, zf + dir[1] * 0.28), panel);
+      } else {
+        const xf = b.x + dir[0] * off;
+        gb.boxPlain(Math.min(xf, xf + dir[0] * 0.28), cy - sh / 2, b.z - w / 2, Math.max(xf, xf + dir[0] * 0.28), cy + sh / 2, b.z + w / 2, panel);
+      }
+      signs.push({ x: b.x + dir[0] * (off + 0.36), y: cy, z: b.z + dir[1] * (off + 0.36), yaw: FACE_YAW[face], w: w * 0.88, h: sh * 0.62, color: b.accent, word: rng.int(0, 999) });
+      // No built unit under the panel (the face's frame starts at its rect corner: s runs along the face from there).
+      if (keep) keep.push({ face, s0: fw / 2 - w / 2 - 0.3, s1: fw / 2 + w / 2 + 0.3, y0: cy - sh / 2 - 0.3, y1: cy + sh / 2 + 0.3 });
+    }
+  }
+
   // --- Facade relief on the faces that see a street ---------------------------------------------
   // Relief runs on the full-footprint walls from above the ground-floor band to under the roof edge.
   const yBase = bandTop > 0 ? bandTop + 0.3 : 0.4;
+  // Below this the wall is hidden by the ground-floor band and its cap (or, without one, nothing).
+  const hiddenBelow = bandTop > 0 ? bandTop + 0.18 : 0;
   const yTop = Math.min(wallTop, topY) - 0.9;
   const wallY1 = kind === 'setback' ? stepY : kind === 'tiers' ? wallY0 + h * 0.65 : kind === 'octagon' || kind === 'podium' ? PODIUM_H : kind === 'twin' ? h : topY;
   const slabStyle = reliefStyle(b);
@@ -1601,30 +1767,7 @@ export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Buildi
           }
         }
       }
-      if (b.style === 'residential' && f >= 0) {
-        // Balconies under the painted rails (every other row of the tile) on every other flush bay: a slab with a
-        // handrail bar and three posts standing on it. The painted rail rows depend on each band's row offset.
-        const bands = bandRows(wallY0, wallY1, rowH, mm.th, key);
-        const bw = 1.8, bd = 0.45, bt = 0.12, rh = 0.95;
-        for (let j = 0; j < bands.n; j++) {
-          for (let r = Math.ceil(bands.y[j] / rowH - 1e-6); r * rowH < bands.y[j + 1] - 1e-6; r++) {
-            const y = r * rowH;
-            if (y < yBase + 0.4 || y > yTop) continue;
-            if (((((r + bands.kv[j]) % 8) + 8) % 8) % 2 !== 1) continue;
-            for (let c = 0; (c + 1) * bayW <= fr.len + 1e-6; c++) {
-              if ((c + (b.id & 1)) % 2 === 1) continue;
-              const sc = (c + 0.5) * bayW;
-              if (depthAt(lay, sc) !== 0) continue;
-              frameBox(gb, fr, sc - bw / 2, sc + bw / 2, y + 0.02, y + 0.02 + bt, 0.02, bd, balSlab, true, true, false, false);
-              frameBox(gb, fr, sc - bw / 2, sc + bw / 2, y + bt + rh, y + bt + rh + 0.06, -(bd - 0.06), bd, rail, true, false, false, false);
-              for (let p = -1; p <= 1; p++) {
-                const sp = sc + p * (bw / 2 - 0.04);
-                frameBox(gb, fr, sp - 0.03, sp + 0.03, y + bt, y + bt + rh, -(bd - 0.06), bd, rail, true, false, false, false);
-              }
-            }
-          }
-        }
-      }
+      if (cells && f >= 0 && b.style !== 'glass') facadeUnits(cells, keep, b, fr, f, i, lay, mm, wallY0, wallY1, yBase, yTop, hiddenBelow, base);
       if (ledgeStyle) {
         // Spandrel ledge under every window row (0.12 m proud, 0.25 m tall: front and underside) and a pier strip on
         // every bay line (0.18 m proud: front and both flanks). The ledge passes behind the piers.
@@ -1655,27 +1798,5 @@ export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Buildi
     const ex = dir[0] !== 0 ? 0.45 : (b.w / 2) * 0.55;
     const ez = dir[1] !== 0 ? 0.45 : (b.d / 2) * 0.55;
     gb.boxPlain(fx - Math.max(0.3, ex * 0.12), BAND.shopH + 1, fz - Math.max(0.3, ez * 0.12), fx + Math.max(0.3, ex * 0.12), wallTop - 1, fz + Math.max(0.3, ez * 0.12), b.neonColor, false, glowCellFor(b.neonColor));
-  }
-
-  // --- Blank side wall with a big painted sign ---------------------------------------------------
-  if (!b.hasNeonSign && wallTop >= 16 && rng.chance(0.24)) {
-    const face = ((b.facing + (rng.chance(0.5) ? 1 : 3)) % 4) as 0 | 1 | 2 | 3;
-    const fw = face === 0 || face === 2 ? b.w : b.d;
-    const w = Math.min(fw - 2.5, 15);
-    const sh = Math.min(w * 0.4, wallTop - 11);
-    if (w >= 6 && sh >= 3) {
-      const dir = FACE_DIR[face];
-      const off = (face === 0 || face === 2 ? b.d : b.w) / 2;
-      const cy = rng.range(9 + sh / 2, wallTop - 2.5 - sh / 2);
-      const panel = darken(base, 0.45);
-      if (dir[0] === 0) {
-        const zf = b.z + dir[1] * off;
-        gb.boxPlain(b.x - w / 2, cy - sh / 2, Math.min(zf, zf + dir[1] * 0.28), b.x + w / 2, cy + sh / 2, Math.max(zf, zf + dir[1] * 0.28), panel);
-      } else {
-        const xf = b.x + dir[0] * off;
-        gb.boxPlain(Math.min(xf, xf + dir[0] * 0.28), cy - sh / 2, b.z - w / 2, Math.max(xf, xf + dir[0] * 0.28), cy + sh / 2, b.z + w / 2, panel);
-      }
-      signs.push({ x: b.x + dir[0] * (off + 0.36), y: cy, z: b.z + dir[1] * (off + 0.36), yaw: FACE_YAW[face], w: w * 0.88, h: sh * 0.62, color: b.accent, word: rng.int(0, 999) });
-    }
   }
 }
