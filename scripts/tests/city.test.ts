@@ -504,7 +504,7 @@ test('street trees and lot hedges: placement, clearances, colliders', () => {
     const d = districtOf(blk.col, blk.row);
     expect(d !== 'beachfront' && blk.kind === 'buildings', 'trees only on downtown / suburb building blocks');
     if (d === 'downtown') downtown++;
-    expect(t.scale >= 0.85 && t.scale <= 1.15, 'tree scale in range');
+    expect(t.scale >= 0.8 && t.scale <= 1.3, 'tree scale in range');
     let nearest = Infinity;
     for (const k of circles) {
       const s = k.shape as { cx: number; cz: number; r: number };

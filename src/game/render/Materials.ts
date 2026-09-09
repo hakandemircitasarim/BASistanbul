@@ -33,8 +33,16 @@ const NEON_BOOST = 1.5;
 /** Palm frond tint (multiplies the leaflet map) and its daylight translucency emissive (faded out at night). */
 const PALM_FROND_TINT = 0x7fa050;
 const PALM_FROND_EMISSIVE_DAY = 0.06;
+/** Leaf emissive kept at full night (the frond tint x this): a dark green, well under anything that blooms. */
+const LEAF_EMISSIVE_NIGHT = 0.045;
+/** How far the leaf albedo (fronds and solid foliage) drops at full night: moonlit leaves stay dark green, never pale. */
+const FOLIAGE_NIGHT_DIM = 0.25;
+/** Daylight roughness of the alpha fronds (0.97 at full night: no moon highlight on the leaves). */
+const PALM_FROND_ROUGHNESS = 0.65;
 /** Half width of the frond alpha ramp around alphaTest (see the palmFrond shader patch). */
 const PALM_ALPHA_RAMP = 0.08;
+/** Distance-driven alpha boost of the fronds: x(1 + gain) reached `span` metres beyond `from` (see the palmFrond shader patch). */
+const PALM_ALPHA_DIST = { from: 12, span: 33, gain: 1.6 } as const;
 
 /**
  * Roughness / metalness / sky-probe strength per surface family. Everything lit is MeshStandardMaterial so the PMREM
@@ -88,6 +96,8 @@ export class Materials {
   readonly furniture: THREE.MeshStandardMaterial;
   readonly palmTrunk: THREE.MeshStandardMaterial;
   readonly palmFrond: THREE.MeshStandardMaterial;
+  /** Vertex-coloured foliage with baked face normals (tree crowns and trunks, hedges, the far palm LOD); darkens after dark like palmFrond. */
+  readonly foliage: THREE.MeshStandardMaterial;
   readonly lampPole: THREE.MeshStandardMaterial;
   readonly bench: THREE.MeshStandardMaterial;
   readonly hydrant: THREE.MeshStandardMaterial;
@@ -169,24 +179,39 @@ export class Materials {
     // A whisper of leaf-coloured emissive stands in for translucency by day (applyNight fades it out, so the crowns
     // go dark with everything else instead of glowing grey after sunset). The tint is a deep saturated green: the
     // old pale sage read as mint once the sky fill and the coverage bleed (below) got at it.
-    this.palmFrond = new THREE.MeshStandardMaterial({ map: tex.palmFrond(), alphaTest: 0.34, side: THREE.FrontSide, color: PALM_FROND_TINT, vertexColors: true, emissive: PALM_FROND_TINT, emissiveIntensity: PALM_FROND_EMISSIVE_DAY, roughness: 0.65, metalness: 0, envMapIntensity: SURF.foliage.env });
+    this.palmFrond = new THREE.MeshStandardMaterial({ map: tex.palmFrond(), alphaTest: 0.34, side: THREE.FrontSide, color: PALM_FROND_TINT, vertexColors: true, emissive: PALM_FROND_TINT, emissiveIntensity: PALM_FROND_EMISSIVE_DAY, roughness: PALM_FROND_ROUGHNESS, metalness: 0, envMapIntensity: SURF.foliage.env });
     // Alpha-to-coverage lets the MSAA resolve feather the leaf edges instead of the hard alpha-test stair-step. Past
     // ~25 m the mip chain averages the leaflet gaps into a coverage of ~0.4-0.6, and three's own smoothstep over
     // [alphaTest, alphaTest + fwidth] then lets that much sky through every frond (the mint / cut-out look). The
     // ramp below is re-centred on the test and fixed at +-PALM_ALPHA_RAMP (no screen derivatives: a fwidth-based
     // ramp blacked out the whole MSAA frame on the software GL used by the screenshot harness), so a distant frond is
     // solid wherever its alpha clears the test and only the real leaf edges, which cross the ramp in a texel or two,
-    // stay feathered.
+    // stay feathered. The mip chain still erodes the alpha of the thin leaflets with distance (a 40 m crown kept only
+    // a few covered samples and read as the sky behind it: a pale ghost after dark), so the alpha is boosted with the
+    // view distance (PALM_ALPHA_DIST: from 12 m, x2.6 by 45 m; distance, not derivatives, for the reason above), which
+    // closes a distant crown into the solid fans the far LOD takes over at 60 m.
     this.palmFrond.alphaToCoverage = true;
     this.palmFrond.onBeforeCompile = (shader) => {
+      this.leafSpecularPatch(shader);
+      // The leaflet map's transparent texels are black, so the mip chain darkens a distant frond toward black (its
+      // colour, unlike its alpha, averages with the gaps): a 40 m crown had no albedo left at all. Dividing the
+      // sampled colour by its alpha undoes that premultiplication-like fade and keeps the leaf green at every mip.
+      shader.fragmentShader = shader.fragmentShader.replace('#include <map_fragment>', '#include <map_fragment>\ndiffuseColor.rgb /= max( diffuseColor.a, 0.05 );');
       shader.fragmentShader = shader.fragmentShader.replace('#include <alphatest_fragment>', [
         '{',
-        `  diffuseColor.a = smoothstep( alphaTest - ${PALM_ALPHA_RAMP.toFixed(3)}, alphaTest + ${PALM_ALPHA_RAMP.toFixed(3)}, diffuseColor.a );`,
+        `  float leafBoost = 1.0 + ${PALM_ALPHA_DIST.gain.toFixed(2)} * clamp( ( length( vViewPosition ) - ${PALM_ALPHA_DIST.from.toFixed(1)} ) / ${PALM_ALPHA_DIST.span.toFixed(1)}, 0.0, 1.0 );`,
+        `  diffuseColor.a = smoothstep( alphaTest - ${PALM_ALPHA_RAMP.toFixed(3)}, alphaTest + ${PALM_ALPHA_RAMP.toFixed(3)}, diffuseColor.a * leafBoost );`,
         '  if ( diffuseColor.a <= 0.0 ) discard;',
         '}',
       ].join('\n'));
     };
-    this.palmFrond.customProgramCacheKey = () => 'palmFrondSharpen';
+    this.palmFrond.customProgramCacheKey = () => 'palmFrondSharpen4';
+    // Solid foliage (PropRenderer bakes the normals: canopy normals on the far fronds, face normals on the crowns and
+    // hedges) with the same daylight-only translucency emissive as the fronds, so the far palm LOD and the tree crowns
+    // fall dark with the near fronds after sunset instead of standing in the street as pale cut-outs.
+    this.foliage = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: SURF.foliage.roughness, metalness: SURF.foliage.metalness, envMapIntensity: SURF.foliage.env, emissive: PALM_FROND_TINT, emissiveIntensity: PALM_FROND_EMISSIVE_DAY });
+    this.foliage.onBeforeCompile = (shader) => { this.leafSpecularPatch(shader); };
+    this.foliage.customProgramCacheKey = () => 'foliageLeaf2';
     this.lampPole = new THREE.MeshStandardMaterial({ color: 0x3a3d44, roughness: SURF.metal.roughness, metalness: SURF.metal.metalness, envMapIntensity: SURF.metal.env });
     this.bench = new THREE.MeshStandardMaterial({ color: 0x8a5a30, roughness: SURF.wood.roughness, metalness: 0, envMapIntensity: SURF.wood.env });
     this.hydrant = new THREE.MeshStandardMaterial({ color: 0xd8302a, roughness: SURF.paint.roughness, metalness: SURF.paint.metalness, envMapIntensity: SURF.paint.env });
@@ -228,6 +253,24 @@ export class Materials {
         }`);
     };
     m.customProgramCacheKey = () => 'macro' + scale.toFixed(4) + amount.toFixed(3);
+  }
+
+  /** Dielectric F0 scale of the leaf materials (palmFrond, foliage): 1 by day, 0 at full night (see leafSpecularPatch). */
+  private readonly leafSpec = { value: 1 };
+
+  /**
+   * Leaves have no moon highlight: the moon's broad specular lobe on up-facing leaves lit a whole crown to a flat
+   * blue-white (F0 0.04 x a 1.5-unit light, independent of the albedo), which is what stood in the street as a pale
+   * cut-out. The dielectric F0 of both leaf materials is scaled by uLeafSpec, driven to 0 by the night factor.
+   */
+  private leafSpecularPatch(shader: THREE.WebGLProgramParametersWithUniforms): void {
+    shader.uniforms.uLeafSpec = this.leafSpec;
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nuniform float uLeafSpec;')
+      .replace('#include <lights_physical_fragment>', THREE.ShaderChunk.lights_physical_fragment
+        .replace('material.specularColor = vec3( 0.04 );', 'material.specularColor = vec3( 0.04 * uLeafSpec );')
+        // F90 too: the probe's grazing-angle reflection (the multi-scatter term) is what a scaled F0 alone leaves behind.
+        .replace('material.specularF90 = 1.0;\n', 'material.specularF90 = uLeafSpec;\n'));
   }
 
   get nightFactor(): number { return this._night; }
@@ -287,7 +330,25 @@ export class Materials {
     this.lightPoolMat.opacity = n * 0.45;
     this.lampSpillMat.opacity = n * 0.18;
     // Palm crowns: the translucency stand-in is a daylight effect only.
-    this.palmFrond.emissiveIntensity = PALM_FROND_EMISSIVE_DAY * (1 - n);
+    // A whisper of leaf green stays on after dark (LEAF_EMISSIVE_NIGHT): with the moon highlight gone a crown is
+    // otherwise pure black lifted by the grade's toe, i.e. the same grey as the facade behind it, and reads as a
+    // cut-out again — this keeps it a dark green.
+    this.palmFrond.emissiveIntensity = PALM_FROND_EMISSIVE_DAY * (1 - n) + LEAF_EMISSIVE_NIGHT * n;
+    this.foliage.emissiveIntensity = PALM_FROND_EMISSIVE_DAY * (1 - n) + LEAF_EMISSIVE_NIGHT * n;
+    // Leaves go dark after sunset: the moon and the sky probe's horizon band lit a moonlit crown to the same pale
+    // grey as the facades, and a palm then stood in the street as a flat cut-out. The albedo of both leaf materials
+    // (the alpha fronds' tint, the solid foliage's vertex-colour multiplier) is pulled down together with the probe's
+    // share, so near fronds, far fronds and tree crowns all read as dark green under the lamps.
+    const leafDim = 1 - FOLIAGE_NIGHT_DIM * n;
+    this.palmFrond.color.setHex(PALM_FROND_TINT).multiplyScalar(leafDim);
+    this.foliage.color.setScalar(leafDim);
+    this.palmFrond.envMapIntensity = SURF.foliage.env * (1 - 0.7 * n);
+    this.foliage.envMapIntensity = SURF.foliage.env * (1 - 0.7 * n);
+    // The moon's broad specular lobe on 0.65-rough leaves was the actual pale grey: a crown whose canopy normals sat
+    // near the half vector lit up in the moon's blue-white regardless of its albedo. Leaves go matte after dark.
+    this.palmFrond.roughness = PALM_FROND_ROUGHNESS + (0.97 - PALM_FROND_ROUGHNESS) * n;
+    this.foliage.roughness = SURF.foliage.roughness + (0.97 - SURF.foliage.roughness) * n;
+    this.leafSpec.value = 1 - n;
     // Damp asphalt after dark: dropping the road's roughness lets the sky probe, the lamps and the neon smear along
     // the street the way a wet Vice City night does, without any reflection pass.
     this.road.roughness = SURF.road.roughnessDay + n * (SURF.road.roughnessNight - SURF.road.roughnessDay);
@@ -319,7 +380,7 @@ export class Materials {
     this.plain.dispose(); this.glow.dispose(); this.shopfront.dispose(); this.plinth.dispose(); this.awning.dispose(); this.facade.dispose();
     this.road.dispose(); this.crosswalk.dispose(); this.roadMark.dispose(); this.sidewalk.dispose(); this.sand.dispose();
     this.grass.dispose(); this.plaza.dispose(); this.pavement.dispose(); this.dirt.dispose(); this.water.dispose(); this.foam.dispose();
-    this.furniture.dispose(); this.palmTrunk.dispose(); this.palmFrond.dispose(); this.lampPole.dispose(); this.bench.dispose(); this.hydrant.dispose();
+    this.furniture.dispose(); this.palmTrunk.dispose(); this.palmFrond.dispose(); this.foliage.dispose(); this.lampPole.dispose(); this.bench.dispose(); this.hydrant.dispose();
     this.lampHeadMat.dispose(); this.lightPoolMat.dispose(); this.lampSpillMat.dispose();
     if (this.neonMat) this.neonMat.dispose();
     if (this.neonBloomMat) this.neonBloomMat.dispose();

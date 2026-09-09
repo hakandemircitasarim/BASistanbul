@@ -3,13 +3,15 @@
 //
 // Every body is merged ONCE at construction: one smooth lofted shell (a side silhouette and a plan curve sampled at
 // ~20 stations x 28 ring points, with duplicated rings for the belt and drip-rail creases) whose glass, gaskets, lamps
-// and valances are coloured regions of the same surface, plus a few small parts (pillars, mirrors, handles, grille,
-// plates, arches, lamp bezels, bumper strip, exhaust). Every vertex carries a base colour and a `paintMix` weight, and
-// the patched Physical shader blends the per-instance paint only where paintMix > 0 (a negative paintMix marks a lamp
-// lens, which glows per instance when the lights are on), so glass stays dark and lamps stay red on a bright yellow
-// taxi while the whole spec still costs one draw call. The paint is a clearcoated metallic with a view-angle rim, so
-// the shell reads as lacquered metal against the sky probe instead of clay. `parkedShellGeometry` is the same loft at
-// a coarser ring and fewer stations for the static parked cars of the lots (CityRendererProps).
+// and valances are coloured regions of the same surface, plus a few small parts (pillars, mirrors on stalks, handles,
+// grille, plates, arches, lamp blocks, a proud rear bumper with its rubbing strip and valance, exhaust). Every vertex
+// carries a base colour and a `paintMix` weight, and the patched Physical shader blends the per-instance paint only
+// where paintMix > 0 (paintMix -1 marks a lamp lens, which glows per instance when the lights are on; -2 a matte part
+// that drops the clearcoat and metal: rubber, soot, baked wheel discs), so glass stays dark and lamps stay red on a
+// bright yellow taxi while the whole spec still costs one draw call. The paint is a clearcoated metallic with a
+// view-angle rim, so the shell reads as lacquered metal against the sky probe instead of clay. `parkedShellGeometry`
+// is the same loft at a coarser ring and fewer stations for the static parked cars of the lots (CityRendererProps),
+// which draw it from a BatchedMesh (the shader also reads the batch colour as the paint).
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
@@ -26,7 +28,7 @@ import { surface, tube } from './PlayerRenderer';
 import type { Ring } from './PlayerRenderer';
 
 export const VEHICLE_RENDER = {
-  cullDist: 260, clearance: 0.30, wheelRadius: 0.33, wheelWidth: 0.24, lightsPerVehicle: 6, wheelsPerVehicle: 4,
+  cullDist: 260, clearance: 0.30, wheelRadius: 0.36, wheelWidth: 0.24, lightsPerVehicle: 6, wheelsPerVehicle: 4,
   /** Past this the lathed wheels (~320 triangles each) are a few pixels inside a dark arch; they are simply not written. */
   wheelDist: 110,
   /** Beyond this distance a vehicle is drawn as its parked-shell LOD (baked wheel discs, no shadow-map pass). */
@@ -68,11 +70,15 @@ const SIGN = 0xf6edd2;
 /** Number plates: a muted warm grey-white in a dark frame, not a bright cream rectangle. */
 const PLATE = 0xd8d2c0;
 const PLATE_FRAME = 0x2a2c30;
-const EXHAUST = 0x3a3d42;
+/** Tailpipe steel (keeps the clearcoat, so it catches light like a pipe) and its sooty open end. */
+const EXHAUST = 0x767b83;
+const SOOT = 0x141516;
 /** Rubbing strip across the rear bumper: the horizontal bumper line the tail was missing. */
 const BUMPER_STRIP = 0x111315;
 /** paintMix value that marks a lamp lens: no paint tint, and emissive when the vehicle's lights are on. */
 const LENS_MIX = -1;
+/** paintMix value that marks a matte part: no paint, rough, no metal, no clearcoat (wheel wells, soot, baked wheel discs). */
+const MATTE_MIX = -2;
 
 /** A box deformed into a frustum: independent z / half-width / y for the (bottom, top) x (back, front) corners. */
 interface PrismDef {
@@ -227,18 +233,43 @@ function plate(out: PrismDef[], zBack: number, zFace: number, hw: number, y0: nu
   out.push({ ...block(Math.min(zBack, zFace), Math.max(zBack, zFace), hw, y0, y1, PLATE, 0), plain: true });
 }
 
-/** Rear plate recess; the exhaust tube itself is lathed in `bodyGeometry` from the profile's `exhaust` anchor. */
-function rearDetails(out: PrismDef[], zFace: number, plateY: number): void {
-  plate(out, zFace + 0.06, zFace - 0.012, 0.19, plateY, plateY + 0.11);
+/**
+ * Three-box tail behind the flat rear face `zFace`: a proud bumper wrapping the corners (a bevelled prism whose flank
+ * sits 1.2 cm off the shell at all four corners and tapers in plan at the back), a black valance under it, the rubbing
+ * strip across it, the plate set into it, and a boot shut line across the flat face above the lamp blocks. The
+ * exhaust anchor of the profile pokes out of the bumper face (`zFace` - 0.02). Replaces the old fan-shaded valance.
+ */
+function rearEnd(parts: PrismDef[], extras: THREE.BufferGeometry[], width: (y: number, z: number) => number, zFace: number, zFront: number, y0: number, y1: number, shutY: number, shutHalfW: number): number {
+  const zb = zFace - 0.02, p = 0.012, span = y1 - y0;
+  const xb0 = width(y0 + 0.02, zFace + 0.05) + p, xb1 = width(y0 + 0.02, zFront) + p;
+  const xt0 = width(y1, zFace + 0.05) + p, xt1 = width(y1, zFront) + p;
+  parts.push({ bz0: zb, bz1: zFront, bw0: xb0, bw1: xb1, by0: y0, tz0: zb, tz1: zFront, tw0: xt0, tw1: xt1, ty0: y1, col: PAINT_SHADE, paint: 1, bevel: 0.1, tailTaper: 0.12 });
+  parts.push({ ...block(zb - 0.004, zb + 0.14, xb0 * 0.95, y0 - 0.01, y0 + 0.06, BLACK, MATTE_MIX), plain: true });
+  extras.push(bumperStrip(zb, y0 + span * 0.28, xb0 * 0.84));
+  const plateY = y0 + span * 0.45;
+  plate(parts, zb + 0.05, zb - 0.012, 0.19, plateY, plateY + 0.11);
+  if (shutHalfW > 0) parts.push({ ...block(zFace - 0.006, zFace + 0.012, shutHalfW, shutY - 0.005, shutY + 0.005, BLACK, 0), plain: true });
+  return zb;
 }
 
-/** Exhaust: a 2 cm dark tube under the bumper (6-sided lathe, closed), its rearmost 2 cm sootier. */
+/**
+ * Exhaust: a 5.4 cm steel tailpipe tucked under the bumper's valance, its open end 4 cm proud of the bumper face:
+ * the steel rim keeps the clearcoat, the recessed end disc is matte soot.
+ */
 function exhaustGeometry(x: number, y: number, zFace: number): THREE.BufferGeometry {
-  const len = 0.19;
-  const g = new THREE.CylinderGeometry(0.021, 0.021, len, 6, 1, false);
-  g.rotateX(Math.PI / 2); // axis y -> z
-  g.translate(x, y, zFace + len / 2 - 0.07);
-  return shade(decorate(g, EXHAUST, 0), (_x, _y, z) => (z < zFace - 0.05 ? 0.45 : 1));
+  const r = 0.027, len = 0.30, zEnd = zFace - 0.04;
+  const pipe = new THREE.CylinderGeometry(r, r, len, 8, 1, true);
+  pipe.rotateX(Math.PI / 2); // axis y -> z
+  pipe.translate(x, y, zEnd + len / 2);
+  const rim = new THREE.RingGeometry(r * 0.7, r, 8, 1);
+  rim.rotateY(Math.PI); // face -z
+  rim.translate(x, y, zEnd);
+  const soot = new THREE.CircleGeometry(r * 0.72, 8);
+  soot.rotateY(Math.PI);
+  soot.translate(x, y, zEnd + 0.012);
+  const merged = mergeGeometries([decorate(pipe, EXHAUST, 0), decorate(rim, EXHAUST, 0), decorate(soot, SOOT, MATTE_MIX)], false);
+  if (!merged) throw new Error('exhaust merge failed (attribute mismatch)');
+  return merged;
 }
 
 /**
@@ -261,19 +292,36 @@ function handle(out: PrismDef[], z0: number, z1: number, flankX: number, y: numb
   pair(out, { ...block(z0 + 0.02, z1 - 0.02, 0.006, y - 0.03, y - 0.015, BLACK, 0, flankX + 0.004) });
 }
 
-/** Door mirror: a short stalk from the glasshouse flank (`xGlass`) out to a painted shell with dark glass on its trailing face. */
-function mirror(out: PrismDef[], z0: number, z1: number, xGlass: number, y: number, h: number, w: number): void {
-  const cx = xGlass + 0.06 + w;
-  pair(out, { ...block(z0 + 0.015, z1 - 0.015, 0.045, y + h * 0.35, y + h * 0.6, PAINT_SHADE, 1, xGlass + 0.025) });
-  pair(out, {
-    bz0: z0, bz1: z1, bw0: w, bw1: w * 0.9, by0: y, tz0: z0 + 0.01, tz1: z1 - 0.01, tw0: w * 0.9, tw1: w * 0.8, ty0: y + h,
-    col: PAINT_SHADE, paint: 1, xc: cx, txc: cx,
-  });
-  pair(out, { ...block(z0 - 0.008, z0 + 0.004, w * 0.8, y + 0.015, y + h - 0.015, GLASS_DEEP, 0, cx) });
+/**
+ * Door mirror (both sides): a flat stalk from the glasshouse flank (`xGlass`) out to a tapered housing — an 8-sided
+ * lathe along the car's axis, oval in section (2w wide, h high), widest just behind its flat trailing face (the glass,
+ * dark) and closing to a rounded nose forward over z0..z1 — instead of a box on a box.
+ */
+function mirrorGeometry(out: THREE.BufferGeometry[], z0: number, z1: number, xGlass: number, y: number, h: number, w: number): void {
+  const len = z1 - z0, cy = y + h * 0.5;
+  for (let side = -1; side <= 1; side += 2) {
+    const cx = side * (xGlass + 0.05 + w);
+    const rings: Ring[] = [
+      { y: 0, rx: w * 0.92, rz: h * 0.46 }, { y: 0.008, rx: w, rz: h * 0.5 }, { y: len * 0.4, rx: w * 0.96, rz: h * 0.47 },
+      { y: len * 0.78, rx: w * 0.62, rz: h * 0.31 }, { y: len, rx: w * 0.12, rz: h * 0.06 },
+    ];
+    const housing = tube(rings, 8, true, true);
+    housing.rotateX(Math.PI / 2); // lathe axis y -> +z (nose forward); the bottom lid becomes the trailing face
+    housing.translate(cx, cy, z0);
+    const g = decorate(housing, PAINT_SHADE, 1);
+    const pos = g.attributes.position, col = g.attributes.color, pm = g.attributes.paintMix;
+    authorColor.setHex(GLASS_DEEP);
+    for (let i = 0; i < pos.count; i++) if (pos.getZ(i) < z0 + 0.004) { col.setXYZ(i, authorColor.r, authorColor.g, authorColor.b); pm.setX(i, 0); }
+    out.push(g);
+    const reach = Math.abs(cx) - xGlass + 0.02;
+    const arm = new THREE.BoxGeometry(reach, h * 0.22, 0.05);
+    arm.translate(side * (xGlass - 0.01 + reach * 0.5), y + h * 0.42, z0 + 0.06);
+    out.push(decorate(arm, PAINT_SHADE, 1));
+  }
 }
 
-/** Wheel centre x = half width - half tyre width + this: the tyre face ends 1 cm inside the spec width, flush with the arch lip. */
-const WHEEL_INSET = -0.01;
+/** Wheel centre x = half width - half tyre width + this: the tyre face stands 1.2 cm proud of the spec width, outboard of the arch lip. */
+const WHEEL_INSET = 0.012;
 /** Shell plan widths are authored against hw * PLAN: the doors stay 5 % inside the arch lips, so the arches read as flares. */
 const PLAN = 0.947;
 const PILLAR_W = 0.09;
@@ -579,8 +627,8 @@ function arches(archOut: ArchDef[], width: (y: number, z: number) => number, whe
     archOut.push({ x: wheelX, z, r: ar, w: wide, wellX: wellX + 0.006 });
   }
 }
-/** Arch opening radius over the tyre radius (real cars sit around 1.15-1.25; anything bigger reads as a toy). */
-const ARCH_R = 1.22;
+/** Arch opening radius over the tyre radius: a tight 1.12, so the tyre fills the arch instead of sitting in a dark gap. */
+const ARCH_R = 1.12;
 const ARCH_SEG = 16;
 /** Arch lip face this far inside the spec width: 2 cm proud of the widest flank, a real fender flare. */
 const ARCH_INSET = 0.025;
@@ -607,7 +655,7 @@ function archGeometry(a: ArchDef, side: number): THREE.BufferGeometry[] {
   const back = new THREE.CircleGeometry(a.r * 0.99, ARCH_SEG, 0, Math.PI);
   back.rotateY(side > 0 ? Math.PI / 2 : -Math.PI / 2); // face outboard
   back.translate(side * a.wellX, y, a.z);
-  return [decorate(tube, PAINT_DARK, 1), decorate(lip, PAINT_DARK, 1), decorate(well, BLACK, 0), decorate(back, BLACK, 0)];
+  return [decorate(tube, PAINT_DARK, 1), decorate(lip, PAINT_DARK, 1), decorate(well, BLACK, MATTE_MIX), decorate(back, BLACK, MATTE_MIX)];
 }
 
 /** Segment tones of the end faces and their wraps onto the flanks: a dark bezel above and below every lens cell. */
@@ -621,74 +669,57 @@ const FRONT_FACE: SegTone = { sill: T.black, low: T.shade, flank: T.lamp, bezel:
 const FAN: SegTone = { sill: T.black, low: T.shade, flank: T.dark, bezel: T.bezel, side: T.dark, top: T.dark };
 
 /**
- * Light quad anchored on a lamp cluster: centred on the flank band of the end face, a hair in front of the swept face
+ * Lamp cluster depths: the bezel block proud of the swept lamp face and the lens block standing out of it, for the
+ * tail (a chunky block) and the head (shallower, the nose is already busy). `proud` = where the light quad sits.
+ */
+const LAMP_BLOCK = { tailFrame: 0.035, tailLens: 0.022, headFrame: 0.022, headLens: 0.014, quadGap: 0.006 } as const;
+const TAIL_PROUD = LAMP_BLOCK.tailFrame + LAMP_BLOCK.tailLens + LAMP_BLOCK.quadGap;
+const HEAD_PROUD = LAMP_BLOCK.headFrame + LAMP_BLOCK.headLens + LAMP_BLOCK.quadGap;
+
+/**
+ * Light quad anchored on a lamp cluster: centred on the flank band of the end face, `proud` in front of the swept face
  * (which runs from the outer ring at `outer.z` to the shrunk ring at `inner.z`), yawed to follow that sweep.
  */
-function lampAnchor(outer: Station, inner: Station, dir: number, w: number, h: number): Anchor {
+function lampAnchor(outer: Station, inner: Station, dir: number, w: number, h: number, proud: number): Anchor {
   const k = inner.shrink ?? 0.5, cy = inner.shrinkY ?? 0;
   const xo = outer.wBelt, xi = outer.wBelt * k;
   const yo = (outer.yLow + outer.yBelt) * 0.5, yi = cy + (yo - cy) * k;
   const zMid = (outer.z + inner.z) * 0.5;
-  return { x: (xo + xi) * 0.5, y: (yo + yi) * 0.5, z: zMid + dir * 0.035, w, h, sweep: Math.atan2(Math.abs(inner.z - outer.z), xo - xi) };
+  return { x: (xo + xi) * 0.5, y: (yo + yi) * 0.5, z: zMid + dir * proud, w, h, sweep: Math.atan2(Math.abs(inner.z - outer.z), xo - xi) };
 }
 
 /**
- * Lamp bezel: a dark frame 1.6 cm proud of the swept lamp face with a lens plate standing another 1.4 cm out of it,
- * both yawed to follow the face like the light quad, which sits just in front of the plate. From outside the lamp is
- * a bevelled cluster (frame, lens rim, lit face) instead of a flat rectangle; the plate is a lens (LENS_MIX), so it
- * glows around the quad when the lights are on.
+ * Lamp block: a bevelled dark bezel standing `frame` proud of the swept lamp face (buried 1 cm into it) with a lens
+ * block another `lensDepth` out of it, both yawed to follow the face like the light quad, which sits just in front of
+ * the lens. From outside the lamp is a real block set into the corner (a rim, a lit face, a shadow under it) instead
+ * of a coloured cell; the lens (LENS_MIX) glows around the quad when the lights are on. `proud` is the anchor's quad
+ * offset, so the face is recovered from the anchor.
  */
-function lampBevel(a: Anchor, dir: 1 | -1, lensCol: number): THREE.BufferGeometry[] {
+function lampBlock(a: Anchor, dir: 1 | -1, lensCol: number, frame: number, lensDepth: number, proud: number): THREE.BufferGeometry[] {
   const out: THREE.BufferGeometry[] = [];
   for (let side = -1; side <= 1; side += 2) {
-    const fw = a.w * 1.28, fh = a.h * 1.45, lw = a.w * 1.1, lh = a.h * 1.16;
-    const frame = new THREE.BoxGeometry(fw, fh, 0.016);
-    frame.translate(0, 0, dir * 0.008);
-    const lens = new THREE.BoxGeometry(lw, lh, 0.02);
-    lens.translate(0, 0, dir * 0.022);
-    for (const g of [frame, lens]) {
+    const fw = a.w * 1.3, fh = a.h * 1.5, lw = a.w * 1.06, lh = a.h * 1.15;
+    const bezel = new RoundedBoxGeometry(fw, fh, frame + 0.01, 1, 0.007);
+    bezel.translate(0, 0, dir * ((frame + 0.01) / 2 - 0.01));
+    const lens = new THREE.BoxGeometry(lw, lh, lensDepth + 0.006);
+    lens.translate(0, 0, dir * (frame + (lensDepth + 0.006) / 2 - 0.006));
+    for (const g of [bezel, lens]) {
       g.rotateY(dir * side * a.sweep);
-      g.translate(side * a.x, a.y, a.z - dir * 0.03);
+      g.translate(side * a.x, a.y, a.z - dir * proud);
     }
-    out.push(decorate(frame, BEZEL, 0), decorate(lens, lensCol, LENS_MIX));
+    out.push(decorate(bezel, BEZEL, 0), decorate(lens, lensCol, LENS_MIX));
   }
   return out;
 }
 
-const stripT = new THREE.Vector3(), stripN = new THREE.Vector3(), stripB = new THREE.Vector3();
-
-/**
- * Rear bumper strip: a 1.2 cm rubbing strip swept across the tail 1 cm proud of the fanned end face, so the rear gets
- * the horizontal bumper line a flat loft cannot give it. `faceZ(x)` returns the depth of the end face at half-width x.
- */
-function bumperStrip(faceZ: (x: number) => number, y: number, halfW: number): THREE.BufferGeometry {
-  const n = 9, pts: THREE.Vector3[] = [];
-  for (let i = 0; i < n; i++) {
-    const x = -halfW + (2 * halfW * i) / (n - 1);
-    pts.push(new THREE.Vector3(x, y, faceZ(x) - 0.012));
-  }
+/** Rear bumper strip: a 1.2 cm rubbing strip across the bumper face at `z` (its axis 1.2 cm proud of it). */
+function bumperStrip(z: number, y: number, halfW: number): THREE.BufferGeometry {
   const radial = 6, r = 0.012;
-  const g = surface(n, radial, true, true, (i, j, out) => {
-    const a = pts[Math.max(0, i - 1)], b = pts[Math.min(n - 1, i + 1)];
-    stripT.subVectors(b, a).normalize();
-    stripN.crossVectors(stripT, stripB.set(0, 1, 0)).normalize();
-    stripB.crossVectors(stripT, stripN);
+  const g = surface(2, radial, true, true, (i, j, out) => {
     const ang = (j / radial) * Math.PI * 2;
-    out.copy(pts[i]).addScaledVector(stripN, Math.sin(ang) * r).addScaledVector(stripB, Math.cos(ang) * r);
+    out.set(i === 0 ? -halfW : halfW, y + Math.cos(ang) * r, z - 0.012 + Math.sin(ang) * r);
   });
   return decorate(g, BUMPER_STRIP, 0);
-}
-
-/**
- * Depth of a fanned end face at half-width x: linear from the outer ring (`zOuter`, half-width `wOuter`) through the
- * shrunk ring (`zMid`, at `kMid` of the width) to the apex (`zApex`).
- */
-function fanDepth(zOuter: number, wOuter: number, zMid: number, kMid: number, zApex: number): (x: number) => number {
-  return (x: number): number => {
-    const f = Math.min(1, Math.abs(x) / Math.max(1e-4, wOuter));
-    if (f >= kMid) return zMid + (zOuter - zMid) * ((f - kMid) / (1 - kMid));
-    return zApex + (zMid - zApex) * (f / kMid);
-  };
 }
 
 /**
@@ -728,9 +759,12 @@ function sedanProfile(s: VehicleSpec, kind: 'sedan' | 'police' | 'taxi'): Vehicl
   const nose = station(hl - 0.05, c, belt - 0.10, hp * 0.62, belt - 0.13, hp * 0.83, { yFloor: c + 0.03, wFloor: hp * 0.76, yLow: belt - 0.30, wLow: hp * 0.83, edge: 0.03, crown: 0.01, seg: FRONT_FACE, lod: true });
   const cowlZ = L * 0.145, roofFrontZ = -0.02, roofRearZ = -L * 0.215, screenBaseZ = -L * 0.31;
   const deck = station(screenBaseZ, c, belt + 0.10, hp * 0.72, belt + 0.025, hp * 0.95, { edge: 0.02, crown: 0.01, seg: SCREEN_EDGE });
+  // The end-face apex sits at the depth of the half ring, so the inner tail is one flat face (no fanned X crease);
+  // the bumper, lamp blocks and shut line of rearEnd() give it its structure.
+  const zFace = -hl - 0.05;
   const stations: Station[] = [
-    shrunk(rear, -hl - 0.07, 0, yCRear, FAN, true),
-    shrunk(rear, -hl - 0.05, 0.5, yCRear, REAR_FACE, true),
+    shrunk(rear, zFace, 0, yCRear, FAN, true),
+    shrunk(rear, zFace, 0.5, yCRear, REAR_FACE, true),
     rear,
     station(-hl + 0.24, c, belt + 0.115, hp * 0.76, belt + 0.035, hp * 0.925, { wFloor: hp * 0.86, yLow: belt - 0.17, wLow: hp * 0.91, edge: 0.03, crown: 0.015, lod: true }),
     deck,
@@ -759,24 +793,23 @@ function sedanProfile(s: VehicleSpec, kind: 'sedan' | 'police' | 'taxi'): Vehicl
   shutLine(parts, -L * 0.19, width(c + 0.17, -L * 0.19), c + 0.17, width(belt - 0.02, -L * 0.19), belt - 0.02);
   parts.push({ ...block(cowlZ + 0.02, cowlZ + 0.036, hw * 0.76, belt + 0.05, belt + 0.10, BLACK, 0), plain: true });
   arches(archDefs, width, wx, wz, VEHICLE_RENDER.wheelRadius, hw - ARCH_INSET - wx);
-  // Grille, plates, mirrors, handles.
+  // Grille, front plate, the three-box tail (bumper, valance, strip, plate, boot shut line), mirrors, handles.
   parts.push({ ...block(hl + 0.03, hl + 0.075, hw * 0.36, c + 0.25, belt - 0.19, BLACK, 0), plain: true });
   plate(parts, hl + 0.04, hl + 0.085, hw * 0.18, c + 0.08, c + 0.19);
-  rearDetails(parts, -hl - 0.07, c + 0.31);
-  mirror(parts, cowlZ - 0.20, cowlZ - 0.06, width(belt + 0.02, cowlZ - 0.13), belt + 0.01, 0.11, 0.05);
+  const extras: THREE.BufferGeometry[] = [];
+  const head = lampAnchor(nose, stations[stations.length - 2], 1, 0.22, 0.09, HEAD_PROUD);
+  const tail = lampAnchor(rear, stations[1], -1, 0.24, 0.10, TAIL_PROUD);
+  const zBumper = rearEnd(parts, extras, width, zFace, -hl + 0.26, c + 0.02, belt - 0.20, belt + 0.02, tail.x - tail.w * 0.65 - 0.01);
+  mirrorGeometry(extras, cowlZ - 0.20, cowlZ - 0.06, width(belt + 0.02, cowlZ - 0.13), belt + 0.01, 0.11, 0.05);
   handle(parts, -L * 0.03, L * 0.04, width(belt - 0.11, 0), belt - 0.11);
   handle(parts, -L * 0.34, -L * 0.27, width(belt - 0.11, -L * 0.3), belt - 0.11);
-
-  const head = lampAnchor(nose, stations[stations.length - 2], 1, 0.22, 0.09);
-  const tail = lampAnchor(rear, stations[1], -1, 0.24, 0.10);
-  const extras = [...lampBevel(head, 1, LAMP_LENS), ...lampBevel(tail, -1, TAIL_LENS)];
-  extras.push(bumperStrip(fanDepth(-hl, rear.wLow, -hl - 0.05, 0.5, -hl - 0.07), rear.yLow + 0.045, rear.wLow * 0.9));
+  extras.push(...lampBlock(head, 1, LAMP_LENS, LAMP_BLOCK.headFrame, LAMP_BLOCK.headLens, HEAD_PROUD), ...lampBlock(tail, -1, TAIL_LENS, LAMP_BLOCK.tailFrame, LAMP_BLOCK.tailLens, TAIL_PROUD));
   const profile: VehicleProfile = {
     stations,
     parts,
     extras,
     arches: archDefs,
-    exhaust: { x: hw * 0.55, y: c + 0.01, zFace: -hl - 0.07 },
+    exhaust: { x: hw * 0.55, y: c - 0.005, zFace: zBumper },
     head,
     tail,
     roof: { x: 0, y: H, z: 0, w: 0.3, h: 0.12, sweep: 0 },
@@ -828,9 +861,10 @@ function sportProfile(s: VehicleSpec): VehicleProfile {
   const nose = station(hl - 0.05, c, belt - 0.14, hp * 0.60, belt - 0.16, hp * 0.84, { yFloor: c + 0.03, wFloor: hp * 0.78, yLow: belt - 0.27, wLow: hp * 0.84, edge: 0.02, crown: 0.01, seg: FRONT_FACE, lod: true });
   const cowlZ = 0.58, roofFrontZ = -0.12, roofRearZ = -0.55, deckZ = -1.30;
   const deck = station(deckZ, c, belt + 0.17, hp * 0.78, belt + 0.045, hp * 0.945, { edge: 0.02, crown: 0.005, seg: SCREEN_EDGE });
+  const zFace = -hl - 0.045;
   const stations: Station[] = [
-    shrunk(rear, -hl - 0.06, 0, yCRear, FAN, true),
-    shrunk(rear, -hl - 0.045, 0.5, yCRear, REAR_FACE, true),
+    shrunk(rear, zFace, 0, yCRear, FAN, true),
+    shrunk(rear, zFace, 0.5, yCRear, REAR_FACE, true),
     rear,
     station(-hl + 0.28, c, belt + 0.19, hp * 0.82, belt + 0.06, hp * 0.95, { wFloor: hp * 0.88, yLow: belt - 0.06, wLow: hp * 0.94, edge: 0.03, crown: 0.005, lod: true }),
     deck,
@@ -861,19 +895,19 @@ function sportProfile(s: VehicleSpec): VehicleProfile {
   parts.push({ ...block(cowlZ + 0.02, cowlZ + 0.036, hw * 0.78, belt + 0.05, belt + 0.10, BLACK, 0), plain: true });
   parts.push({ ...block(hl + 0.03, hl + 0.07, hw * 0.44, c + 0.16, belt - 0.24, BLACK, 0), plain: true });
   plate(parts, hl + 0.035, hl + 0.08, hw * 0.18, c + 0.05, c + 0.15);
-  rearDetails(parts, -hl - 0.06, c + 0.26);
-  mirror(parts, cowlZ - 0.20, cowlZ - 0.07, width(belt + 0.02, cowlZ - 0.13), belt + 0.01, 0.09, 0.045);
+  const extras: THREE.BufferGeometry[] = [];
+  const head = lampAnchor(nose, stations[stations.length - 2], 1, 0.24, 0.07, HEAD_PROUD);
+  const tail = lampAnchor(rear, stations[1], -1, 0.34, 0.07, TAIL_PROUD);
+  const zBumper = rearEnd(parts, extras, width, zFace, -hl + 0.28, c + 0.02, belt - 0.10, belt + 0.075, tail.x - tail.w * 0.65 - 0.01);
+  mirrorGeometry(extras, cowlZ - 0.20, cowlZ - 0.07, width(belt + 0.02, cowlZ - 0.13), belt + 0.01, 0.09, 0.045);
   handle(parts, -L * 0.14, -L * 0.07, width(belt - 0.10, -L * 0.1), belt - 0.10);
-  const head = lampAnchor(nose, stations[stations.length - 2], 1, 0.24, 0.07);
-  const tail = lampAnchor(rear, stations[1], -1, 0.34, 0.07);
-  const extras = [...lampBevel(head, 1, LAMP_LENS), ...lampBevel(tail, -1, TAIL_LENS)];
-  extras.push(bumperStrip(fanDepth(-hl, rear.wLow, -hl - 0.045, 0.5, -hl - 0.06), rear.yLow + 0.04, rear.wLow * 0.9));
+  extras.push(...lampBlock(head, 1, LAMP_LENS, LAMP_BLOCK.headFrame, LAMP_BLOCK.headLens, HEAD_PROUD), ...lampBlock(tail, -1, TAIL_LENS, LAMP_BLOCK.tailFrame, LAMP_BLOCK.tailLens, TAIL_PROUD));
   return {
     stations,
     parts,
     extras,
     arches: archDefs,
-    exhaust: { x: hw * 0.50, y: c + 0.01, zFace: -hl - 0.06 },
+    exhaust: { x: hw * 0.50, y: c - 0.005, zFace: zBumper },
     head,
     tail,
     roof: { x: 0, y: H, z: 0, w: 0.3, h: 0.12, sweep: 0 },
@@ -902,9 +936,10 @@ function vanProfile(s: VehicleSpec): VehicleProfile {
   const rear = station(-hl, c, roof - 0.02, hp * 0.86, belt + 0.02, hp * 0.92, { yFloor: c + 0.04, wFloor: hp * 0.86, yLow: belt - 0.32, wLow: hp * 0.91, edge: 0.05, crown: 0.02, seg: REAR_WRAP, lod: true });
   const nose = station(hl - 0.05, c, belt - 0.06, hp * 0.70, belt - 0.11, hp * 0.84, { yFloor: c + 0.04, wFloor: hp * 0.78, yLow: belt - 0.30, wLow: hp * 0.84, edge: 0.03, crown: 0.01, seg: FRONT_FACE, lod: true });
   const cowlZ = noseZ + 0.16, roofFrontZ = noseZ - 0.28, bPillarZ = noseZ - 1.02;
+  const zFace = -hl - 0.04;
   const stations: Station[] = [
-    shrunk(rear, -hl - 0.05, 0, belt - 0.15, FAN, true),
-    shrunk(rear, -hl - 0.04, 0.72, belt - 0.15, REAR_FACE, true),
+    shrunk(rear, zFace, 0, belt - 0.15, FAN, true),
+    shrunk(rear, zFace, 0.72, belt - 0.15, REAR_FACE, true),
     rear,
     station(-hl + 0.22, c, roof, hp * 0.88, belt + 0.02, hp * 0.95, { wFloor: hp * 0.88, yLow: belt - 0.32, wLow: hp * 0.94, edge: 0.05, crown: 0.02, lod: true }),
     station(bPillarZ, c, roof, hp * 0.88, belt + 0.01, hp * 0.95, { wFloor: hp * 0.88, edge: 0.05, crown: 0.02, seg: B_PILLAR, inset: IN }),
@@ -932,21 +967,22 @@ function vanProfile(s: VehicleSpec): VehicleProfile {
   arches(archDefs, width, wx, wz, VEHICLE_RENDER.wheelRadius * 1.12, hw - ARCH_INSET - wx);
   parts.push({ ...block(hl + 0.03, hl + 0.075, hw * 0.42, c + 0.30, belt - 0.20, BLACK, 0), plain: true });
   plate(parts, hl + 0.04, hl + 0.085, hw * 0.18, c + 0.10, c + 0.21);
-  rearDetails(parts, -hl - 0.05, c + 0.38);
+  const extras: THREE.BufferGeometry[] = [];
+  const head = lampAnchor(nose, stations[stations.length - 2], 1, 0.24, 0.10, HEAD_PROUD);
+  const tail = lampAnchor(rear, stations[1], -1, 0.13, 0.22, TAIL_PROUD);
+  // The rear doors carry their own seam, so no boot shut line across the van's tail.
+  const zBumper = rearEnd(parts, extras, width, zFace, -hl + 0.30, c + 0.02, belt - 0.34, 0, 0);
   // Big mirrors on arms, cab and sliding-door handles.
-  mirror(parts, cowlZ - 0.34, cowlZ - 0.14, width(belt + 0.20, cowlZ - 0.24), belt + 0.16, 0.20, 0.06);
+  mirrorGeometry(extras, cowlZ - 0.34, cowlZ - 0.14, width(belt + 0.20, cowlZ - 0.24), belt + 0.16, 0.20, 0.06);
   handle(parts, noseZ - 0.62, noseZ - 0.54, width(belt - 0.02, noseZ - 0.58), belt - 0.02);
   handle(parts, -L * 0.22 + 0.06, -L * 0.22 + 0.14, width(belt - 0.02, -L * 0.22 + 0.1), belt - 0.02);
-  const head = lampAnchor(nose, stations[stations.length - 2], 1, 0.24, 0.10);
-  const tail = lampAnchor(rear, stations[1], -1, 0.13, 0.22);
-  const extras = [...lampBevel(head, 1, LAMP_LENS), ...lampBevel(tail, -1, TAIL_LENS)];
-  extras.push(bumperStrip(fanDepth(-hl, rear.wLow, -hl - 0.04, 0.72, -hl - 0.05), rear.yLow + 0.05, rear.wLow * 0.92));
+  extras.push(...lampBlock(head, 1, LAMP_LENS, LAMP_BLOCK.headFrame, LAMP_BLOCK.headLens, HEAD_PROUD), ...lampBlock(tail, -1, TAIL_LENS, LAMP_BLOCK.tailFrame, LAMP_BLOCK.tailLens, TAIL_PROUD));
   return {
     stations,
     parts,
     extras,
     arches: archDefs,
-    exhaust: { x: hw * 0.55, y: c + 0.01, zFace: -hl - 0.05 },
+    exhaust: { x: hw * 0.55, y: c - 0.005, zFace: zBumper },
     head,
     tail,
     roof: { x: 0, y: H, z: 0, w: 0.3, h: 0.12, sweep: 0 },
@@ -1003,8 +1039,12 @@ export function bodyGeometry(s: VehicleSpec): THREE.BufferGeometry {
   return merged;
 }
 
-/** Hub tone of the parked-car shell's baked wheel discs (matches the lathed wheel's bright dish); the disc edge and tread fall to tyre black. */
-const LOD_RIM = 0x9aa0a8;
+/**
+ * Hub tone of the parked-car shell's baked wheel discs: the lathed wheel's alloy grey, but matte (MATTE_MIX: no
+ * clearcoat, no metal), so a disc that squares up to the sun reads as a rim instead of a white flash; the disc edge and
+ * tread fall to tyre black.
+ */
+const LOD_RIM = 0x848a92;
 
 /**
  * Cheap shell for the static parked cars of the lots: the same loft at the coarse ring through the `lod` stations only
@@ -1027,7 +1067,7 @@ export function parkedShellGeometry(s: VehicleSpec): THREE.BufferGeometry {
     disc.translate(x, r, z);
     // Rim faces: the cap centre vertex carries the bright hub, the cap edge and the tread ring stay tyre-black, so the
     // fan interpolates a bright rim inside a dark tyre like the lathed wheel does at chase distance.
-    geos.push(shade(decorate(disc, LOD_RIM, 0), (px, py, pz) => (Math.abs(Math.abs(px - x) - w * 0.5) < 1e-4 && Math.hypot(py - r, pz - z) < r * 0.5 ? 1 : 0.22)));
+    geos.push(shade(decorate(disc, LOD_RIM, MATTE_MIX), (px, py, pz) => (Math.abs(Math.abs(px - x) - w * 0.5) < 1e-4 && Math.hypot(py - r, pz - z) < r * 0.5 ? 1 : 0.2)));
   }
   const merged = mergeGeometries(geos, false);
   if (!merged) throw new Error('parked shell merge failed (attribute mismatch)');
@@ -1140,21 +1180,31 @@ export function makeVehiclePaintMaterial(lensGlow = false): THREE.MeshPhysicalMa
         lensGlow ? 'attribute float instanceGlow;' : '',
         'varying float vPaint;',
         'varying float vLens;',
+        'varying float vMatte;',
       ].join('\n'))
-      // three >= r155 declares vColor as vec4 (see color_pars_vertex), so write through .rgb.
+      // three >= r155 declares vColor as vec4 (see color_pars_vertex), so write through .rgb. The paint comes from the
+      // instance colour (vehicle InstancedMeshes) or the batch colour (the parked-shell BatchedMesh of the props).
       .replace('#include <color_vertex>', [
         'vColor = vec4( 1.0 );',
         '#ifdef USE_COLOR',
         '  vColor.rgb *= color;',
         '#endif',
         'vPaint = clamp( paintMix, 0.0, 1.0 );',
-        lensGlow ? 'vLens = step( paintMix, -0.5 ) * instanceGlow;' : 'vLens = 0.0;',
+        lensGlow ? 'vLens = step( paintMix, -0.5 ) * step( -1.5, paintMix ) * instanceGlow;' : 'vLens = 0.0;',
+        'vMatte = step( paintMix, -1.5 );',
         '#ifdef USE_INSTANCING_COLOR',
         '  vColor.rgb *= mix( vec3( 1.0 ), instanceColor.rgb, vPaint );',
         '#endif',
+        '#ifdef USE_BATCHING_COLOR',
+        '  vColor.rgb *= mix( vec3( 1.0 ), getBatchingColor( getIndirectIndex( gl_DrawID ) ).rgb, vPaint );',
+        '#endif',
       ].join('\n'));
     shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', '#include <common>\nuniform float uLensGlow;\nuniform float uRim;\nvarying float vPaint;\nvarying float vLens;')
+      .replace('#include <common>', '#include <common>\nuniform float uLensGlow;\nuniform float uRim;\nvarying float vPaint;\nvarying float vLens;\nvarying float vMatte;')
+      // Matte parts (MATTE_MIX): rough, non-metal, no clearcoat, so a wheel well or a baked wheel disc never flashes the sky.
+      .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = mix( roughnessFactor, 0.92, vMatte );')
+      .replace('#include <metalnessmap_fragment>', '#include <metalnessmap_fragment>\nmetalnessFactor = mix( metalnessFactor, 0.08, vMatte );')
+      .replace('#include <lights_physical_fragment>', THREE.ShaderChunk.lights_physical_fragment.replace('material.clearcoat = clearcoat;', 'material.clearcoat = clearcoat * ( 1.0 - vMatte );'))
       // Lit lens cells: emissive in their own (lens) colour.
       .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += vColor.rgb * vLens * uLensGlow;')
       // Fresnel rim on the paint only: view-angle brightening toward the silhouette, tinted a little toward white.
@@ -1167,7 +1217,7 @@ export function makeVehiclePaintMaterial(lensGlow = false): THREE.MeshPhysicalMa
         '#include <opaque_fragment>',
       ].join('\n'));
   };
-  m.customProgramCacheKey = () => (lensGlow ? 'vehiclePaintMixGlow' : 'vehiclePaintMix');
+  m.customProgramCacheKey = () => (lensGlow ? 'vehiclePaintMixGlow2' : 'vehiclePaintMix2');
   return m;
 }
 

@@ -270,11 +270,12 @@ const PARKED_MIX: { key: ParkedSpec; weight: number }[] = [{ key: 'sedan', weigh
 const ISLAND = { w: 1.5, l: 5.6, h: 0.16, p: 0.5, p2: 0.3 } as const;
 const PARKED_H = 1.5;
 /**
- * Clipped hedge units screening a lot from the street: 2 m long, standing `off` outside the lot's kerb ring in the
- * block's inset band (the pavement between the lot and the sidewalk), broken at the gate (`gateClear` either side of
- * the drive lane) and short of the lot corners by `cornerClear`.
+ * Clipped hedge units screening a lot from the street: 1.9 m colliders at a 2 m pitch (a 10 cm seam so each unit
+ * clears its neighbour's box; the renderer's unit is longer than the pitch, so a row reads as one continuous hedge),
+ * 0.62 m high, standing `off` outside the lot's kerb ring in the block's inset band (the pavement between the lot and
+ * the sidewalk), broken at the gate (`gateClear` either side of the drive lane) and short of the lot corners by `cornerClear`.
  */
-export const HEDGE = { len: 2.0, depth: 0.6, h: 0.8, off: 1.0, pitch: 2.1, gateClear: 1.5, cornerClear: 0.4 } as const;
+export const HEDGE = { len: 1.9, depth: 0.6, h: 0.62, off: 1.0, pitch: 2.0, gateClear: 1.5, cornerClear: 0.4 } as const;
 
 /** Axis-aligned rectangle in world space. */
 export interface Rect { x0: number; z0: number; x1: number; z1: number }

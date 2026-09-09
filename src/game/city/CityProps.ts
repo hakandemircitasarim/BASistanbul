@@ -43,8 +43,11 @@ const SPOT_LOT_CAP = 6;
 const SPOT_LOT_CAP_OTHER = 4;
 const SPAWN_SPOT_RADIUS = 40;
 
-/** Sidewalk trees (downtown / suburb): pitch along a block edge, the first one this far from the corner, jitter, offset from the block edge (0.7 m off the kerb, like the palms). */
-const TREE = { pitch: 18, first: 9, jitter: 2.5, offset: 2.3, r: 0.3, clear: 1.2, shelterClear: 4.5, scaleMin: 0.85, scaleMax: 1.15 } as const;
+/**
+ * Sidewalk trees (downtown / suburb): an irregular pitch along a block edge (12-22 m, seeded), the first one 8-14 m
+ * from the corner, offset from the block edge (0.7 m off the kerb, like the palms), scale 0.8-1.3 per tree.
+ */
+const TREE = { pitchMin: 12, pitchMax: 22, first: 8, firstJitter: 6, offset: 2.3, r: 0.3, clear: 1.2, shelterClear: 4.5, scaleMin: 0.8, scaleMax: 1.3 } as const;
 /**
  * Kerbside parking: cars stand on the pavement strip hard against the kerb (their road-side flank `kerbGap` off the
  * asphalt edge, i.e. wholly outside the outer lane), noses along the adjacent lane's direction of travel, in runs
@@ -331,9 +334,10 @@ function edgePoint(b: Block, edge: number, t: number, off: number, out: { x: num
 const ep = { x: 0, z: 0 };
 
 /**
- * Round-crown sidewalk trees on the downtown and suburb blocks (the beachfront has its palms): one every ~18 m along
- * every edge, on the kerb line like the palms, skipped where a lamp, sign, palm, bin or hydrant already stands and
- * within `shelterClear` of a bus shelter (which has no collider). Seeded from `rng` only.
+ * Round-crown sidewalk trees on the downtown and suburb blocks (the beachfront has its palms): every 12-22 m along
+ * every edge (an irregular rhythm rather than a picket line), on the kerb line like the palms, skipped where a lamp,
+ * sign, palm, bin or hydrant already stands and within `shelterClear` of a bus shelter (which has no collider); the
+ * kerbside cars are placed afterwards and keep clear of them. Seeded from `rng` only.
  */
 export function addStreetTrees(ctx: GenContext, rng: Random): void {
   const shelters: { x: number; z: number }[] = [];
@@ -342,8 +346,7 @@ export function addStreetTrees(ctx: GenContext, rng: Random): void {
     const b = ctx.blocks[bi];
     if (b.kind !== 'buildings' || districtOf(b.col, b.row) === 'beachfront') continue;
     for (let edge = 0; edge < 4; edge++) {
-      for (let t = TREE.first; t <= BLOCK - TREE.first + 1e-6; t += TREE.pitch) {
-        const tt = t + rng.range(-TREE.jitter, TREE.jitter);
+      for (let tt = TREE.first + rng.range(0, TREE.firstJitter); tt <= BLOCK - TREE.first + 1e-6; tt += rng.range(TREE.pitchMin, TREE.pitchMax)) {
         edgePoint(b, edge, tt, TREE.offset, ep);
         const x = ep.x, z = ep.z;
         if (clearance(ctx.hash, x, z, 6) < TREE.clear) continue;
