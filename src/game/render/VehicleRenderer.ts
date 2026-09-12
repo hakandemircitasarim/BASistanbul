@@ -382,10 +382,12 @@ interface Station {
   seg: SegTone;
   /** Kept by the coarse parked-car shell (`parkedShellGeometry`). */
   lod?: boolean;
+  /** Kept by the mid parked-car shell (`parkedMidGeometry`) on top of every `lod` station: the greenhouse pillars. */
+  mid?: boolean;
 }
 
 interface StationOpts {
-  yFloor?: number; wFloor?: number; yLow?: number; wLow?: number; edge?: number; crown?: number; bulge?: number; inset?: number; topInset?: number; seg?: SegTone; lod?: boolean;
+  yFloor?: number; wFloor?: number; yLow?: number; wLow?: number; edge?: number; crown?: number; bulge?: number; inset?: number; topInset?: number; seg?: SegTone; lod?: boolean; mid?: boolean;
 }
 
 /** A full ring; defaults: floor at `c`, floor 5 cm narrower than the belt, lower-flank point 42 % of the way up. */
@@ -394,7 +396,7 @@ function station(z: number, c: number, yTop: number, wTop: number, yBelt: number
   return {
     z, yFloor, wFloor: o.wFloor ?? wBelt - 0.05, yLow: o.yLow ?? yFloor + (yBelt - yFloor) * 0.42, wLow: o.wLow ?? wBelt - 0.012,
     yBelt, wBelt, yTop, wTop, edge: o.edge ?? 0.04, crown: o.crown ?? 0.02, bulge: o.bulge ?? 0.02, inset: o.inset ?? 0, topInset: o.topInset ?? 0,
-    seg: o.seg ?? BODY, lod: o.lod,
+    seg: o.seg ?? BODY, lod: o.lod, mid: o.mid,
   };
 }
 
@@ -439,6 +441,13 @@ function makeLayout(half: PointKind[]): RingLayout {
 const FULL_RING = makeLayout(['bottom', 'sill', 'lowFloor', 'low', 'lensLo', 'lensHi', 'belt', 'belt', 'sealLo', 'mid', 'sealHi', 'edge', 'edge', 'topMid', 'top']);
 /** Parked-car ring: 8 half points (14 around), belt crease only, no gaskets or lens split. */
 const LOD_RING = makeLayout(['bottom', 'lowFloor', 'low', 'belt', 'belt', 'mid', 'edge', 'top']);
+/**
+ * Mid parked-car ring: 10 half points (18 around). The coarse ring's silhouette plus the lens split, so the lamp
+ * clusters of the end faces are real bezel / lens / bezel bands at 32 m (the coarse shell paints the whole flank of
+ * the nose and tail one body colour, which is why a parked car has no lights until it is 8 m away). No gasket bands:
+ * at that distance a 3 cm black line costs two rows of cells and reads as nothing.
+ */
+const MID_RING = makeLayout(['bottom', 'lowFloor', 'low', 'lensLo', 'lensHi', 'belt', 'belt', 'mid', 'edge', 'top']);
 
 /** Band of ring cell j (points j -> j+1) in a layout: the second half mirrors the first. */
 function cellBand(lay: RingLayout, j: number): Band | null {
@@ -658,6 +667,27 @@ function archGeometry(a: ArchDef, side: number): THREE.BufferGeometry[] {
   return [decorate(tube, PAINT_DARK, 1), decorate(lip, PAINT_DARK, 1), decorate(well, BLACK, MATTE_MIX), decorate(back, BLACK, MATTE_MIX)];
 }
 
+/** Arch segments of the mid parked shell: half the near loft's, which is still a smooth crescent at 20-32 m. */
+const MID_ARCH_SEG = 8;
+
+/**
+ * Cheap wheel arch for the mid parked shell: the painted half-tube of the fender (so the flank is cut back around the
+ * wheel and the tyre sits INSIDE the body) over a black half-disc backing proud of the flank. No outboard lip ring and
+ * no inward-facing well tube — at 20-32 m those are two sub-pixel rings — which is a quarter of the near arch's
+ * triangles for the read that actually matters: a dark crescent over a tyre that is let into the body, not a black
+ * disc stuck on a wedge.
+ */
+function midArchGeometry(a: ArchDef, side: number): THREE.BufferGeometry[] {
+  const y = VEHICLE_RENDER.wheelRadius;
+  const tube = new THREE.CylinderGeometry(a.r, a.r, a.w * 2, MID_ARCH_SEG, 1, true, 0, Math.PI);
+  tube.rotateZ(Math.PI / 2);
+  tube.translate(side * a.x, y, a.z);
+  const back = new THREE.CircleGeometry(a.r * 0.99, MID_ARCH_SEG, 0, Math.PI);
+  back.rotateY(side > 0 ? Math.PI / 2 : -Math.PI / 2);
+  back.translate(side * a.wellX, y, a.z);
+  return [decorate(tube, PAINT_DARK, 1), decorate(back, BLACK, MATTE_MIX)];
+}
+
 /** Segment tones of the end faces and their wraps onto the flanks: a dark bezel above and below every lens cell. */
 // The `low` band (sill to lower flank) is the bumper: PAINT_SHADE, so it reads as a separate moulded part under the
 // lamp clusters and the boot / bonnet, with the dark bezel band above it as the seam.
@@ -778,8 +808,8 @@ function sedanProfile(s: VehicleSpec, kind: 'sedan' | 'police' | 'taxi'): Vehicl
   rearScreen(stations, deck, roofRearZ, roof, hp * 0.72, 0.05, 0.025, 0.03);
   stations.push(
     station(roofRearZ, c, roof, hp * 0.72, belt + 0.015, hp * 0.94, { edge: 0.05, crown: 0.025, seg: GLAZED, inset: IN, lod: true }),
-    station(-0.27, c, roof, hp * 0.73, belt + 0.005, hp * 0.945, { edge: 0.05, crown: 0.025, seg: B_PILLAR, inset: IN }),
-    station(-0.18, c, roof, hp * 0.73, belt + 0.005, hp * 0.945, { edge: 0.05, crown: 0.025, seg: GLAZED, inset: IN }),
+    station(-0.27, c, roof, hp * 0.73, belt + 0.005, hp * 0.945, { edge: 0.05, crown: 0.025, seg: B_PILLAR, inset: IN, mid: true }),
+    station(-0.18, c, roof, hp * 0.73, belt + 0.005, hp * 0.945, { edge: 0.05, crown: 0.025, seg: GLAZED, inset: IN, mid: true }),
     station(roofFrontZ - SEAL_W, c, roof - 0.005, hp * 0.71, belt, hp * 0.94, { edge: 0.05, crown: 0.025, seg: GLAZED_SCREEN_EDGE, inset: IN }),
     station(roofFrontZ, c, roof - 0.01, hp * 0.71, belt, hp * 0.94, { edge: 0.05, crown: 0.025, seg: GLAZED_SCREEN, inset: IN, topInset: IN, lod: true }),
     station(0.33, c, belt + 0.29, hp * 0.75, belt - 0.005, hp * 0.945, { edge: 0.04, crown: 0.01, seg: GLAZED_SCREEN, inset: IN, topInset: IN }),
@@ -880,9 +910,9 @@ function sportProfile(s: VehicleSpec): VehicleProfile {
   rearScreen(stations, deck, roofRearZ, roof, hp * 0.70, 0.05, 0.02, 0.035);
   stations.push(
     station(roofRearZ, c, roof, hp * 0.70, belt + 0.025, hp * 0.95, { edge: 0.05, crown: 0.02, seg: GLAZED, inset: IN, lod: true }),
-    station(roofFrontZ - SEAL_W, c, roof - 0.005, hp * 0.69, belt + 0.01, hp * 0.945, { edge: 0.05, crown: 0.02, seg: GLAZED_SCREEN_EDGE, inset: IN }),
+    station(roofFrontZ - SEAL_W, c, roof - 0.005, hp * 0.69, belt + 0.01, hp * 0.945, { edge: 0.05, crown: 0.02, seg: GLAZED_SCREEN_EDGE, inset: IN, mid: true }),
     station(roofFrontZ, c, roof - 0.01, hp * 0.69, belt + 0.01, hp * 0.945, { edge: 0.05, crown: 0.02, seg: GLAZED_SCREEN, inset: IN, topInset: IN, lod: true }),
-    station(0.25, c, belt + 0.30, hp * 0.74, belt, hp * 0.94, { edge: 0.04, crown: 0.01, seg: GLAZED_SCREEN, inset: IN, topInset: IN }),
+    station(0.25, c, belt + 0.30, hp * 0.74, belt, hp * 0.94, { edge: 0.04, crown: 0.01, seg: GLAZED_SCREEN, inset: IN, topInset: IN, mid: true }),
     station(cowlZ - SEAL_W, c, belt + 0.105, hp * 0.78, belt - 0.015, hp * 0.94, { edge: 0.03, crown: 0.01, seg: SCREEN_EDGE, topInset: IN * 0.5 }),
     station(cowlZ, c, belt + 0.085, hp * 0.78, belt - 0.015, hp * 0.94, { edge: 0.03, crown: 0.01, lod: true }),
     station(1.40, c, belt - 0.01, hp * 0.70, belt - 0.06, hp * 0.91, { edge: 0.04, crown: 0.02, bulge: 0.03, lod: true }),
@@ -950,7 +980,7 @@ function vanProfile(s: VehicleSpec): VehicleProfile {
     shrunk(rear, zFace, 0.72, belt - 0.15, REAR_FACE, true),
     rear,
     station(-hl + 0.22, c, roof, hp * 0.88, belt + 0.02, hp * 0.95, { wFloor: hp * 0.88, yLow: belt - 0.32, wLow: hp * 0.94, edge: 0.05, crown: 0.02, lod: true }),
-    station(bPillarZ, c, roof, hp * 0.88, belt + 0.01, hp * 0.95, { wFloor: hp * 0.88, edge: 0.05, crown: 0.02, seg: B_PILLAR, inset: IN }),
+    station(bPillarZ, c, roof, hp * 0.88, belt + 0.01, hp * 0.95, { wFloor: hp * 0.88, edge: 0.05, crown: 0.02, seg: B_PILLAR, inset: IN, mid: true }),
     station(bPillarZ + 0.08, c, roof, hp * 0.88, belt + 0.01, hp * 0.95, { wFloor: hp * 0.88, edge: 0.05, crown: 0.02, seg: GLAZED, inset: IN, lod: true }),
     station(roofFrontZ - SEAL_W, c, roof - 0.005, hp * 0.87, belt, hp * 0.95, { wFloor: hp * 0.88, edge: 0.05, crown: 0.02, seg: GLAZED_SCREEN_EDGE, inset: IN }),
     station(roofFrontZ, c, roof - 0.01, hp * 0.87, belt, hp * 0.95, { wFloor: hp * 0.88, edge: 0.05, crown: 0.02, seg: GLAZED_SCREEN, inset: IN, topInset: IN, lod: true }),
@@ -1061,6 +1091,12 @@ const TYRE_BLACK = 0x1a1b1e;
  * (about 300 triangles), no pillars / arches / mirrors, and each wheel a dark 8-sided disc with a lighter rim face
  * instead of a lathed tyre. Same attribute set and paint material as the bodies, so `instanceColor` tints the paint
  * regions and leaves glass and lamps alone. Sits on the ground like a body (floor at `clearance`).
+ *
+ * Nothing fakes the arch cut here. The flat half-annulus that used to (16 triangles a corner, 64 a car) is at most a
+ * pixel or two tall at 60 m and invisible at PROP_RANGE.parked = 120 m, yet every coarse car in range paid for it in
+ * the colour pass, the GTAO pass AND the sun shadow pass - about 5k triangles in the dusk frame, which is over the
+ * hard budget. The fender read the band existed for is the mid tier's job (`parkedMidGeometry`, real arch fenders out
+ * to MID_CARS.range = 32 m); past that the eye catches the silhouette, not the crescent.
  */
 export function parkedShellGeometry(s: VehicleSpec): THREE.BufferGeometry {
   const profile = profileFor(s);
@@ -1079,18 +1115,41 @@ export function parkedShellGeometry(s: VehicleSpec): THREE.BufferGeometry {
 
 /**
  * The four baked wheels of a static parked car (which is not a Vehicle, so nothing instances a lathed wheel for it).
- * `seg`-sided, and at `rim` a shouldered tyre (the tread pulls in at both sidewalls instead of ending in a flat
- * cylinder cap) with an alloy disc set into its outboard face: without that disc a parked car at 6 m wears four black
- * balls. The cheap form keeps the plain cylinder, whose cap centre carries the bright hub and whose cap edge and
- * tread stay tyre black, so the fan still interpolates a rim inside a dark tyre at chase distance.
+ * `seg`-sided in three grades. `rim` (near): a shouldered tyre with a lathed alloy set into both bead faces. `mid`:
+ * the same shouldered profile at three bands, with a flat alloy disc plugging each bead — a split sidewall / tread /
+ * rim at a third of the near wheel's triangles, which is what a 20-32 m wheel actually reads as. `flat` (far): a plain
+ * cylinder whose cap centre carries the bright hub and whose cap edge and tread stay tyre black, so the fan still
+ * interpolates a rim inside a dark tyre at chase distance.
  */
-function bakedWheels(out: THREE.BufferGeometry[], s: VehicleSpec, profile: VehicleProfile, seg: number, rim = false): void {
+function bakedWheels(out: THREE.BufferGeometry[], s: VehicleSpec, profile: VehicleProfile, seg: number, kind: 'flat' | 'mid' | 'rim' = 'flat'): void {
   const R = VEHICLE_RENDER;
   const r = R.wheelRadius * profile.wheelScale, w = R.wheelWidth;
   const hw = s.width * 0.5 - w * 0.5 + WHEEL_INSET, hb = s.wheelbase * 0.5;
   for (let k = 0; k < 4; k++) {
     const x = (k % 2 === 0 ? -1 : 1) * hw, z = k < 2 ? hb : -hb;
-    if (!rim) {
+    if (kind === 'mid') {
+      // Mid tyre: three bands, shouldered at both sidewalls (the tread pulls in to a bead), so the silhouette is a
+      // tyre and the sidewall catches its own tone instead of the single flat cylinder wall of the coarse disc. A flat
+      // alloy face plugs each bead: at 20-32 m a bright dish inside a dark tyre is the whole read of a wheel.
+      const tyre = tube([
+        { y: -w * 0.5, rx: r * 0.62, rz: r * 0.62 }, { y: -w * 0.3, rx: r, rz: r },
+        { y: w * 0.3, rx: r, rz: r }, { y: w * 0.5, rx: r * 0.62, rz: r * 0.62 },
+      ], seg, false, false);
+      tyre.rotateZ(Math.PI / 2);
+      tyre.translate(x, r, z);
+      // Sidewall a touch lighter than the tread: a tyre seen side-on is not one black mass.
+      out.push(shade(decorate(tyre, TYRE_BLACK, MATTE_MIX), (px) => (Math.abs(px - x) > w * 0.28 ? 1.45 : 1)));
+      for (let e = -1; e <= 1; e += 2) {
+        // Set well inside the bead and kept dark: an alloy is a recessed dish in shadow, not a hubcap. At 0.63 r and
+        // near its own albedo the disc read as a white plate filling the tyre, which is worse than no rim at all.
+        const face = new THREE.CircleGeometry(r * 0.55, seg);
+        face.rotateY(e > 0 ? Math.PI / 2 : -Math.PI / 2);
+        face.translate(x + e * (w * 0.5 - 0.01), r, z);
+        out.push(shade(decorate(face, LOD_RIM, MATTE_MIX), (_px, py, pz) => (Math.hypot(py - r, pz - z) < r * 0.22 ? 0.78 : 0.42)));
+      }
+      continue;
+    }
+    if (kind === 'flat') {
       const disc = new THREE.CylinderGeometry(r, r, w, seg, 1, false);
       disc.rotateZ(Math.PI / 2); // axle y -> x
       disc.translate(x, r, z);
@@ -1118,6 +1177,33 @@ function bakedWheels(out: THREE.BufferGeometry[], s: VehicleSpec, profile: Vehic
 }
 
 /**
+ * Mid shell for the static parked cars between the near band and the coarse one (CityRendererProps' `mid` tier,
+ * ~8-32 m): the coarse silhouette at MID_RING, so the flank carries a real lamp cluster at each end, plus the
+ * greenhouse pillar stations (`mid`), cheap arch fenders with a black well backing, and a 12-sided shouldered tyre
+ * with an alloy face at every corner. None of the near shell's small parts — no mirrors, handles, shut lines, plate,
+ * grille or lamp blocks — so it lands at a third of its triangles while keeping everything the eye can resolve at
+ * 20 m: the wheels sit IN the body, the glasshouse has posts, and the car has lights.
+ */
+export function parkedMidGeometry(s: VehicleSpec): THREE.BufferGeometry {
+  const profile = profileFor(s);
+  const stations: Station[] = [];
+  for (let i = 0; i < profile.stations.length; i++) if (profile.stations[i].lod || profile.stations[i].mid) stations.push(profile.stations[i]);
+  const geos: THREE.BufferGeometry[] = [loft(stations, MID_RING)];
+  for (let i = 0; i < profile.arches.length; i++) {
+    const a = profile.arches[i];
+    geos.push(...midArchGeometry(a, 1), ...midArchGeometry(a, -1));
+  }
+  bakedWheels(geos, s, profile, 12, 'mid');
+  const merged = mergeGeometries(geos, false);
+  if (!merged) throw new Error('parked mid shell merge failed (attribute mismatch)');
+  for (let i = 0; i < geos.length; i++) geos[i].dispose();
+  for (let i = 0; i < profile.extras.length; i++) profile.extras[i].dispose();
+  bakeShading(merged, profile.floor, profile.belt);
+  merged.computeBoundingSphere();
+  return merged;
+}
+
+/**
  * Near shell for the handful of static parked cars closest to the camera (CityRendererProps' near group, within
  * ~35 m): the player's own body loft — every station at FULL_RING, so the belt crease, the gasket bands and the lens
  * split are all there — with the pillars, shut lines, rocker strip, handles, mirrors, plates, grille, bumpers, the
@@ -1135,7 +1221,7 @@ export function parkedNearGeometry(s: VehicleSpec): THREE.BufferGeometry {
     geos.push(...archGeometry(a, 1), ...archGeometry(a, -1));
   }
   geos.push(exhaustGeometry(profile.exhaust.x, profile.exhaust.y, profile.exhaust.zFace));
-  bakedWheels(geos, s, profile, 10, true);
+  bakedWheels(geos, s, profile, 10, 'rim');
   const merged = mergeGeometries(geos, false);
   if (!merged) throw new Error('parked near shell merge failed (attribute mismatch)');
   for (let i = 0; i < geos.length; i++) geos[i].dispose();

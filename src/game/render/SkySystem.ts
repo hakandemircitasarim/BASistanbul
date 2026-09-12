@@ -28,8 +28,47 @@ export const SKY_KEYS: SkyKey[] = [
 ];
 
 export const scratchLuma = new THREE.Color();
+
+/**
+ * Width of the shadow-edge fade, as a fraction of the shadow box on each side (0.1 of a 132 m box = 13.2 m).
+ */
+const SHADOW_FADE = 0.1;
+/**
+ * Shadow-edge fade, patched into three's shadow lookup once, at module load (before any material compiles).
+ *
+ * Outside the directional light's shadow box getShadow returns "lit", so on a big flat ground at noon the box's own
+ * border draws a hard, stair-stepped line across the tarmac: the border of a square in LIGHT space, which the sun's
+ * azimuth turns into a diagonal on the ground, stepped by the shadow map's texels. No box size hides that - it only
+ * moves it. Fading the shadow term back to 1 over the outer SHADOW_FADE of the box turns the step into a gradient
+ * that nothing in the frame reads as an edge, for two instructions in the fragment shader.
+ *
+ * Only the three 2D variants (PCF / VSM / basic, shared by the directional and spot lights) are patched; the two
+ * getPointShadow tails work in cube space, where there is no border to fade.
+ */
+function patchShadowEdgeFade(): void {
+  const tail = 'return mix( 1.0, shadow, shadowIntensity );';
+  const faded = `{
+			vec2 fadeXY = min( shadowCoord.xy, 1.0 - shadowCoord.xy );
+			float edgeT = clamp( min( fadeXY.x, fadeXY.y ) / ${SHADOW_FADE.toFixed(3)}, 0.0, 1.0 );
+			shadow = mix( 1.0, shadow, edgeT * edgeT * ( 3.0 - 2.0 * edgeT ) );
+		}
+		${tail}`;
+  let out = '', rest = THREE.ShaderChunk.shadowmap_pars_fragment;
+  for (let i = 0; i < 3; i++) {
+    const k = rest.indexOf(tail);
+    if (k < 0) break;
+    out += rest.slice(0, k) + faded;
+    rest = rest.slice(k + tail.length);
+  }
+  THREE.ShaderChunk.shadowmap_pars_fragment = out + rest;
+}
+patchShadowEdgeFade();
 const SKY_TUNING = {
-  domeRadius: 850, sunDist: 700, sunScale: 34, moonScale: 55, starCount: 1400, shadowBox: 120, shadowMap: 2048, lightUnits: 3.0,
+  // 132 m wide (0.065 m a texel at 2048). The border is hidden by SHADOW_FADE, not by the box size, so the box is
+  // sized purely by what it can afford: it is the shadow pass' own caster set, and every metre of it is paid three
+  // times over (colour, GTAO, shadow map). At 150 m the dusk frame measured 726k triangles against a 720k ceiling;
+  // 132 gives ~6k of that back and still carries full shadow to 53 m, fading out to 66.
+  domeRadius: 850, sunDist: 700, sunScale: 34, moonScale: 55, starCount: 1400, shadowBox: 132, shadowMap: 2048, lightUnits: 3.0,
   // Clouds: uv scale of the flat-plane projection, density cut/softness, day and night coverage, drift per game hour.
   cloudScale: 0.6, cloudCut: 0.28, cloudSoft: 0.3, cloudDay: 0.45, cloudNight: 0.22, cloudDrift: 0.018,
   // Dome radiance multiplier (linear HDR): a bright day sky that ACES rolls off, unity at night so the stars keep their size.

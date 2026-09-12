@@ -5,6 +5,7 @@ import { clamp } from '../core/math';
 import type { TextureFactory } from './TextureFactory';
 import { ROAD_TILE_M } from './TextureFactory';
 import { PROP_DIMS } from './CityRendererProps';
+import { leafTexture } from './PropTextures';
 
 export const STYLES: readonly BuildingStyle[] = ['artdeco', 'glass', 'concrete', 'neon', 'residential'];
 /** Sidewalk/sand/grass/plaza texture tile sizes in meters (UVs are world meters / tile). Sidewalk and pavement share the 8 m slab grid so kerb and lot never show a seam. */
@@ -226,9 +227,14 @@ export class Materials {
     // Solid foliage (PropRenderer bakes the normals: canopy normals on the far fronds, face normals on the crowns and
     // hedges) with the same daylight-only translucency emissive as the fronds, so the far palm LOD and the tree crowns
     // fall dark with the near fronds after sunset instead of standing in the street as pale cut-outs.
-    this.foliage = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: SURF.foliage.roughness, metalness: SURF.foliage.metalness, envMapIntensity: SURF.foliage.env, emissive: PALM_FROND_TINT, emissiveIntensity: PALM_FROND_EMISSIVE_DAY });
-    this.foliage.onBeforeCompile = (shader) => { this.leafSpecularPatch(shader); };
-    this.foliage.customProgramCacheKey = () => 'foliageLeaf2';
+    // The leaf albedo (PropTextures) is the only texture on this material: without it a crown, a cypress and a hedge
+    // are flat-shaded solid colour, which at 1-3 m is the most dated thing in the city. The UVs are world metres /
+    // LEAF_TILE_M, projected per face onto the dominant normal axis (CityRendererProps' `leafSurface`), so one map
+    // serves balls, cones and boxes. It is a leaf-coloured multiplier and NOT a near-white one (mean luma 0.45, see
+    // leafTexture), which is why it must be masked off the bark the same batch carries: leafMapMixPatch below.
+    this.foliage = new THREE.MeshStandardMaterial({ map: leafTexture(), vertexColors: true, roughness: SURF.foliage.roughness, metalness: SURF.foliage.metalness, envMapIntensity: SURF.foliage.env, emissive: PALM_FROND_TINT, emissiveIntensity: PALM_FROND_EMISSIVE_DAY });
+    this.foliage.onBeforeCompile = (shader) => { this.leafSpecularPatch(shader); Materials.leafMapMixPatch(shader); };
+    this.foliage.customProgramCacheKey = () => 'foliageLeaf5';
     this.lampPole = new THREE.MeshStandardMaterial({ color: 0x3a3d44, roughness: SURF.metal.roughness, metalness: SURF.metal.metalness, envMapIntensity: SURF.metal.env });
     this.bench = new THREE.MeshStandardMaterial({ color: 0x8a5a30, roughness: SURF.wood.roughness, metalness: 0, envMapIntensity: SURF.wood.env });
     this.hydrant = new THREE.MeshStandardMaterial({ color: 0xd8302a, roughness: SURF.paint.roughness, metalness: SURF.paint.metalness, envMapIntensity: SURF.paint.env });
@@ -242,7 +248,9 @@ export class Materials {
     const macroFor = (tile: number): number => tile / 45;
     this.macroVariation(this.road, macro, macroFor(TILE_M.road), 0.2);
     this.macroVariation(this.sidewalk, macro, macroFor(TILE_M.sidewalk), 0.16);
-    this.macroVariation(this.plaza, macro, macroFor(TILE_M.plaza), 0.16);
+    // The plaza gets the strongest macro of the paved surfaces: it is the one ground the player sees as an unbroken
+    // 96 m field with nothing on it, so its 8 m tile repeat is the most visible in the city.
+    this.macroVariation(this.plaza, macro, macroFor(TILE_M.plaza), 0.26);
     this.macroVariation(this.pavement, macro, macroFor(TILE_M.pavement), 0.16);
     this.macroVariation(this.sand, macro, macroFor(TILE_M.sand), 0.12);
     this.macroVariation(this.grass, macro, macroFor(TILE_M.grass), 0.22);
@@ -310,6 +318,29 @@ export class Materials {
    * blue-white (F0 0.04 x a 1.5-unit light, independent of the albedo), which is what stood in the street as a pale
    * cut-out. The dielectric F0 of both leaf materials is scaled by uLeafSpec, driven to 0 by the night factor.
    */
+  /**
+   * Keeps the leaf albedo off the bark. The foliage batch carries whole trees - bark trunk and fork limbs, the
+   * cypress' bole, the far palm's trunk - in the same geometry as the crowns, so the map has to be masked per vertex
+   * rather than per material: PropRenderer bakes a `leafMix` attribute (1 = leaf, 0 = bark, see `leafMixAttr`) and
+   * the map is lerped in by it. Without this the leaf ellipses printed themselves over every trunk and the map's
+   * mean pulled FURN.bark's warm brown down into moss green - the most prominent object in a 2 m walking frame.
+   */
+  private static leafMapMixPatch(shader: THREE.WebGLProgramParametersWithUniforms): void {
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nattribute float leafMix;\nvarying float vLeafMix;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvLeafMix = leafMix;');
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nvarying float vLeafMix;')
+      .replace('#include <map_fragment>', [
+        '#ifdef USE_MAP',
+        '  diffuseColor *= mix( vec4( 1.0 ), texture2D( map, vMapUv ), vLeafMix );',
+        '#endif',
+      ].join('\n'))
+      // The translucency emissive is a leaf standing in front of the sun; bark is opaque, and the green glow on a
+      // trunk only turned its brown olive.
+      .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance *= vLeafMix;');
+  }
+
   private leafSpecularPatch(shader: THREE.WebGLProgramParametersWithUniforms): void {
     shader.uniforms.uLeafSpec = this.leafSpec;
     shader.fragmentShader = shader.fragmentShader
@@ -427,6 +458,7 @@ export class Materials {
     this.plain.dispose(); this.glow.dispose(); this.shopfront.dispose(); this.plinth.dispose(); this.awning.dispose(); this.facade.dispose();
     this.road.dispose(); this.crosswalk.dispose(); this.roadMark.dispose(); this.sidewalk.dispose(); this.sand.dispose();
     this.grass.dispose(); this.plaza.dispose(); this.pavement.dispose(); this.dirt.dispose(); this.water.dispose(); this.foam.dispose();
+    this.foliage.map?.dispose(); // the leaf albedo is this material's own texture, not one of the factory's cached ones
     this.furniture.dispose(); this.palmTrunk.dispose(); this.palmFrond.dispose(); this.foliage.dispose(); this.lampPole.dispose(); this.bench.dispose(); this.hydrant.dispose();
     this.lampHeadMat.dispose(); this.lightPoolMat.dispose(); this.lampSpillMat.dispose();
     if (this.neonMat) this.neonMat.dispose();

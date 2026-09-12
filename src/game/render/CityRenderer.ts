@@ -4,11 +4,11 @@ import type { Building, CityData, Landmark, Lot } from '../city/CityData';
 import type { RoadGraph } from '../city/RoadGraph';
 import type { LanePos } from '../city/RoadGraph';
 import { CITY_MAX_X, CITY_MAX_Z, CURB_H, GRID_COLS, LANE_W, OCEAN_SIZE, OCEAN_X0, SIDEWALK_W } from '../city/CityConfig';
-import { SIGN_WORDS } from '../city/Palette';
+import { SHOP_WORDS, SIGN_WORDS } from '../city/Palette';
 import type { Materials } from './Materials';
 import { STYLES, TILE_M } from './Materials';
 import type { TextureFactory } from './TextureFactory';
-import { GLOW_U, MARK_UV } from './TextureFactory';
+import { GLOW_U, MARK_UV, ROOF_V } from './TextureFactory';
 import { BAND, BASE_WALL_Y, FACE, FacadeCellList, GeoBuilder, appendBuilding, appendBuildingDetail, appendStreetLevel, bandHeight, landmarkGeometries } from './BuildingGeometry';
 import type { FacadeKeepOut, WallSign } from './BuildingGeometry';
 import { Random } from '../core/Random';
@@ -38,6 +38,25 @@ export const STREET = {
 /** Flat quad on the XZ plane with UVs in meters / tile (u along X, v along Z) at height y. */
 function flatQuad(gb: GeoBuilder, x0: number, z0: number, x1: number, z1: number, y: number, tile: number): void {
   gb.quad(x0, y, z1, x1, y, z1, x1, y, z0, x0, y, z0, 0, 1, 0, x0 / tile, z1 / tile, x1 / tile, z1 / tile, x1 / tile, z0 / tile, x0 / tile, z0 / tile);
+}
+
+/**
+ * Up-facing horizontal annulus (a fountain's coping ring and the wet shelf under it) on the plain cell of the
+ * building atlas. Two triangles a segment, wound like GeoBuilder.cylinder's cap so it faces +Y.
+ *
+ * The plain cell is (0.25, ROOF_V), the same point GeoBuilder's own plainTarget samples: v = 1 sits exactly on the
+ * atlas' wrap seam, where a RepeatWrapping fetch blends the white plain strip with the ground-floor row at the other
+ * edge and speckles the ring. Constant UVs over the ring, so mip 0 is sampled and the speckle never averages out.
+ */
+function annulus(gb: GeoBuilder, cx: number, cz: number, rIn: number, rOut: number, y: number, segments: number, color: number): void {
+  gb.setColor(color);
+  const u = 0.25, v = ROOF_V;
+  for (let i = 0; i < segments; i++) {
+    const a0 = (i / segments) * Math.PI * 2, a1 = ((i + 1) / segments) * Math.PI * 2;
+    const c0 = Math.cos(a0), s0 = Math.sin(a0), c1 = Math.cos(a1), s1 = Math.sin(a1);
+    gb.quad(cx + c0 * rIn, y, cz + s0 * rIn, cx + c1 * rIn, y, cz + s1 * rIn, cx + c1 * rOut, y, cz + s1 * rOut, cx + c0 * rOut, y, cz + s0 * rOut,
+      0, 1, 0, u, v, u, v, u, v, u, v);
+  }
 }
 
 /** Curb box: textured top (meters / tile) + kerb-stone sides, from y0 to y1 (a block kerb by default). */
@@ -336,7 +355,14 @@ export class CityRenderer {
       const b = blocks[i];
       if (b.kind !== 'plaza') continue;
       const cx = (b.x0 + b.x1) / 2, cz = (b.z0 + b.z1) / 2, y = CITY_RENDER.blockY;
-      fountains.cylinder(cx, cz, 5, 5, y, y + 0.9, 20, 0xd0c8d8, false, 0x48a8d8, GLOW_U.cyan);
+      // Basin as a bowl, not a disc: a stone drum, a coping that oversails it by 0.3 m (the lip), the coping's top
+      // ring, a darker wet shelf tucked under its inner edge and the water surface sunk 5 cm below the shelf. The
+      // old basin was one capped drum, so a plaza fountain read as a cyan circle painted on the paving.
+      fountains.cylinder(cx, cz, 5, 5, y, y + 0.86, 20, 0xc4bcd0, false, null);
+      fountains.cylinder(cx, cz, 5.3, 5.3, y + 0.7, y + 0.9, 20, 0xdcd6e4, false, null);
+      annulus(fountains, cx, cz, 4.36, 5.3, y + 0.9, 20, 0xdcd6e4);
+      annulus(fountains, cx, cz, 3.85, 4.4, y + 0.84, 20, 0x6d7686);
+      fountains.cylinder(cx, cz, 3.92, 3.92, y + 0.6, y + 0.845, 20, 0x8fa0ac, false, 0x48a8d8, GLOW_U.cyan);
       fountains.cylinder(cx, cz, 0.9, 0.9, y + 0.9, y + 3.2, 10, 0xb8b0c0, false, null);
       fountains.cylinder(cx, cz, 2.2, 2.2, y + 3.2, y + 3.6, 12, 0xd0c8d8, false, 0x48a8d8, GLOW_U.cyan);
       fountains.cylinder(cx, cz, 0.5, 0.5, y + 3.6, y + 5.0, 8, 0xb8b0c0, false, 0xff7a00, GLOW_U.orange);
@@ -525,7 +551,7 @@ export class CityRenderer {
     // Big painted words on blank side walls: same atlas, picked by the detail pass's word index.
     for (let i = 0; i < this.wallSigns.length; i++) {
       const s = this.wallSigns[i];
-      const rect = atlas.rects.get(SIGN_WORDS[s.word % SIGN_WORDS.length]);
+      const rect = atlas.rects.get(SHOP_WORDS[s.word % SHOP_WORDS.length]);
       if (!rect) continue;
       const rx = Math.cos(s.yaw), rz = -Math.sin(s.yaw);
       const nx = Math.sin(s.yaw), nz = Math.cos(s.yaw);

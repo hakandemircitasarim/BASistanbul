@@ -9,7 +9,7 @@ import type { World } from '../world/World';
 import type { Transform } from '../core/Types';
 import { createTransform, lerpTransform } from '../core/Transform';
 import { BUDGET } from '../core/Budget';
-import { clamp, smoothstep } from '../core/math';
+import { clamp, damp, smoothstep } from '../core/math';
 import {
   PROFILE, RIM_FRAGMENT, armRings, bakeAO, block, fillAttr, fuse, hairCap, hand, headParts, legRings, makeRimUniforms,
   neckRings, nightFromHour, paintFn, ringAt, setRimNight, shoe, surface, torsoRings, tube, type Ring, type RimUniforms,
@@ -24,6 +24,8 @@ export const PED_RENDER = {
   kneeFold: 1.0, kneeSoft: 0.05, elbowRest: 0.25, elbowReach: 0.4, jointBlend: 0.05,
   /** Torso lean into the stride and the head's share of it. */
   lean: 0.05, leanStride: 0.03, headFollow: 0.5, glance: 0.22,
+  /** Damping of the cosmetic kerb height under a ped (rad/s), the player's own rate (PlayerRenderer.groundY). */
+  groundDamp: 14,
   radial: 10, headSegs: 12, headRings: 8, hairRows: 5,
 };
 
@@ -134,11 +136,14 @@ function headGeometry(): THREE.BufferGeometry {
 /** Leg pivoted at the hip, straight; the knee fold is the shader's (pedJoint below the knee); darker shoe. */
 function legGeometry(side: number): THREE.BufferGeometry {
   const R = PED_RENDER, s = R.scale, P = PROFILE;
-  const leg = tube(legRings(s), R.radial, false, false); // the shoe hides the ankle end
-  paintFn(leg, (_x, y, _z, out) => { const k = 0.84 + 0.16 * smoothstep(0.07, 0.5, y / s); out.setRGB(k, k, k); });
+  const leg = tube(legRings(s, side), R.radial, false, false); // the shoe hides the ankle end
+  paintFn(leg, (_x, y, _z, out) => { const k = 0.84 + 0.16 * smoothstep(0.1, 0.5, y / s); out.setRGB(k, k, k); });
   fillAttr(leg, 'absCol', 0);
   fillAttr(leg, 'partMask', V_ALL);
-  const g = fuse([leg, solid(shoe(s, 8), SHOE, V_ALL)]);
+  // Six-sided shoe: the crowd is the one part of the scene that pays its triangles 26 times over (and twice again in
+  // the shadow pass), and at the distance a ped is ever seen the facet count of a 25 cm shoe is not resolvable — the
+  // heel height is what reads. The player keeps ten sides.
+  const g = fuse([leg, solid(shoe(s, 6, -side * 0.020), SHOE, V_ALL)]);
   g.translate(side * P.hipX * s, 0, 0);
   bakeAO(g, s);
   g.translate(-side * P.hipX * s, -P.hipY * s, 0);
@@ -215,6 +220,17 @@ export class PedRenderer {
   private readonly unit = new THREE.Vector3(1, 1, 1);
   private readonly euler = new THREE.Euler(0, 0, 0, 'YXZ');
   private readonly color = new THREE.Color();
+  /**
+   * Smoothed cosmetic ground height per ped, slotted by `id % MAX_PEDS` with the owning id beside it.
+   *
+   * `groundYAt` is a step function - 0 on the carriageway, CURB_H on a block-plus-sidewalk rectangle - so a ped that
+   * steps off a kerb onto a crossing would otherwise jump 15 cm (8 % of its height) in a single frame, and one whose
+   * walk line runs along the rectangle's edge would oscillate. The player damps exactly this value for exactly this
+   * reason (PlayerRenderer.groundY); the crowd needs one damper each. The slot arrays are allocated once, so `sync`
+   * still allocates nothing; a ped taking over a slot from a despawned one snaps rather than damping in from it.
+   */
+  private readonly groundY = new Float32Array(BUDGET.MAX_PEDS);
+  private readonly groundOwner = new Int32Array(BUDGET.MAX_PEDS).fill(-1);
 
   constructor(scene: THREE.Scene) {
     this.scene = scene;
@@ -308,8 +324,9 @@ export class PedRenderer {
     return m;
   }
 
-  sync(world: World, alpha: number, camX: number, camZ: number): void {
+  sync(world: World, alpha: number, camX: number, camZ: number, frameDt: number): void {
     const R = PED_RENDER, P = PROFILE, s = R.scale;
+    const dt = Math.min(frameDt, 0.1);
     const list = world.pedList;
     const cap = BUDGET.MAX_PEDS;
     const clock = world.time.elapsed;
@@ -341,7 +358,16 @@ export class PedRenderer {
       const bob = lying ? 0 : R.bob * amp * (0.5 - 0.5 * Math.cos(p.animPhase * 2));
       this.euler.set(pitch, t.yaw, R.sway * swing);
       this.quat.setFromEuler(this.euler);
-      this.pos.set(t.x, t.y + lift + bob * sc * tall, t.z);
+      // Lifted onto the cosmetic ground like the contact shadow below: the simulation is one flat plane, the city's
+      // pavements stand CURB_H above it, so a ped placed at the raw simulation y is buried to the ankles in every
+      // sidewalk it walks along. Damped per ped (see `groundY`), like the player's own lift: the raw value is a
+      // 15 cm step at every kerb line and the crowd crosses one all the time.
+      const slot = p.id % cap;
+      const gRaw = groundYAt(t.x, t.z);
+      if (this.groundOwner[slot] !== p.id) { this.groundOwner[slot] = p.id; this.groundY[slot] = gRaw; }
+      else this.groundY[slot] = damp(this.groundY[slot], gRaw, R.groundDamp, dt);
+      const gy = this.groundY[slot];
+      this.pos.set(t.x, t.y + gy + lift + bob * sc * tall, t.z);
       this.scl.set(sc * wide, sc * tall, sc * wide);
       this.base.compose(this.pos, this.quat, this.scl);
       this.bodyVariant.setX(n, variant);
@@ -370,7 +396,7 @@ export class PedRenderer {
       if (sc > 0.01) {
         const r = lying ? R.shadowR * 1.7 : R.shadowR;
         const rz = lying ? R.shadowR * 0.75 : R.shadowR;
-        this.shadows.add(t.x, groundYAt(t.x, t.z) + R.shadowLift, t.z, r * wide, rz * wide, t.yaw, sc);
+        this.shadows.add(t.x, gy + R.shadowLift, t.z, r * wide, rz * wide, t.yaw, sc);
       }
       n++;
     }

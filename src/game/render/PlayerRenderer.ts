@@ -145,21 +145,24 @@ export function rounded(w: number, h: number, d: number, r: number, segs = 2): T
 }
 
 /**
- * Shoe as a rounded loaf: elliptical cross-sections from heel to toe (toe wider and lower), flat-ish sole, no box edges.
- * Origin at the ankle on the sole, toe toward +z; `s` scales the figure.
+ * Shoe as a rounded loaf: elliptical cross-sections from heel to toe (a tall heel, the widest section at the ball of
+ * the foot, closing down to the toe), flat-ish sole, no box edges. Origin at the ankle on the sole, toe toward +z;
+ * `s` scales the figure and `lean` shifts it across to follow the shin (legRings leans the shins inward).
+ *
+ * Five sections and a 10 cm heel, because the old four-section 7 cm one disappeared behind the calf from the angle
+ * the player is actually seen from: the leg ended in a blue tube with a dark spike under it instead of a foot.
+ * About 96 triangles a foot at radial 8.
  */
-export function shoe(s: number, radial: number): THREE.BufferGeometry {
+export function shoe(s: number, radial: number, lean = 0): THREE.BufferGeometry {
   const sec = [
-    { z: -0.09, rx: 0.052, ry: 0.036 }, { z: -0.03, rx: 0.064, ry: 0.046 }, { z: 0.06, rx: 0.068, ry: 0.04 }, { z: 0.15, rx: 0.052, ry: 0.024 },
+    { z: -0.10, rx: 0.054, ry: 0.052 }, { z: -0.05, rx: 0.066, ry: 0.058 }, { z: 0.03, rx: 0.072, ry: 0.052 },
+    { z: 0.12, rx: 0.066, ry: 0.036 }, { z: 0.19, rx: 0.046, ry: 0.020 },
   ];
-  const side = surface(sec.length, radial, true, false, (i, j, out) => {
-    const c = sec[i], a = ((j + 0.5) / radial) * Math.PI * 2;
-    out.set(c.rx * s * Math.sin(a), c.ry * s * (1 - Math.cos(a)) * 0.98, (c.z + 0.02) * s);
-  });
-  const cap = (k: number, flip: boolean): THREE.BufferGeometry => surface(2, radial, true, flip, (i, j, out) => {
-    const c = sec[k], a = ((j + 0.5) / radial) * Math.PI * 2, q = i === 0 ? 0 : 1;
-    out.set(c.rx * s * Math.sin(a) * q, c.ry * s * (1 - Math.cos(a) * q) * 0.98, (c.z + 0.02) * s);
-  });
+  const at = (c: { z: number; rx: number; ry: number }, a: number, q: number, out: THREE.Vector3): void => {
+    out.set(lean * s + c.rx * s * Math.sin(a) * q, c.ry * s * (1 - Math.cos(a) * q) * 0.98, (c.z + 0.02) * s);
+  };
+  const side = surface(sec.length, radial, true, false, (i, j, out) => at(sec[i], ((j + 0.5) / radial) * Math.PI * 2, 1, out));
+  const cap = (k: number, flip: boolean): THREE.BufferGeometry => surface(2, radial, true, flip, (i, j, out) => at(sec[k], ((j + 0.5) / radial) * Math.PI * 2, i === 0 ? 0 : 1, out));
   return fuseBare([side, cap(0, false), cap(sec.length - 1, true)]);
 }
 
@@ -268,8 +271,12 @@ export function ringAt(rings: Ring[], y: number, out: Ring): Ring {
  */
 export const PROFILE = {
   hipY: 0.86, crotchY: 0.74, kneeY: 0.47, shoulderY: 1.40, shoulderX: 0.222, elbowY: 1.14, neckY: 1.50,
-  headCY: 1.665, headRX: 0.113, headRY: 0.135, headRZ: 0.123, jawK: 0.8, hipX: 0.11,
-  beltLo: 0.86, beltHi: 0.90, collarY: 1.464, sleeveY: 1.253,
+  headCY: 1.665, headRX: 0.113, headRY: 0.135, headRZ: 0.123, jawK: 0.8,
+  // Hip half separation. At 0.11 the two thighs (rx 0.098 at the top) left 2.4 cm between them, which at any distance
+  // past a couple of metres closes up: the figure read as one blue column with a seam down it. 0.124 opens a real
+  // 5 cm gap at the thigh, and legRings leans the shins back inward so the stance stays narrow at the ankle.
+  hipX: 0.124,
+  beltLo: 0.86, beltHi: 0.90, collarY: 1.44, sleeveY: 1.253,
 } as const;
 
 function scaled(rings: Ring[], s: number): Ring[] {
@@ -289,11 +296,13 @@ export function torsoRings(s: number): Ring[] {
     { y: 1.20, rx: 0.215, rz: 0.142, z: 0.006 },
     { y: 1.30, rx: 0.23, rz: 0.138 },
     { y: 1.385, rx: 0.25, rz: 0.13, z: -0.006 },
-    { y: 1.425, rx: 0.215, rz: 0.115 },
-    { y: 1.45, rx: 0.14, rz: 0.095 },
-    { y: 1.462, rx: 0.105, rz: 0.085 },
-    { y: 1.466, rx: 0.09, rz: 0.078 },
-    { y: 1.50, rx: 0.082, rz: 0.072 },
+    { y: 1.425, rx: 0.212, rz: 0.114 },
+    { y: 1.442, rx: 0.135, rz: 0.093 },
+    // The collar closes 4 cm lower than it used to (1.476 instead of 1.50): the jaw sits at ~1.53, so the old shirt
+    // left 3 cm of neck and the head read as bolted straight onto the shoulders. Six centimetres is a neck.
+    { y: 1.452, rx: 0.098, rz: 0.082 },
+    { y: 1.456, rx: 0.084, rz: 0.074 },
+    { y: 1.476, rx: 0.077, rz: 0.068 },
   ], s);
 }
 
@@ -301,15 +310,17 @@ export function torsoRings(s: number): Ring[] {
  * Arm hanging straight down, centred on x = 0 (translate to the shoulder); the sleeve ends just above the elbow.
  * `side` is the sign of the shoulder x the arm goes to: the deltoid leans inward and the top ring sits inside the
  * torso's trapezius slope, so the sleeve top is buried in the shoulder instead of standing proud of it.
+ * The forearm swells at the belly just under the elbow and closes to a 3 cm wrist — the old arm ran at a near
+ * constant 4.5 cm from elbow to hand, which is the straight tube with a blob on the end the critic saw.
  */
 export function armRings(s: number, side = 1): Ring[] {
   const inw = -side;
   return scaled([
-    { y: 0.79, rx: 0.035, rz: 0.025 },
-    { y: 0.84, rx: 0.046, rz: 0.03 },
-    { y: 0.90, rx: 0.042, rz: 0.028 },
-    { y: 0.92, rx: 0.038, rz: 0.036 },
-    { y: 1.03, rx: 0.048, rz: 0.046 },
+    { y: 0.79, rx: 0.029, rz: 0.022 },
+    { y: 0.86, rx: 0.036, rz: 0.029 },
+    { y: 0.94, rx: 0.044, rz: 0.038 },
+    { y: 1.00, rx: 0.050, rz: 0.045 },
+    { y: 1.06, rx: 0.051, rz: 0.048 },
     { y: 1.14, rx: 0.05, rz: 0.05 },
     { y: 1.25, rx: 0.052, rz: 0.05 },
     { y: 1.255, rx: 0.06, rz: 0.058 },
@@ -353,7 +364,7 @@ export function bakeAO(g: THREE.BufferGeometry, s: number): THREE.BufferGeometry
     let ao = 1;
     ao *= pocket(x, y, z, -0.215 * s, 1.33 * s, 0, 0.11 * s, 0.24); // armpits
     ao *= pocket(x, y, z, 0.215 * s, 1.33 * s, 0, 0.11 * s, 0.24);
-    ao *= pocket(x, y, z, 0, 0.76 * s, 0, 0.13 * s, 0.22); // between the thighs
+    ao *= pocket(x, y, z, 0, 0.76 * s, 0, 0.17 * s, 0.30); // between the thighs (wider now that the legs are apart)
     ao *= pocket(x, y, z, 0, 1.51 * s, 0.02 * s, 0.1 * s, 0.22); // under the chin
     ao *= 1 - 0.14 * smoothstep(1.44 * s, 1.5 * s, y) * (1 - smoothstep(1.52 * s, 1.58 * s, y)); // inside the collar
     // Hair line: skin just below the cap edge (fringe over the brow, deeper at the temples and the nape).
@@ -370,24 +381,36 @@ export function bakeAO(g: THREE.BufferGeometry, s: number): THREE.BufferGeometry
   return g;
 }
 
-/** Leg centred on x = 0 (translate to the hip): thigh, knee pinch, calf swell, ankle. */
-export function legRings(s: number): Ring[] {
+/**
+ * Leg centred on x = 0 (translate to the hip by `side` * PROFILE.hipX): thigh, knee pinch, calf swell, ankle. The
+ * shin leans back in toward the centre line (`inw`), so the wider hips open a gap at the thigh without splaying the
+ * feet: a stance, not a compass. The ankle ends at 0.10 rather than 0.07, where the shoe now takes over.
+ */
+export function legRings(s: number, side = 1): Ring[] {
+  const inw = -side;
   return scaled([
-    { y: 0.07, rx: 0.048, rz: 0.054 },
-    { y: 0.14, rx: 0.052, rz: 0.058 },
-    { y: 0.28, rx: 0.068, rz: 0.076 },
-    { y: 0.40, rx: 0.076, rz: 0.086 },
-    { y: 0.47, rx: 0.074, rz: 0.08 },
-    { y: 0.54, rx: 0.08, rz: 0.088 },
-    { y: 0.66, rx: 0.092, rz: 0.102 },
-    { y: 0.78, rx: 0.1, rz: 0.112 },
+    { y: 0.10, rx: 0.045, rz: 0.052, x: inw * 0.020 },
+    { y: 0.16, rx: 0.050, rz: 0.056, x: inw * 0.019 },
+    { y: 0.28, rx: 0.066, rz: 0.076, x: inw * 0.017 },
+    { y: 0.40, rx: 0.074, rz: 0.086, x: inw * 0.015 },
+    { y: 0.47, rx: 0.072, rz: 0.080, x: inw * 0.013 },
+    { y: 0.54, rx: 0.078, rz: 0.088, x: inw * 0.011 },
+    { y: 0.66, rx: 0.090, rz: 0.102, x: inw * 0.007 },
+    { y: 0.78, rx: 0.098, rz: 0.112, x: inw * 0.002 },
     { y: 0.87, rx: 0.098, rz: 0.108 },
   ], s);
 }
 
-/** Neck stub from inside the skull down into the collar. */
+/**
+ * Neck: a short column from inside the collar (1.425, under the shirt's new top ring) up into the skull, pinched at
+ * the throat and flaring into the trapezius at the base, so the six centimetres of it that now show below the jaw
+ * read as a neck and not as a peg.
+ */
 export function neckRings(s: number): Ring[] {
-  return scaled([{ y: 1.46, rx: 0.062, rz: 0.06 }, { y: 1.53, rx: 0.058, rz: 0.056 }, { y: 1.6, rx: 0.064, rz: 0.062 }], s);
+  return scaled([
+    { y: 1.425, rx: 0.080, rz: 0.074 }, { y: 1.47, rx: 0.062, rz: 0.059 },
+    { y: 1.53, rx: 0.057, rz: 0.055 }, { y: 1.6, rx: 0.064, rz: 0.062 },
+  ], s);
 }
 
 export type HeadRole = 'skin' | 'hair' | 'eye' | 'brow';
@@ -499,12 +522,13 @@ function playerGeometry(): THREE.BufferGeometry {
     });
     arm.translate(side * P.shoulderX, 0, 0);
     parts.push(skin(arm, side < 0 ? SH_L : SH_R, side < 0 ? EL_L : EL_R, 1.19, 1.09));
-    const leg = paintFn(tube(legRings(1), RADIAL, false, true), (_x, y, _z, out) => {
-      out.setHex(JEANS).multiplyScalar(0.86 + 0.14 * smoothstep(0.07, 0.5, y));
+    const leg = paintFn(tube(legRings(1, side), RADIAL, false, true), (_x, y, _z, out) => {
+      out.setHex(JEANS).multiplyScalar(0.86 + 0.14 * smoothstep(0.1, 0.5, y));
     });
     leg.translate(side * P.hipX, 0, 0);
     parts.push(skin(leg, side < 0 ? HIP_L : HIP_R, side < 0 ? KNEE_L : KNEE_R, 0.52, 0.42));
-    const foot = paint(shoe(1, 10), SHOE);
+    // The shoe carries the shin's inward lean, so it stands under the ankle rather than beside it.
+    const foot = paint(shoe(1, 10, -side * 0.020), SHOE);
     foot.translate(side * P.hipX, 0, 0);
     parts.push(skin(foot, side < 0 ? KNEE_L : KNEE_R, side < 0 ? KNEE_L : KNEE_R, 0, 0));
   }
@@ -525,6 +549,15 @@ export class PlayerRenderer {
   private airPose = 0;
   private time = 0;
   // Idle head look-around: a new target yaw/pitch every few seconds, eased toward.
+  /**
+   * Smoothed height of the cosmetic ground under the figure. The simulation runs on one flat plane (player.curr.y is
+   * 0 on the pavement and on the road alike) while the city's pavements are modelled CURB_H above it, so a character
+   * placed straight at the simulation y stands 15 cm INSIDE every sidewalk: the shoes and the bottom of the shins are
+   * buried, which is why the player had "a thin dark spike instead of feet" — the only thing above the paving was the
+   * toe. The contact shadow already used groundYAt for exactly this reason; the mesh now does too, eased over ~0.1 s
+   * so stepping off a kerb does not snap the whole figure.
+   */
+  private groundY = NaN;
   private lookTimer = 2.5;
   private lookTargetY = 0;
   private lookTargetX = 0;
@@ -586,7 +619,9 @@ export class PlayerRenderer {
     const dt = Math.min(frameDt, 0.1);
     this.time += dt;
     const sc = Math.max(0.01, p.spawnFade);
-    g.position.set(this.interp.x, this.interp.y, this.interp.z);
+    const gy = groundYAt(this.interp.x, this.interp.z);
+    this.groundY = Number.isNaN(this.groundY) ? gy : damp(this.groundY, gy, 14, dt);
+    g.position.set(this.interp.x, this.interp.y + this.groundY, this.interp.z);
     g.rotation.y = this.interp.yaw;
     g.scale.set(sc, sc, sc);
     setRimNight(this.rim, nightFromHour(world.time.hour));

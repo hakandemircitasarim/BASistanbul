@@ -23,7 +23,12 @@ class FoliageAwareGTAOPass extends GTAOPass {
       const anyObj = o as THREE.Object3D & { isPoints?: boolean; isLine?: boolean; isLine2?: boolean; material?: THREE.Material | THREE.Material[] };
       let skip = !!(anyObj.isPoints || anyObj.isLine || anyObj.isLine2);
       const m = anyObj.material;
-      if (!skip && m && !Array.isArray(m)) skip = m.transparent || m.alphaTest > 0 || m.alphaToCoverage;
+      // `foliage` (the solid crowns, cypresses, hedges and far palm LODs) joins them for the same reason: it is a
+      // stand-in for a mass of leaves with gaps in it, not a solid body. As an occluder its crossed leaf cards and
+      // lobe bellies read as sealed pockets, and the pass multiplies the composed pixel, so a fringe card came out at
+      // rgb(4,4,4) — a flat black quad hanging off the crown, from every angle that put a card over the mass. Trees
+      // still darken the ground under them through the shadow map, which is where that reads as shadow anyway.
+      if (!skip && m && !Array.isArray(m)) skip = m.transparent || m.alphaTest > 0 || m.alphaToCoverage || m.name === 'foliage';
       if (skip) { o.visible = false; cache.push(o); }
     });
   }

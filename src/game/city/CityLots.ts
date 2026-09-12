@@ -2,7 +2,7 @@
 // lot furnishing (static parked cars, kerb islands, planters, street-edge hedges) once the gameplay spots are placed,
 // followed by the street dressing (CityProps.furnishStreets). Track A.
 import { BLOCK } from './CityConfig';
-import { NEONS, SIGN_WORDS, pickStyle } from './Palette';
+import { NEONS, VENUE_WORDS, pickStyle } from './Palette';
 import type { Block, Building, Lot, NeonSign, ParkedSpec } from './CityData';
 import { addAabb, addLotProp, addParkedCar, addPropBox, blockIndex, districtOf, rectClear } from './CityBuild';
 import type { GenContext } from './CityBuild';
@@ -250,7 +250,7 @@ function makeSign(rng: { range(a: number, b: number): number; pick<T>(a: readonl
   if (w < 4) return null;
   const dir = FACING_DIR[b.facing];
   const off = (b.facing === 0 || b.facing === 2 ? b.d : b.w) / 2 + 0.15;
-  return { x: b.x + dir[0] * off, y: rng.range(6, b.h - 2), z: b.z + dir[1] * off, yaw: FACING_YAW[b.facing], text: rng.pick(SIGN_WORDS), color: rng.pick(NEONS), w, h: SIGN_H };
+  return { x: b.x + dir[0] * off, y: rng.range(6, b.h - 2), z: b.z + dir[1] * off, yaw: FACING_YAW[b.facing], text: rng.pick(VENUE_WORDS), color: rng.pick(NEONS), w, h: SIGN_H };
 }
 
 // ---------------------------------------------------------------------------------------------- lot furnishing

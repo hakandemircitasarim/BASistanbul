@@ -47,7 +47,27 @@ const SPAWN_SPOT_RADIUS = 40;
  * Sidewalk trees (downtown / suburb): an irregular pitch along a block edge (12-22 m, seeded), the first one 8-14 m
  * from the corner, offset from the block edge (0.7 m off the kerb, like the palms), scale 0.8-1.3 per tree.
  */
-const TREE = { pitchMin: 12, pitchMax: 22, first: 8, firstJitter: 6, offset: 2.3, r: 0.3, clear: 1.2, shelterClear: 4.5, scaleMin: 0.8, scaleMax: 1.3 } as const;
+const TREE = {
+  pitchMin: 12, pitchMax: 22, first: 8, firstJitter: 6, offset: 2.3, r: 0.3, clear: 1.2, shelterClear: 4.5,
+  scaleMin: 0.8, scaleMax: 1.3,
+  /**
+   * Horizontal reach of a scale-1 broad crown and the air left between that and the building line. A tree stands
+   * `offset` = 2.3 m outside the block edge and a building sits ~2 m inside it, so the tightest gap the generator
+   * produces is 4.30 m (measured over all 1346 trees; median 7.30) — and the widest crown at `scaleMax` fills it.
+   * The placement fits the crown to the gap, shrinking the tree toward `scaleMin` and dropping it only when even
+   * that will not fit (which the current street grid never needs).
+   *
+   * The reach is the worst case of CityRendererProps' `treeGeometry`, summed part by part — a hand-rounded guess is
+   * how this constant came out at 2.75, below every gap the generator can make, which made the rule dead code and
+   * the test that checks it vacuous:
+   *  - small lobe: centre out to 1.75, radius to 0.98, `crownLobe` wobble up to +14 %  -> 1.75 + 0.98 * 1.14 = 2.87
+   *  - big lobe: centre at lean * 1.25 <= 1.06, radius to 1.45, wobble up to +21 %     -> 1.06 + 1.45 * 1.21 = 2.82
+   *  - fringe card: centre at reach * 1.08 <= 2.86 plus half the card width (0.95 / 2) -> 3.34  (the widest)
+   */
+  crownR: 3.35, facadeGap: 0.4,
+} as const;
+/** Crown clearance contract of the sidewalk trees, exported for the placement test. */
+export const TREE_CLEAR = { crownR: TREE.crownR, facadeGap: TREE.facadeGap } as const;
 /**
  * Kerbside parking: cars stand on the pavement strip hard against the kerb (their road-side flank `kerbGap` off the
  * asphalt edge, i.e. wholly outside the outer lane), noses along the adjacent lane's direction of travel, in runs
@@ -379,10 +399,31 @@ export function addStreetTrees(ctx: GenContext, rng: Random): void {
         let nearShelter = false;
         for (let k = 0; k < shelters.length && !nearShelter; k++) nearShelter = Math.hypot(shelters[k].x - x, shelters[k].z - z) < TREE.shelterClear;
         if (nearShelter) continue;
-        addProp(ctx, 'tree', x, z, rng.range(0, Math.PI * 2), rng.range(TREE.scaleMin, TREE.scaleMax), TREE.r);
+        const yaw = rng.range(0, Math.PI * 2);
+        let scale = rng.range(TREE.scaleMin, TREE.scaleMax);
+        // Crown clearance against this block's building line (the trunk test above only clears 1.2 m, which is a
+        // trunk, not a crown). Shrink to fit; skip when even the smallest tree would push into the facade.
+        const fit = (treeBuildingGap(ctx, b, x, z) - TREE.facadeGap) / TREE.crownR;
+        if (fit < TREE.scaleMin) continue;
+        if (scale > fit) scale = fit;
+        addProp(ctx, 'tree', x, z, yaw, scale, TREE.r);
       }
     }
   }
+}
+
+/**
+ * Distance from (x, z) to the nearest building footprint of block `b` (Infinity when the block has none). The
+ * footprints are axis-aligned rectangles centred on the building, so this is the plain rectangle distance.
+ */
+function treeBuildingGap(ctx: GenContext, b: Block, x: number, z: number): number {
+  let best = Infinity;
+  for (let i = 0; i < b.buildings.length; i++) {
+    const g = ctx.buildings[b.buildings[i]];
+    const d2 = rectDist2(g.x - g.w / 2, g.z - g.d / 2, g.x + g.w / 2, g.z + g.d / 2, x, z);
+    if (d2 < best) best = d2;
+  }
+  return best === Infinity ? Infinity : Math.sqrt(best);
 }
 
 function pickKerbSpec(rng: Random): ParkedSpec {

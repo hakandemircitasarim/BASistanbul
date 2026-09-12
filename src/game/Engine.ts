@@ -473,7 +473,7 @@ export class Engine {
     if (this.cityRenderer) this.cityRenderer.update(t, nf, px, pz);
     if (this.vehicleRenderer) { this.vehicleRenderer.setNightFactor(nf); this.vehicleRenderer.sync(world, alpha, t, camX, camZ); }
     if (this.playerRenderer) this.playerRenderer.sync(world, alpha, frameDt);
-    if (this.pedRenderer) this.pedRenderer.sync(world, alpha, camX, camZ);
+    if (this.pedRenderer) this.pedRenderer.sync(world, alpha, camX, camZ, frameDt);
     if (this.markers) this.markers.update(world, t);
     if (this.effects) this.effects.update(world, alpha, frameDt);
     // Audio follows the player; engine/skid/wind fall silent outside 'playing'.

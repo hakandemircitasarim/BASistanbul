@@ -17,15 +17,25 @@ Ayrıntılı sözleşmeler: `docs/GAME_DESIGN.md` (bölüm 0 = temel kurallar, 2
 - Sabit adım 1/60 s, render interpolasyonu; `fixedUpdate` ve `sync` yollarında **tahsis yok**
   (modül seviyesinde scratch nesneler, `out` parametreleri, sayaç döndüren sorgular).
 - Yoğun nesneler `InstancedMesh`, statik şehir birleştirilmiş (merged) geometri.
-- Çizim çağrısı bütçesi: kare başına < 120 (öğlen ~101, alacakaranlık ~105, gece ~104), üçgen bütçesi öğlen ≤ ~720 bin
-  (ölçülen: öğlen ~669 bin, alacakaranlık ~696 bin, gece ~695 bin — `?autostart=1&hour=12|19|21&quality=high&noadapt=1`
-  doğuş karesi). Bu parantezler bir sonraki turun bütçe payıdır: görsel bir tur açtıktan sonra yeniden ölçülüp güncellenir.
+- Çizim çağrısı bütçesi: kare başına < 120, üçgen bütçesi ≤ 720 bin. **Bağlayıcı kare öğlen değil, alacakaranlık ve
+  gece**: doğuş karesinde (`?autostart=1&hour=12|19|21&quality=high&noadapt=1`, 1280×720) ölçülen tur 9 değerleri
+  öğlen 688,5 bin / 102 çizim, 19:00 714,3 bin / 106, 21:00 713,9 bin / 105 — yani 19:00'da tavanın altında ~5,7 bin
+  üçgen kalıyor. Bu sayılar ölçümdür, tahmin değil: tur 8 CLAUDE.md'ye 691/713/713 yazmıştı ama aynı komut 708/726/726
+  veriyordu, yani iki kare 6 bin üstündeydi ve bir tur boyunca öyle kaldı. **Görsel bir tur kapanmadan önce 12, 19 ve
+  21'i yeniden ölçüp bu satırı güncelle** (öğlen ölçmek yetmez; aradaki fark ~26 bin).
+  Doğuş karesi en pahalısıdır: aynı saatte 20 m batıya yürümek 696-704 bin, diğer yakın noktalar 415-465 bin ölçüyor.
+  Karenin en büyük kalemi 26 kişilik kalabalık (26 × 1.902 × 2 = 98,9 bin, yüzde 14); sıradaki ucuz kalemler ise
+  `MID_CARS.cap` (16 orta kabuk, gölge geçişinde araç başına ~1 bin üçgen) ve yayalara bir LOD.
 - Sahnede kalıcı olarak 3 `THREE.PointLight` (lamba havuzu, `LAMP_LIGHTS`) + 2 far SpotLight durur. Gündüz yoğunlukları
   0'dır ama sahneden çıkarılmazlar (çıkarmak `NUM_POINT_LIGHTS`'ı değiştirip tüm malzemeleri yeniden derler), yani öğlen
   de her aydınlatılan parça onları hesaplar: havuz bilerek küçük tutulur.
+- Gölge kutusu (`SKY_TUNING.shadowBox`, 132 m) gölge geçişinin döküm kümesidir: her metresi renk, GTAO ve gölge
+  geçişinde üç kez ödenir (150 m, alacakaranlık karesinde 120 m'ye göre ~9,5 bin üçgen demek). Kutunun sert basamaklı
+  kenarını `patchShadowEdgeFade` kapatır (dıştaki yüzde 10'da gölge terimi 1'e döner), kutuyu büyütmek değil.
 - Çok sayıda statik nesne (lamba, palmiye, mobilya, park kabukları, ağaç/çit) mesafeye göre paketlenir: `PropRenderer`
   malzeme başına tek `THREE.BatchedMesh` kullanır (`setVisibleAt` ile `PROP_RANGE` dışındakiler gizli) ve kamera 15 m
-  hareket edince yeniden paketler; `FacadeDetailRenderer` pencere çerçevesi/denizlik/balkon/klima birimlerini aynı
+  hareket edince yeniden paketler (park araçlarının iki kapaklı kademesi kendi 1,5 m'lik `CAR_TIER_MOVE` ritminde,
+  çünkü 8 m'lik yakın bant 15 m'lik ritimle atanamaz); `FacadeDetailRenderer` pencere çerçevesi/denizlik/balkon/klima birimlerini aynı
   şekilde ~55 m içinde tek BatchedMesh'te tutar. `WEBGL_multi_draw` gerekir.
 - Dinamik çözünürlük: `Renderer.adapt()` fps düşerse çizim tamponunu 0.65'e kadar küçültür
   (kullanıcının kalite ayarına dokunmaz); `?noadapt=1` ile kapatılır.

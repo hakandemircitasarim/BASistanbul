@@ -7,7 +7,7 @@ import { Random } from '../../src/game/core/Random';
 import { BLOCK, INTERSECTION_R, LANE_W, PITCH, ROAD_W, SIDEWALK_W } from '../../src/game/city/CityConfig';
 import { ASPHALT_HALF, colliderDistance, districtOf, onRoad } from '../../src/game/city/CityBuild';
 import { HEDGE, LOT_BAYS, lotLayout } from '../../src/game/city/CityLots';
-import { CAFE, CLUTTER_SPOT_CLEAR, DUMPSTER, POLE, ROADSIGN } from '../../src/game/city/CityProps';
+import { CAFE, CLUTTER_SPOT_CLEAR, DUMPSTER, POLE, ROADSIGN, TREE_CLEAR } from '../../src/game/city/CityProps';
 import type { Lot, ParkedCar } from '../../src/game/city/CityData';
 import { SPECS } from '../../src/game/entities/VehicleSpecs';
 import type { LanePos } from '../../src/game/city/RoadGraph';
@@ -494,7 +494,7 @@ test('street trees and lot hedges: placement, clearances, colliders', () => {
   expect(hedges.length >= 600 && hedges.length <= 3000, `600-3000 hedge units (got ${hedges.length})`);
   const circles = c.staticColliders.filter((k) => k.shape.kind === 'circle' && k.tag !== 'water' && k.tag !== 'boundary');
   const shelters = c.props.filter((p) => p.kind === 'shelter');
-  let downtown = 0;
+  let downtown = 0, fitted = 0;
   for (const t of trees) {
     const f = faceOffset(c, t.x, t.z);
     expect(f !== null, 'tree stands on a block face');
@@ -513,9 +513,25 @@ test('street trees and lot hedges: placement, clearances, colliders', () => {
       if (dd > 1e-6 && dd < nearest) nearest = dd; // skip its own collider (distance -r)
     }
     expect(nearest >= 1.2 - 1e-6, `tree keeps 1.2 m from the nearest collider (got ${nearest.toFixed(2)})`);
+    // Crown clearance: the whole point of scaling a tree down near a facade is that its crown (TREE.crownR at
+    // scale 1) never reaches the building line. Crowns pushing through walls and clipping shopfront bands was the
+    // fault this test exists to catch.
+    let facade = Infinity;
+    for (const bg of c.buildings) {
+      const dx = Math.max(bg.x - bg.w / 2 - t.x, 0, t.x - (bg.x + bg.w / 2));
+      const dz = Math.max(bg.z - bg.d / 2 - t.z, 0, t.z - (bg.z + bg.d / 2));
+      facade = Math.min(facade, Math.hypot(dx, dz));
+    }
+    expect(facade >= TREE_CLEAR.crownR * t.scale + TREE_CLEAR.facadeGap - 1e-6,
+      `tree crown clears the building line (gap ${facade.toFixed(2)} m, crown ${(TREE_CLEAR.crownR * t.scale).toFixed(2)} m)`);
+    // ... and the rule has to actually BITE somewhere, or the assertion above certifies nothing: with crownR at 2.75
+    // the largest crown (2.75 * 1.3 + 0.4 = 3.98 m) fitted every gap the generator can make (the tightest is 4.30 m),
+    // so no tree was ever shrunk and the clearance was dead code that passed with 0.3 m of slack.
+    if (Math.abs(t.scale - (facade - TREE_CLEAR.facadeGap) / TREE_CLEAR.crownR) < 1e-9 && t.scale < 1.3 - 1e-9) fitted++;
     for (const h of shelters) expect(Math.hypot(h.x - t.x, h.z - t.z) >= 4.5, 'tree keeps 4.5 m from a bus shelter');
     expect(circles.some((k) => { const s = k.shape as { cx: number; cz: number; r: number }; return Math.abs(s.cx - t.x) < 1e-6 && Math.abs(s.cz - t.z) < 1e-6; }), 'tree has a circle collider');
   }
+  expect(fitted >= 20, `the crown-clearance rule shrinks the trees that stand close to a facade (got ${fitted} of ${trees.length})`);
   expect(downtown > 0 && downtown < trees.length, 'trees in both downtown and the suburbs');
   const lots = c.lots ?? [];
   const aabbs = c.staticColliders.filter((k) => k.tag === 'prop' && k.shape.kind === 'aabb');

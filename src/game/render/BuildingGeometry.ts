@@ -86,6 +86,16 @@ const PARAPET_AO = 0.66;
 const DOOR_RECESS = 1.2;
 /** Door leaf: proud of the recess back, inset from the door cell's jambs; the threshold step in front of it. */
 const DOOR_LEAF_OUT = 0.06, DOOR_LEAF_INSET = 0.1, DOOR_LEAF_H = 2.35, DOOR_STEP_H = 0.12, DOOR_STEP_D = 0.5;
+/**
+ * How far the painted shop interior sits BEHIND the fascia plane. The shopfront atlas paints the goods, the shelves
+ * and the floor on the same plane as the glass, so from a car the interior is a poster at the wrong perspective:
+ * pushing that plane back half a metre gives the head of the opening a real soffit, the bay lines real reveals (the
+ * arcade columns already stand on the wall line and simply run back to it) and the whole row parallax when you drive
+ * past. The door cell keeps its own, deeper DOOR_RECESS.
+ */
+const GLASS_RECESS = 0.45;
+/** Height (fraction of the glazing band) and depth of the display counter behind each shop window. */
+const COUNTER = { y: 0.34, front: 0.1, inset: 0.25 } as const;
 
 /** 32-bit integer hash (murmur3 finaliser) of a small integer key. */
 function hashU(n: number): number {
@@ -1242,7 +1252,7 @@ function keptOut(keep: FacadeKeepOut[] | null, face: number, s0: number, s1: num
 }
 
 /** Street-level band geometry constants: band heights come from the band textures, `out` is how far the band steps in front of the wall, `doorRecess` how far a shop door cell steps back. */
-export const BAND = { shopH: SHOP_BAND_H, shopTile: SHOP_TILE_W, shopOut: 0.16, plinthH: PLINTH_BAND_H, plinthTile: PLINTH_TILE_W, plinthOut: 0.34, doorRecess: DOOR_RECESS } as const;
+export const BAND = { shopH: SHOP_BAND_H, shopTile: SHOP_TILE_W, shopOut: 0.16, plinthH: PLINTH_BAND_H, plinthTile: PLINTH_TILE_W, plinthOut: 0.34, doorRecess: DOOR_RECESS, glassRecess: GLASS_RECESS } as const;
 
 const FACE_DIR: [number, number][] = [[0, 1], [1, 0], [0, -1], [-1, 0]];
 const FACE_YAW = [0, Math.PI / 2, Math.PI, -Math.PI / 2];
@@ -1346,6 +1356,18 @@ function revealQuad(gb: GeoBuilder, fr: FaceFrame, s: number, dIn: number, dOut:
   if (plus) { at(fr, s, dOut, y0, pA); at(fr, s, dIn, y0, pB); at(fr, s, dIn, y1, pC); at(fr, s, dOut, y1, pD); }
   else { at(fr, s, dIn, y0, pA); at(fr, s, dOut, y0, pB); at(fr, s, dOut, y1, pC); at(fr, s, dIn, y1, pD); }
   gb.texQuad(pA[0], pA[1], pA[2], pB[0], pB[1], pB[2], pC[0], pC[1], pC[2], pD[0], pD[1], pD[2], u, v, u, v, u, v, u, v);
+}
+
+/**
+ * Horizontal quad of a street band facing DOWN (a recess soffit) or UP (a display counter top): s0..s1 along the
+ * frame, between plane offsets dIn (further into the building) and dOut, at height y. Samples the atlas' plain cell.
+ */
+function flatBandQuad(gb: GeoBuilder, fr: FaceFrame, s0: number, s1: number, dIn: number, dOut: number, y: number, up: boolean, color: number): void {
+  gb.setColor(color);
+  const u = SHOP_PLAIN_UV.u, v = SHOP_PLAIN_UV.v;
+  at(fr, s0, dIn, y, pA); at(fr, s1, dIn, y, pB); at(fr, s1, dOut, y, pC); at(fr, s0, dOut, y, pD);
+  if (up) gb.texQuad(pD[0], pD[1], pD[2], pC[0], pC[1], pC[2], pB[0], pB[1], pB[2], pA[0], pA[1], pA[2], u, v, u, v, u, v, u, v);
+  else gb.texQuad(pA[0], pA[1], pA[2], pB[0], pB[1], pB[2], pC[0], pC[1], pC[2], pD[0], pD[1], pD[2], u, v, u, v, u, v, u, v);
 }
 
 /**
@@ -1521,6 +1543,11 @@ export function appendStreetLevel(styleGb: GeoBuilder, bandGb: GeoBuilder, b: Bu
   const yF = h * (SHOP_FASCIA_Y / SHOP_BAND_H);
   const col = darken(cap, 0.9), cw = ARCADE.colW, yTop = h - 0.3;
   const revealCol = darken(tint, 0.5);
+  // The glazing plane runs GLASS_RECESS behind the fascia plane on street faces, and the painted interior on it is
+  // dimmed a quarter: it is half a metre deeper into the building and under its own soffit, so it must not read at
+  // the same brightness as the sunlit fascia above it.
+  const interiorCol = darken(tint, 0.74);
+  const counterCol = darken(tint, 0.46);
   const front = rec + out;
   const rowV = 1 / SHOP_ROWS, fasciaV = (SHOP_FASCIA_Y / SHOP_BAND_H) * rowV;
   // Fabric in open air over the door: the ground occlusion ramp does not apply to it.
@@ -1551,6 +1578,10 @@ export function appendStreetLevel(styleGb: GeoBuilder, bandGb: GeoBuilder, b: Bu
       continue;
     }
     const stride = BAY_STRIDES[hashU(key * 7 + 9) % BAY_STRIDES.length];
+    // Head of the recess: one quad for the whole run, from the recessed glazing plane forward to the fascia plane.
+    // Without it the strip between the fascia foot and the glazing head is an open slot showing sky from any eye
+    // height under the fascia. One quad a run, not a bay - the run recesses as a whole.
+    flatBandQuad(bandGb, fr, 0, fr.len, -GLASS_RECESS, 0, yF, false, revealCol);
     for (let j = 0; j < nBays; j++) {
       const k = (start + j * stride) % SHOP_BAYS.length, bay = SHOP_BAYS[k], row = k >> 2, colI = k & 3;
       const s0 = j * pitch, s1 = s0 + pitch;
@@ -1558,15 +1589,24 @@ export function appendStreetLevel(styleGb: GeoBuilder, bandGb: GeoBuilder, b: Bu
       const uAt = (s: number): number => uB0 + (s - s0) / scale / SHOP_TILE_W;
       const vG0 = (SHOP_ROWS - 1 - row) * rowV, vF0 = vG0 + fasciaV, vT = vG0 + rowV;
       const hv = hashU(b.id * 131 + i * 977 + j * 17 + k);
+      // Widest run of glazing in the bay (the door cell splits it): where the display counter goes.
+      let gL = s0, gR = s1;
       if (bay.door >= 0) {
         const dL = s0 + bay.door * scale, dR = dL + SHOP_DOOR_W * scale;
-        bandQuad(bandGb, fr, s0, dL, 0, 0, yF, uAt(s0), uAt(dL), vG0, vF0, tint);
-        bandQuad(bandGb, fr, dL, dR, -DOOR_RECESS, 0, yF, uAt(dL), uAt(dR), vG0, vF0, tint);
-        bandQuad(bandGb, fr, dR, s1, 0, 0, yF, uAt(dR), uAt(s1), vG0, vF0, tint);
-        revealQuad(bandGb, fr, dL, -DOOR_RECESS, 0, 0, yF, true, revealCol);
-        revealQuad(bandGb, fr, dR, -DOOR_RECESS, 0, 0, yF, false, revealCol);
+        bandQuad(bandGb, fr, s0, dL, -GLASS_RECESS, 0, yF, uAt(s0), uAt(dL), vG0, vF0, interiorCol);
+        bandQuad(bandGb, fr, dL, dR, -DOOR_RECESS, 0, yF, uAt(dL), uAt(dR), vG0, vF0, interiorCol);
+        bandQuad(bandGb, fr, dR, s1, -GLASS_RECESS, 0, yF, uAt(dR), uAt(s1), vG0, vF0, interiorCol);
+        revealQuad(bandGb, fr, dL, -DOOR_RECESS, -GLASS_RECESS, 0, yF, true, revealCol);
+        revealQuad(bandGb, fr, dR, -DOOR_RECESS, -GLASS_RECESS, 0, yF, false, revealCol);
         doorLeaf(bandGb, fr, dL, dR, yF, uAt, vG0, vF0, tint, revealCol);
-      } else bandQuad(bandGb, fr, s0, s1, 0, 0, yF, uAt(s0), uAt(s1), vG0, vF0, tint);
+        if (dL - s0 >= s1 - dR) gR = dL; else gL = dR;
+      } else bandQuad(bandGb, fr, s0, s1, -GLASS_RECESS, 0, yF, uAt(s0), uAt(s1), vG0, vF0, interiorCol);
+      // Display counter: one horizontal plate across the widest glazing run, from the interior plane almost out to
+      // the glass. It is the only piece of the shop that is not on the painted plane, so it is what gives the row
+      // parallax as you drive past - two triangles a bay, and none behind a shutter or a vacant unit.
+      if (bay.kind !== 'shutter' && bay.kind !== 'vacant' && gR - gL > 1.2) {
+        flatBandQuad(bandGb, fr, gL + COUNTER.inset, gR - COUNTER.inset, -GLASS_RECESS, -COUNTER.front, yF * COUNTER.y, true, counterCol);
+      }
       // Fascia in one of the building's hues (the vacant panel keeps a faded neutral; a sign box never takes the
       // charcoal, whose dark letters would vanish on it).
       let fc = bay.sign === 'none' ? 0xd0cabc : pal[(hv >>> 20) % 3];
@@ -1582,11 +1622,13 @@ export function appendStreetLevel(styleGb: GeoBuilder, bandGb: GeoBuilder, b: Bu
     for (let j = 1; j < nBays; j++) {
       const s = j * pitch + shift;
       if (s < 1 || s > wfr.len - 1) continue;
-      faceBox(styleGb, wfr, s - cw / 2, s + cw / 2, 0, yTop, rec - 0.02, out, col, FACE.pz | FACE.px | FACE.nx, f);
+      faceBox(styleGb, wfr, s - cw / 2, s + cw / 2, 0, yTop, rec + GLASS_RECESS - 0.02, out, col, FACE.pz | FACE.px | FACE.nx, f);
     }
   }
   // A square pier on every corner that touches a street, from the pavement up into the cap.
-  for (let i = 0; i < ol.n; i++) if (ol.streetCorner(i, streetMask)) cornerColumn(styleGb, ol, i, rec + 0.1, out, yTop, col);
+  // The corner piers run back past the recessed glazing plane too: they are what closes the end of every run, where
+  // the band steps from GLASS_RECESS back to the wall of a face that sees no street. No extra quads, a fatter pier.
+  for (let i = 0; i < ol.n; i++) if (ol.streetCorner(i, streetMask)) cornerColumn(styleGb, ol, i, rec + GLASS_RECESS + 0.1, out, yTop, col);
   if (awningGb) awningGb.bakeAo = ao;
 }
 

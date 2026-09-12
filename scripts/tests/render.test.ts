@@ -168,8 +168,9 @@ test('BuildingGeometry: street level = 6 m bays with recessed doors and palette 
   appendStreetLevel(style, band, shop, rng, false, awning, 1);
   const bandLen = 16 - 2 * ARCADE.recess, nBays = Math.max(1, Math.round(bandLen / ARCADE.bay));
   expect(nBays === 3, `a 16 m face holds three ~5 m bays (got ${nBays})`);
-  // Street face: per bay glazing (split around the recessed door) + two reveals + a fascia + the doorway's leaf and step (3); the three hidden faces two quads each.
-  expect(band.vertexCount % 4 === 0 && band.vertexCount / 4 >= 3 * 2 + nBays * 2 && band.vertexCount / 4 <= 3 * 2 + nBays * 9, `shop band quads (got ${band.vertexCount / 4})`);
+  // Street face: one soffit for the whole run, then per bay glazing (split around the recessed door) + two reveals
+  // + a fascia + a display counter + the doorway's leaf and step (3); the three hidden faces two quads each.
+  expect(band.vertexCount % 4 === 0 && band.vertexCount / 4 >= 3 * 2 + 1 + nBays * 3 && band.vertexCount / 4 <= 3 * 2 + 1 + nBays * 10, `shop band quads (got ${band.vertexCount / 4})`);
   const bg = band.build();
   const [, maxY] = range(bg, 'position', 1);
   const [vMin, vMax] = range(bg, 'uv', 1);
@@ -177,6 +178,14 @@ test('BuildingGeometry: street level = 6 m bays with recessed doors and palette 
   approx(maxY, BAND.shopH, 1e-6, 'band height = SHOP_BAND_H');
   expect(vMin >= 0 && vMax <= 1, `band v inside the atlas (${vMin.toFixed(3)}..${vMax.toFixed(3)})`);
   approx(maxZ, 200 + 6 - ARCADE.recess, 1e-3, 'shop band recessed behind the wall line');
+  // The painted interior sits BAND.glassRecess further back again, with a soffit quad closing the head of that
+  // recess at the fascia line and a display counter inside it: that depth is what the shopfront row reads as glass.
+  const glassZ = 200 + 6 - ARCADE.recess - BAND.glassRecess;
+  expect(BAND.glassRecess >= 0.4 && BAND.glassRecess <= 0.6, `interior plane 0.4-0.6 m behind the glass (got ${BAND.glassRecess})`);
+  const yF = BAND.shopH * (SHOP_FASCIA_Y / BAND.shopH);
+  expect(countWhere(bg, (_x, y, z) => Math.abs(z - glassZ) < 1e-3 && y < yF + 1e-6) >= 8, 'glazing quads stand on the recessed interior plane');
+  expect(countWhere(bg, (_x, y, z) => Math.abs(y - yF) < 1e-6 && z > glassZ - 1e-3 && z < 200 + 6 - ARCADE.recess + 1e-3) >= 4, 'a soffit closes the head of the recess');
+  expect(countWhere(bg, (_x, y, z) => Math.abs(y - yF * 0.34) < 1e-6 && Math.abs(z - glassZ) < 1e-3) >= 2, 'a display counter stands on the interior plane');
   // Door cells step BAND.doorRecess (1.2 m) back on the street face, with reveal faces between, a door leaf 6 cm proud of the back and a threshold step.
   const doorZ = 200 + 6 - ARCADE.recess - BAND.doorRecess;
   expect(BAND.doorRecess >= 1.2 - 1e-9, `door recess is 1.2 m (got ${BAND.doorRecess})`);

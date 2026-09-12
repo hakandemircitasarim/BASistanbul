@@ -12,8 +12,14 @@ import type { Materials } from './Materials';
  * centre, inside the camera's far plane from anywhere in the city, and the fog does the rest.
  */
 const BACKDROP = {
-  foot: 120, rise: 90, fall: 150, skirtOut: 320, skirtIn: 60, cornerR: 160, step: 22,
-  hMin: 28, hMax: 125, groundY: -0.06, ground: 0x5a4e3c, hillFoot: 0x5e6650, hillRidge: 0x6f7a62,
+  // `foot` pulls the ridge in to 80 m outside the dirt plane (it was 120): from the world's north-west corner the
+  // old gap left a long run of flat tan ground before anything rose out of it. `skirtIn` is the length of the
+  // colour ramp from the dirt tone up into the hill foot - at 60 m perspective compressed it to a couple of pixels
+  // and the two colours met on a hard line; 200 m spreads it across the whole approach.
+  foot: 80, rise: 90, fall: 150, skirtOut: 900, skirtIn: 200, cornerR: 160, step: 22,
+  // hillFoot is now half way between the dirt colour and the ridge green, so the ground GROWS into the hills
+  // instead of butting against them.
+  hMin: 28, hMax: 125, groundY: -0.06, ground: 0x5a4e3c, hillFoot: 0x5c5a46, hillRidge: 0x6f7a62,
 } as const;
 
 /** Seeded ridge profile: two octaves of sines, so the skyline rolls instead of repeating. */
@@ -55,25 +61,31 @@ function backdropGeometry(): THREE.BufferGeometry {
   const path = hillPath();
   const n = path.length;
   // Cross-section stations along the outward normal: offset, height factor (x ridge height), colour blend (0 foot, 1 ridge).
+  // `c` walks a three-stop ramp: 0 = the dirt plane's own colour, 1 = the hill foot, 2 = the ridge. Two of the
+  // stations exist only to carry the transition the world edge was missing - one half way across the approach
+  // (still flat, but already 40 % of the way from the ground tone to the foot) and one at the foot itself with a
+  // 4 % rise, so the hills leave the ground on a curve and a colour ramp instead of on a crease and a hue jump.
   const section = [
-    { d: -B.skirtIn, h: 0, c: 0, ground: true },
-    { d: 0, h: 0, c: 0, ground: false },
-    { d: B.rise * 0.45, h: 0.55, c: 0.5, ground: false },
-    { d: B.rise, h: 1, c: 1, ground: false },
-    { d: B.rise + B.fall * 0.5, h: 0.4, c: 0.6, ground: false },
-    { d: B.rise + B.fall, h: 0, c: 0.2, ground: false },
-    { d: B.skirtOut, h: 0, c: 0, ground: true },
+    { d: -B.skirtIn, h: 0, c: 0 },
+    { d: -B.skirtIn * 0.5, h: 0, c: 0.4 },
+    { d: 0, h: 0.04, c: 0.85 },
+    { d: B.rise * 0.45, h: 0.55, c: 1.5 },
+    { d: B.rise, h: 1, c: 2 },
+    { d: B.rise + B.fall * 0.5, h: 0.4, c: 1.6 },
+    { d: B.rise + B.fall, h: 0, c: 1.2 },
+    { d: B.skirtOut, h: 0, c: 0 },
   ];
   const m = section.length;
   const pos: number[] = [], col: number[] = [], idx: number[] = [];
   const ground = new THREE.Color(B.ground), foot = new THREE.Color(B.hillFoot), ridge = new THREE.Color(B.hillRidge), c = new THREE.Color();
+  const ramp = (t: number): THREE.Color => (t <= 1 ? c.lerpColors(ground, foot, t) : c.lerpColors(foot, ridge, t - 1));
   for (let i = 0; i < n; i++) {
     const p = path[i];
     const h = ridgeHeight(p.s);
     for (let k = 0; k < m; k++) {
       const st = section[k];
       pos.push(p.x + p.nx * st.d, B.groundY + h * st.h, p.z + p.nz * st.d);
-      if (st.ground) c.copy(ground); else c.lerpColors(foot, ridge, st.c);
+      ramp(st.c);
       col.push(c.r, c.g, c.b);
     }
   }

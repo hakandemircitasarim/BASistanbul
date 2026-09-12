@@ -117,6 +117,8 @@ function tint(c: number, k: number): string {
 
 export class TextureFactory {
   private readonly cache = new Map<string, THREE.Texture>();
+  /** Scratch canvases reused between textures (noise fields). Never uploaded, so they cost no GPU memory. */
+  private readonly scratch = new Map<string, HTMLCanvasElement>();
   private atlasRects: Map<string, AtlasRect> | null = null;
 
   private canvas(w: number, h: number): { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D } {
@@ -183,6 +185,61 @@ export class TextureFactory {
       for (let i = 0; i < added.length; i++) filled[added[i]] = 1;
     }
     ctx.putImageData(img, 0, 0);
+  }
+
+  /**
+   * Tiling greyscale value noise on a scratch canvas: `octaves` lattices starting at `lattice` cells across `size`
+   * px, each octave double the frequency and half the amplitude, remapped so the field averages mid grey and its
+   * extremes sit at 0.5 * (1 +- contrast). Drawn back over a flat colour field with globalCompositeOperation
+   * 'multiply' it is the difference between painted render and a single RGB fill - and because it lives on a scratch
+   * canvas that is never handed to THREE, it costs no texture memory at all.
+   */
+  private valueNoise(key: string, size: number, lattice: number, octaves: number, contrast: number, seed: number): HTMLCanvasElement {
+    const hit = this.scratch.get(key);
+    if (hit) return hit;
+    const { canvas, ctx } = this.canvas(size, size);
+    const img = ctx.createImageData(size, size);
+    const d = img.data;
+    const acc = new Float32Array(size * size);
+    const rng = new Random(seed);
+    let amp = 1, norm = 0;
+    for (let o = 0; o < octaves; o++) {
+      const L = lattice << o;
+      const g = new Float32Array(L * L);
+      for (let i = 0; i < L * L; i++) g[i] = rng.next();
+      const cell = size / L;
+      for (let y = 0; y < size; y++) {
+        const fy = y / cell, iy = Math.floor(fy), ty = fy - iy;
+        const sy = ty * ty * (3 - 2 * ty);
+        const y0 = ((iy % L) + L) % L, y1 = (y0 + 1) % L;
+        for (let x = 0; x < size; x++) {
+          const fx = x / cell, ix = Math.floor(fx), tx = fx - ix;
+          const sx = tx * tx * (3 - 2 * tx);
+          const x0 = ((ix % L) + L) % L, x1 = (x0 + 1) % L;
+          const a0 = g[y0 * L + x0], a1 = g[y0 * L + x1], b0 = g[y1 * L + x0], b1 = g[y1 * L + x1];
+          const a = a0 + (a1 - a0) * sx, b = b0 + (b1 - b0) * sx;
+          acc[y * size + x] += (a + (b - a) * sy) * amp;
+        }
+      }
+      norm += amp;
+      amp *= 0.5;
+    }
+    for (let i = 0; i < acc.length; i++) {
+      const t = acc[i] / norm;
+      const v = Math.max(0, Math.min(255, Math.round(255 * (1 - contrast + 2 * contrast * t))));
+      d[i * 4] = v; d[i * 4 + 1] = v; d[i * 4 + 2] = v; d[i * 4 + 3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+    this.scratch.set(key, canvas);
+    return canvas;
+  }
+
+  /** Multiplies a tiling value-noise field over `w` x `h` design px of a canvas, one noise tile every `span` px. */
+  private valueWash(ctx: CanvasRenderingContext2D, w: number, h: number, noise: HTMLCanvasElement, span: number): void {
+    ctx.save();
+    ctx.globalCompositeOperation = 'multiply';
+    for (let y = 0; y < h; y += span) for (let x = 0; x < w; x += span) ctx.drawImage(noise, x, y, span, span);
+    ctx.restore();
   }
 
   private noise(ctx: CanvasRenderingContext2D, w: number, h: number, rng: Random, count: number, size: number, alpha: number, light: boolean): void {
@@ -529,10 +586,14 @@ export class TextureFactory {
     const wall = style === 'glass' ? 0x9fb4c8 : style === 'concrete' ? 0xb8b8b4 : style === 'artdeco' ? 0xd8d0c0 : style === 'neon' ? 0xe8e0e8 : 0xd4cfc4;
     m.ctx.fillStyle = hex(wall);
     m.ctx.fillRect(0, 0, W, H);
-    // Render: two scales of soft patch, both far larger than a pane, and nothing finer. The plaster grain that gives
-    // the wall surface at 12 m is a tiling detail normal (Materials.detailNormal), never albedo noise.
+    // Render: two scales of soft patch, both far larger than a pane...
     this.mottle(m.ctx, W, H, rng, 8, 520, 900, 0.05, 0, 0, true);
     this.mottle(m.ctx, W, H, rng, 16, 220, 420, 0.045, 0, 0, true);
+    // ...then the plaster itself: a tiling value-noise field MULTIPLIED into the wall colour, its coarsest lattice
+    // 4 m across and its finest 1 m. Finer than the mottle, far coarser than a pane, and value only - it is what
+    // stops the wall above the shopfront band from reading as one flat RGB fill at 12 m. The 256 px field is a
+    // scratch canvas (no texture memory); the matching relief still comes from Materials.detailNormal.
+    this.valueWash(m.ctx, W, H, this.valueNoise('plaster', 256, 4, 3, 0.18, 907), W);
     e.ctx.fillStyle = '#000';
     e.ctx.fillRect(0, 0, W, H);
     r.ctx.fillStyle = rgh(0.92);
@@ -540,6 +601,14 @@ export class TextureFactory {
     const cols = 4, rows = 8;
     const top = ROOF_STRIP_PX * (H / WINDOW_TILE_PX_H);
     const cw = W / cols, rh = (H - top) / rows;
+    // Parapet wash: everything the coping sheds runs down the top of the wall. Drawn before the cells so the glazing
+    // and the frames stay clean, and only over the first 0.6 of a floor - a building's tile starts at its roofline.
+    const capWash = m.ctx.createLinearGradient(0, top, 0, top + rh * 0.6);
+    capWash.addColorStop(0, rgba(58, 52, 43, 0.28));
+    capWash.addColorStop(0.3, rgba(58, 52, 43, 0.11));
+    capWash.addColorStop(1, rgba(58, 52, 43, 0));
+    m.ctx.fillStyle = capWash;
+    m.ctx.fillRect(0, top, W, rh * 0.6);
     // Colour-temperature banding every 3-4 floors (a change of contractor, a later extension), faint and broad.
     const bandRows = 3 + (seed % 2);
     for (let row = 0; row < rows; row++) {
@@ -647,8 +716,16 @@ export class TextureFactory {
     plinth.addColorStop(1, rgba(56, 50, 42, 0));
     m.ctx.fillStyle = plinth;
     m.ctx.fillRect(0, H - rh * 0.75, W, rh * 0.75);
-    // Panes are not all one slate: a cool north light, a warm reflected one and a neutral, dealt per cell.
-    const PANE_TINTS = ['#5c728c', '#5a6d80', '#6b7484', '#55708e', '#66707e'];
+    // Panes are not all one slate: a cool north light, a warm reflected one, a neutral, and three noticeably paler
+    // sheets (an older single glazing, a net curtain behind the whole pane, a room painted white). Dealt per cell.
+    const PANE_TINTS = ['#5c728c', '#5a6d80', '#6b7484', '#55708e', '#66707e', '#7d8a9c', '#8b94a0', '#6f8399'];
+    /** Per-cell hash: the pane's own brightness / warmth jitter and its curtain draw, independent of its variant. */
+    const cellHash = (row: number, c: number): number => {
+      let x = (row * 73856093) ^ (c * 19349663) ^ (seed * 83492791);
+      x = Math.imul(x ^ (x >>> 15), 0x2c1b3c6d);
+      x = Math.imul(x ^ (x >>> 12), 0x297a2d39);
+      return (x ^ (x >>> 15)) >>> 0;
+    };
     for (let row = 0; row < rows; row++) {
       const y0 = top + row * rh;
       const ground = row === rows - 1;
@@ -702,6 +779,16 @@ export class TextureFactory {
         }
         m.ctx.fillStyle = rowLum > 0 ? rgba(255, 255, 255, rowLum) : rgba(0, 0, 0, -rowLum);
         m.ctx.fillRect(gx, gy, gw, gh);
+        // Per-pane jitter on top of the row drift: brightness first (a fifth of the panes are clearly paler than
+        // their neighbours, a fifth clearly darker), then a warm / cool cast. Eight identical navy quads a floor is
+        // exactly what makes a facade read as a repeated texture rather than as forty different flats.
+        const ch = cellHash(row, c);
+        const lum = ((ch & 255) / 255 - 0.5) * 0.42;
+        m.ctx.fillStyle = lum > 0 ? rgba(255, 255, 255, lum) : rgba(10, 14, 22, -lum);
+        m.ctx.fillRect(gx, gy, gw, gh);
+        const warm = (((ch >>> 8) & 255) / 255 - 0.5) * 0.2;
+        m.ctx.fillStyle = warm > 0 ? rgba(255, 216, 168, warm) : rgba(168, 200, 245, -warm);
+        m.ctx.fillRect(gx, gy, gw, gh);
         // What is behind the glass, as flat fields.
         const blinds = behind === 0 || (style === 'glass' && behind === 1);
         let blindH = 0, curtainX = -1, curtainW = 0;
@@ -753,11 +840,22 @@ export class TextureFactory {
           e.ctx.fillStyle = rgba(0, 0, 0, 0.6);
           e.ctx.fillRect(sx0, gy, sw, gh);
         }
-        // Sky on the glass: light at the head, dark at the foot, one soft gradient (strong on the curtain wall).
+        // A net curtain drawn across part of the pane on a quarter of the cells that do not already carry blinds or
+        // a curtain pair: one more thing that differs from opening to opening at 12 m.
+        if (!blinds && behind !== 1 && ((ch >>> 16) & 3) === 0) {
+          const nw = gw * (0.26 + 0.22 * (((ch >>> 18) & 3) / 3));
+          m.ctx.fillStyle = rgba(238, 236, 228, 0.5);
+          m.ctx.fillRect(((ch >>> 20) & 1) === 0 ? gx : gx + gw - nw, gy, nw, gh);
+        }
+        // Sky IN the glass, not just a highlight on it: the curtain wall's trick (a cool sky wash at the head that
+        // falls to a dark street reflection at the foot) applied to the punched styles as well. Without it a
+        // residential pane is an opaque navy quad under a noon sky, which is the one thing real glazing never is.
+        const skyA = style === 'glass' ? 0.15 : 0.3;
         const grad = m.ctx.createLinearGradient(0, gy, 0, gy + gh);
-        grad.addColorStop(0, rgba(255, 255, 255, style === 'glass' ? 0.14 : 0.09));
-        grad.addColorStop(0.5, rgba(255, 255, 255, 0));
-        grad.addColorStop(1, rgba(0, 0, 0, 0.08));
+        grad.addColorStop(0, rgba(208, 234, 250, skyA));
+        grad.addColorStop(0.42, rgba(198, 226, 246, skyA * 0.28));
+        grad.addColorStop(0.58, rgba(46, 58, 72, 0.02));
+        grad.addColorStop(1, rgba(26, 36, 48, 0.17));
         m.ctx.fillStyle = grad;
         m.ctx.fillRect(gx, gy, gw, gh);
         // Glazing is glass whatever sits behind it, and far smoother than the render around it: that split (0.15 on
@@ -818,6 +916,21 @@ export class TextureFactory {
         if (!ground && style !== 'glass') {
           const sy = gy + gh + 14;
           sillStreaks(gx - fpx - 6, sy, gw + 2 * fpx + 12, Math.min(rh * 0.72, y0 + rh - sy - 4), variant);
+        }
+      }
+      // One continuous wash across the whole tile under the row's sill line, under the per-opening streaks above:
+      // a floor of sills sheds rain as a band, and that band is what separates one storey from the next on a wall
+      // that has no other horizontal event. Faint (the streaks carry the detail), and never on the ground row.
+      if (!ground && style !== 'glass' && style !== 'neon') {
+        const sy = y0 + (cell.wy + cell.wh) * rh + 14;
+        const len = Math.min(rh * 0.55, y0 + rh - sy - 2);
+        if (len > 8) {
+          const band = m.ctx.createLinearGradient(0, sy, 0, sy + len);
+          band.addColorStop(0, rgba(74, 67, 56, 0.13));
+          band.addColorStop(0.4, rgba(74, 67, 56, 0.05));
+          band.addColorStop(1, rgba(74, 67, 56, 0));
+          m.ctx.fillStyle = band;
+          m.ctx.fillRect(0, sy, W, len);
         }
       }
     }
@@ -1527,10 +1640,15 @@ export class TextureFactory {
         m.ctx.globalAlpha = 0.78;
         m.ctx.drawImage(scene.canvas, gx0, gy0, gx1 - gx0, gy1 - gy0, gx0, gy0, gx1 - gx0, gy1 - gy0);
         m.ctx.globalAlpha = 1;
+        // What the glass itself shows: sky down to a horizon a little above eye level, then the dark street and the
+        // building opposite below it. The step at 0.46 is that horizon - it is the single strongest cue that a shop
+        // window is glazed rather than a lit poster, and the geometry now sits GLASS_RECESS behind this layer.
         const refl = m.ctx.createLinearGradient(0, gy0, 0, gy1);
-        refl.addColorStop(0, rgba(200, 228, 244, 0.28));
-        refl.addColorStop(0.4, rgba(200, 228, 244, 0.04));
-        refl.addColorStop(1, rgba(20, 30, 40, 0.16));
+        refl.addColorStop(0, rgba(198, 226, 246, 0.42));
+        refl.addColorStop(0.34, rgba(198, 226, 246, 0.2));
+        refl.addColorStop(0.46, rgba(186, 206, 222, 0.16));
+        refl.addColorStop(0.5, rgba(34, 44, 56, 0.12));
+        refl.addColorStop(1, rgba(18, 26, 36, 0.22));
         m.ctx.fillStyle = refl;
         m.ctx.fillRect(gx0, gy0, gx1 - gx0, gy1 - gy0);
         m.ctx.save();
@@ -2079,6 +2197,11 @@ export class TextureFactory {
     ctx.fillStyle = '#2e2c29';
     ctx.fillRect(0, 0, S, S);
     this.mottle(ctx, S, S, rng, 26, 90 * k, 240 * k, 0.045, 0, 0, true);
+    // Coarse patch field: a tiling value-noise wash whose coarsest cell is half the tile (7 m on the road) and whose
+    // finest is under 2 m, multiplied into the bitumen. Large-scale tonal variation ONLY - fine grain and aggregate
+    // specks on tarmac read as video static from a moving car, which is why round 6 took them out; but a surface
+    // that has been dug up, patched and re-laid in different decades is the one thing a flat blue-grey plate is not.
+    this.valueWash(ctx, S, S, this.valueNoise('bitumen', 256, 2, 3, 0.2, 613), S);
     if (r) {
       r.fillStyle = grey(1);
       r.fillRect(0, 0, S, S);
@@ -2136,6 +2259,25 @@ export class TextureFactory {
     this.asphalt(ctx, r, S, rng);
     const px = S / ROAD_TILE_M;
     const cx = S / 2;
+    // Cross-section of a used carriageway, as two wide gradients across u and nothing finer: the gutters hold grit
+    // and shade, the two running lanes are scuffed pale by tyres, and the crown under the centre line - which
+    // nothing drives on - stays dark. Symmetric, so the tile still meets itself at the kerb line.
+    const across = (stops: [number, number][], light: boolean): void => {
+      const g = ctx.createLinearGradient(0, 0, S, 0);
+      for (const [t, a] of stops) g.addColorStop(t, light ? rgba(228, 226, 214, a) : rgba(0, 0, 0, a));
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, S, S);
+    };
+    across([[0, 0.17], [0.11, 0.05], [0.3, 0], [0.44, 0.035], [0.56, 0.035], [0.7, 0], [0.89, 0.05], [1, 0.17]], false);
+    across([[0, 0], [0.13, 0], [0.26, 0.075], [0.36, 0.05], [0.47, 0], [0.53, 0], [0.64, 0.05], [0.74, 0.075], [0.87, 0], [1, 0]], true);
+    // One transverse reinstatement across the whole width: a service trench refilled a shade off the surrounding
+    // bitumen, with a hard seam line along each of its edges. Spans u, so the tile still wraps sideways.
+    const ty = rng.range(0.12, 0.62) * S, th = rng.range(0.9, 1.7) * px;
+    ctx.fillStyle = rgba(38, 40, 44, 0.32);
+    ctx.fillRect(0, ty, S, th);
+    ctx.fillStyle = rgba(10, 10, 12, 0.5);
+    ctx.fillRect(0, ty - 1.5 * k, S, 3 * k);
+    ctx.fillRect(0, ty + th - 1.5 * k, S, 3 * k);
     // Darker wheel paths, 1 m wide and soft: the one bit of wear a road needs to read as driven along.
     ctx.fillStyle = rgba(0, 0, 0, 0.07);
     for (const off of [-5.4, -1.9, 1.9, 5.4]) ctx.fillRect(cx + off * px - 0.5 * px, 0, 1.0 * px, S);
@@ -2568,51 +2710,88 @@ export class TextureFactory {
     return this.finish(key, canvas, true);
   }
 
-  /** Decorative plaza paving (8 m tile, diagonal pattern). */
+  /**
+   * Plaza paving (8 m tile, 512 px = 64 px/m): 2 m slabs built the way sidewalk() builds its 2 x 1 m ones, because
+   * that is the tile the critic singled out as working. A cement base carrying a broad mottle, a sandy grain, a
+   * scatter of aggregate and a 3 x 3 blur; then per slab a tone AND a colour-temperature jitter (pours from
+   * different days), a scatter of darker replaced slabs and one granite inlay a tile; then the joints. The base
+   * value sits ~12 % under the old one - the old plaza blew out to near-white under a noon key and lost its joints.
+   */
   plaza(): THREE.CanvasTexture {
     const key = 'plaza';
     const c = this.cache.get(key) as THREE.CanvasTexture | undefined;
     if (c) return c;
-    const S = 256;
+    const S = 512, k = S / 256;
     const { canvas, ctx } = this.canvas(S, S);
     const rng = new Random(71);
-    const CELL = 64; // 2 m slabs on an 8 m tile
-    ctx.fillStyle = '#b0a9a6';
+    const CELL = S / 4; // 2 m slabs on an 8 m tile
+    ctx.fillStyle = '#918b87';
     ctx.fillRect(0, 0, S, S);
-    // Two slab tones laid in a check, then a per-slab tonal jitter so the pattern does not read as a chessboard.
+    // Cement: the sidewalk recipe at the plaza's own scale - broad mottle, fine sandy grain, sparse aggregate, blur.
+    this.mottle(ctx, S, S, rng, 34, 20 * k, 72 * k, 0.05, 0, 0, true);
+    this.grain(ctx, S, S, rng, 0.03, 0.25);
+    this.specks(ctx, S, S, rng, 520, 300, 1.5 * k);
+    this.blur3(ctx, S, S);
+    // Two slab tones laid in a check (their difference halved: the old pair read as a chessboard from 30 m), then a
+    // per-slab tone and warmth jitter twice as wide as the check itself, so the eye reads 16 slabs, not a pattern.
+    const granite = rng.int(0, 15);
     for (let j = 0; j < 4; j++) {
       for (let i = 0; i < 4; i++) {
-        ctx.fillStyle = (i + j) % 2 === 0 ? '#c2b6ad' : '#a89f9c';
-        ctx.fillRect(i * CELL, j * CELL, CELL, CELL);
-        const k = rng.range(-0.06, 0.07);
-        ctx.fillStyle = k > 0 ? rgba(255, 255, 255, k * 1.8) : rgba(0, 0, 0, -k * 1.8);
-        ctx.fillRect(i * CELL, j * CELL, CELL, CELL);
+        const x = i * CELL, y = j * CELL;
+        ctx.fillStyle = (i + j) % 2 === 0 ? '#979088' : '#918b88';
+        ctx.fillRect(x, y, CELL, CELL);
+        const lum = rng.range(-0.075, 0.075);
+        ctx.fillStyle = lum > 0 ? rgba(255, 255, 255, lum * 1.5) : rgba(0, 0, 0, -lum * 1.5);
+        ctx.fillRect(x, y, CELL, CELL);
+        const warm = rng.range(-1, 1);
+        ctx.fillStyle = warm > 0 ? rgba(255, 228, 194, warm * 0.07) : rgba(190, 206, 232, -warm * 0.07);
+        ctx.fillRect(x, y, CELL, CELL);
+        if (j * 4 + i === granite) {
+          // One flecked granite inlay a tile, a shade down from its neighbours - the plaza's equivalent of the
+          // pavement's special slabs. Deliberately gentle: a hard-contrast slab turns the paving into a chessboard.
+          ctx.fillStyle = rgba(66, 64, 66, 0.17);
+          ctx.fillRect(x, y, CELL, CELL);
+          for (let g = 0; g < 300; g++) { ctx.fillStyle = rgba(255, 255, 255, rng.range(0.03, 0.11)); ctx.fillRect(x + rng.range(0, CELL), y + rng.range(0, CELL), 2, 2); }
+        } else if (rng.chance(0.12)) {
+          ctx.fillStyle = rgba(56, 52, 48, 0.09);
+          ctx.fillRect(x, y, CELL, CELL);
+        }
+        // Chipped corner: a small spall with a lit lip, the one bit of relief a laid slab really has.
+        if (rng.chance(0.35)) {
+          const cxk = rng.chance(0.5) ? x : x + CELL, cyk = rng.chance(0.5) ? y : y + CELL;
+          const sx = cxk === x ? 1 : -1, sy = cyk === y ? 1 : -1;
+          const a = rng.range(4, 10) * k, b = rng.range(4, 10) * k;
+          ctx.fillStyle = rgba(255, 246, 232, 0.3);
+          ctx.beginPath(); ctx.moveTo(cxk, cyk); ctx.lineTo(cxk + sx * (a + k), cyk); ctx.lineTo(cxk, cyk + sy * (b + k)); ctx.closePath(); ctx.fill();
+          ctx.fillStyle = rgba(30, 26, 22, 0.34);
+          ctx.beginPath(); ctx.moveTo(cxk, cyk); ctx.lineTo(cxk + sx * a, cyk); ctx.lineTo(cxk + sx * a * 0.55, cyk + sy * b * 0.6); ctx.lineTo(cxk, cyk + sy * b); ctx.closePath(); ctx.fill();
+        }
       }
     }
-    this.mottle(ctx, S, S, rng, 24, 12, 40, 0.05, 1500, 0.03, true);
     // Joints: a dark line with a light lip on the far side, so the slabs read as laid rather than painted.
+    const jw = Math.round(2 * k);
     for (let i = 0; i < 4; i++) {
-      ctx.fillStyle = rgba(0, 0, 0, 0.28);
-      ctx.fillRect(0, i * CELL, S, 2);
-      ctx.fillRect(i * CELL, 0, 2, S);
-      ctx.fillStyle = rgba(255, 255, 255, 0.14);
-      ctx.fillRect(0, i * CELL + 2, S, 1);
-      ctx.fillRect(i * CELL + 2, 0, 1, S);
+      ctx.fillStyle = rgba(0, 0, 0, 0.3);
+      ctx.fillRect(0, i * CELL, S, jw);
+      ctx.fillRect(i * CELL, 0, jw, S);
+      ctx.fillStyle = rgba(255, 255, 255, 0.13);
+      ctx.fillRect(0, i * CELL + jw, S, 1);
+      ctx.fillRect(i * CELL + jw, 0, 1, S);
     }
     // Cracks running across a couple of slabs, and damp patches.
-    ctx.strokeStyle = rgba(0, 0, 0, 0.2);
-    ctx.lineWidth = 1;
-    for (let i = 0; i < 7; i++) {
+    ctx.strokeStyle = rgba(0, 0, 0, 0.11);
+    ctx.lineWidth = k;
+    for (let i = 0; i < 5; i++) {
       let x = rng.range(0, S), y = rng.range(0, S);
       ctx.beginPath();
       ctx.moveTo(x, y);
-      for (let k = 0; k < 5; k++) { x += rng.range(-16, 16); y += rng.range(-16, 16); ctx.lineTo(x, y); }
+      for (let q = 0; q < 5; q++) { x += rng.range(-16, 16) * k; y += rng.range(-16, 16) * k; ctx.lineTo(x, y); }
       ctx.stroke();
     }
-    for (let i = 0; i < 9; i++) {
-      const x = rng.range(0, S), y = rng.range(0, S), r = rng.range(10, 34);
+    for (let i = 0; i < 11; i++) {
+      const x = rng.range(0, S), y = rng.range(0, S), r = rng.range(10, 34) * k;
       const g = ctx.createRadialGradient(x, y, 0, x, y, r);
-      g.addColorStop(0, rgba(40, 36, 34, 0.09 + rng.next() * 0.06));
+      g.addColorStop(0, rgba(40, 36, 34, 0.08 + rng.next() * 0.06));
       g.addColorStop(1, rgba(0, 0, 0, 0));
       ctx.fillStyle = g;
       ctx.fillRect(x - r, y - r, r * 2, r * 2);

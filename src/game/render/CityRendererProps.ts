@@ -9,9 +9,10 @@
 // chamfered bollard, a slatted bench with cast-iron ends, a glazed shelter with a rounded roof, fronds that arch from
 // their base with a V midrib and a fibrous crown. Every part that shares a material lives in ONE THREE.BatchedMesh per
 // material (multi-draw): all the vertex-coloured furniture is a single draw call (+ one shadow draw), so is the
-// foliage (tree species, hedge variants, far palms), the coarse parked shells and the near ones (paint per instance
-// through the batch colour), the palm trunks and the alpha fronds. Only the lamp parts (three materials), the shelter
-// glass, the additive pool quads and the wire LineSegments keep their own mesh, so the prop pass is 11 meshes.
+// foliage (tree species, hedge variants, far palms), and so is each rung of the parked-car fidelity ladder — coarse
+// shells, mid shells and near lofts, paint per instance through the batch colour — plus the palm trunks and the alpha
+// fronds. Only the lamp parts (three materials), the shelter glass, the additive pool quads and the wire LineSegments
+// keep their own mesh, so the prop pass is 12 meshes.
 //
 // After dark the lamps closest to the camera also carry real THREE.PointLights (LAMP_LIGHTS): a small fixed pool
 // created once and re-aimed at the nearest heads every frame, so the asphalt's normal map and its damp night
@@ -25,8 +26,9 @@ import { HEDGE } from '../city/CityLots';
 import { SPECS } from '../entities/VehicleSpecs';
 import { Random } from '../core/Random';
 import type { Materials } from './Materials';
+import { LEAF_TILE_M } from './PropTextures';
 import { surface, tube, type Ring } from './PlayerRenderer';
-import { makeVehiclePaintMaterial, parkedNearGeometry, parkedShellGeometry } from './VehicleRenderer';
+import { makeVehiclePaintMaterial, parkedMidGeometry, parkedNearGeometry, parkedShellGeometry } from './VehicleRenderer';
 
 export const PROP_DIMS = { palmTrunkH: 6.4, palmFrondLen: 4.4, palmFrondW: 2.3, lampH: 6.5, lampArm: 1.4, poolRadius: 5.5 } as const;
 
@@ -99,6 +101,23 @@ function fuse(parts: THREE.BufferGeometry[]): THREE.BufferGeometry {
   const merged = mergeGeometries(parts, false);
   for (let i = 0; i < parts.length; i++) parts[i].dispose();
   return merged;
+}
+
+/**
+ * Marks how much of the leaf albedo a part of a foliage prop takes (the foliage material's shader multiplies its map
+ * in by this attribute, see Materials.leafMapMixPatch): 1 for leaves, 0 for bark.
+ *
+ * The whole foliage batch shares one material and one attribute set, so a tree's bark trunk and limbs, a cypress'
+ * bole and the far palm's trunk travel in the same geometry as the crowns — and a leaf map multiplied over them
+ * printed leaf ellipses on the bark and pulled a warm brown column toward moss green. This is the cheapest way to
+ * keep one draw call and still leave bark alone: one float a vertex, no second material, no second batch.
+ */
+function leafMixAttr(g: THREE.BufferGeometry, mix: number): THREE.BufferGeometry {
+  const n = g.attributes.position.count;
+  const a = new Float32Array(n);
+  if (mix !== 0) a.fill(mix);
+  g.setAttribute('leafMix', new THREE.BufferAttribute(a, 1));
+  return g;
 }
 
 const R = (y: number, r: number, x = 0, z = 0): Ring => ({ y, rx: r, rz: r, x, z });
@@ -578,6 +597,15 @@ function crownLobe(r: number, detail: 0 | 1, phase: number, amp: number, squash:
 /**
  * Leaf fringe: a spray of two crossed cards (with back faces, so it never disappears edge-on) hanging off the crown
  * silhouette at (ox, oy, oz). Breaks the ball outline into something leafy without an alpha map.
+ *
+ * The normal has to stay up-and-out of a point under the card (k = 1), and that is a constraint from the ambient
+ * occlusion pass, not from the shading: a crossed pair of doubled cards is four coincident thin planes, and GTAO
+ * orients its hemisphere by the normal buffer, so any normal tilted back toward the card's own face reads the
+ * partner card as an occluder at zero distance and crushes the pair to a flat BLACK hole in the crown (measured:
+ * occlusion 226/255 at k = 1, 107 at k = 0.5, 6 at k = 0 — with the frame going to rgb(4,4,4) at the last two, where
+ * no albedo can save it because the pass multiplies the composed pixel). Such a normal does take more sky than the
+ * lobe beside it; what keeps the fringe from reading as the pale mint shards of round 7 is the crown's own value ramp
+ * over the card in `treeGeometry`, which brings a sunlit card from 119/255 of green down to 69 against the lobe's 52.
  */
 function leafSpray(ox: number, oy: number, oz: number, w: number, h: number, yaw: number, tilt: number, hex: number): THREE.BufferGeometry {
   const cards: THREE.BufferGeometry[] = [];
@@ -595,8 +623,8 @@ function leafSpray(ox: number, oy: number, oz: number, w: number, h: number, yaw
     cards.push(p, flipFaces(p));
   }
   const g = fuse(cards);
-  // Both faces keep a canopy normal (out of a point below the crown axis), so a card never goes black edge-on the way
-  // a back face with a negated normal does.
+  // Both faces keep the same canopy normal, so a card never goes black edge-on the way a back face with a negated
+  // normal does, and the occlusion pass keeps reading the pair as open air rather than as a sealed pocket.
   canopyNormals(g, oy - 2.2, 1);
   return paint(g, hex);
 }
@@ -616,11 +644,59 @@ function flipFaces(src: THREE.BufferGeometry): THREE.BufferGeometry {
   return g;
 }
 
+const sU = new THREE.Vector3(), sV = new THREE.Vector3();
+
+/**
+ * Gives a solid-foliage part the leaf albedo's UVs and a per-facet value jitter, and is the last thing done to every
+ * geometry that goes into the foliage batch.
+ *
+ * UVs: a triplanar projection resolved PER FACE — the dominant axis of the face's own normal picks which two world
+ * axes become u and v, in metres over LEAF_TILE_M. That is enough for a texture with no direction to it (leaves), it
+ * needs no seams or unwrap on a wobbled icosahedron / lathed cone / lofted box, and because every vertex of a triangle
+ * gets the same axis pair the interpolation inside it is exact. World-space, so two neighbouring lobes of one crown
+ * never repeat the same patch of leaf.
+ *
+ * Jitter: +-`jit` on the whole facet's colour. The crowns are deliberately faceted (flat face normals), and a facet
+ * that differs from its neighbour in value as well as in shading is what turns a faceted ball into foliage.
+ *
+ * Converts to non-indexed first: per-face data needs per-face vertices, and everything else in the batch already is.
+ */
+function leafSurface(g: THREE.BufferGeometry, seed: number, jit = 0.06): THREE.BufferGeometry {
+  const src = g.index ? g.toNonIndexed() : g;
+  if (src !== g) g.dispose();
+  const pos = src.attributes.position;
+  const col = src.attributes.color as THREE.BufferAttribute | undefined;
+  const n = pos.count;
+  const uv = new Float32Array(n * 2);
+  const rng = new Random(seed);
+  const inv = 1 / LEAF_TILE_M;
+  for (let t = 0; t + 2 < n; t += 3) {
+    sU.set(pos.getX(t + 1) - pos.getX(t), pos.getY(t + 1) - pos.getY(t), pos.getZ(t + 1) - pos.getZ(t));
+    sV.set(pos.getX(t + 2) - pos.getX(t), pos.getY(t + 2) - pos.getY(t), pos.getZ(t + 2) - pos.getZ(t));
+    sU.cross(sV);
+    const ax = Math.abs(sU.x), ay = Math.abs(sU.y), az = Math.abs(sU.z);
+    const axis = ay >= ax && ay >= az ? 1 : ax >= az ? 0 : 2;
+    const k = jit > 0 ? 1 + rng.range(-jit, jit) : 1;
+    for (let c = 0; c < 3; c++) {
+      const i = t + c, x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+      uv[i * 2] = (axis === 0 ? z : x) * inv;
+      uv[i * 2 + 1] = (axis === 1 ? z : y) * inv;
+      if (col && k !== 1) col.setXYZ(i, col.getX(i) * k, col.getY(i) * k, col.getZ(i) * k);
+    }
+  }
+  src.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  // Anything that did not split itself into leaf and bark parts is all leaf.
+  if (!src.attributes.leafMix) leafMixAttr(src, 1);
+  return src;
+}
+
 /** Crown shading shared by both tree species: lit toward the top of the mass, dark at the foot and on the undersides. */
 function shadeCrown(g: THREE.BufferGeometry, yLo: number, yHi: number, lit: number, darkSpan: number): void {
   paint(g, FURN.crown);
   blendTo(g, FURN.crownLit, (_x, y) => Math.max(0, Math.min(1, (y - yLo) / Math.max(0.2, yHi - yLo) - 0.25)) * lit);
-  blendTo(g, FURN.crownDark, (_x, y) => Math.max(0, Math.min(1, 1 - (y - yLo) / darkSpan)) * 0.85);
+  // Squared over the bottom 30 % of the mass: the underside of a crown is nearly black, and a linear ramp over the
+  // whole lower half instead gave every lobe the same even wash.
+  blendTo(g, FURN.crownDark, (_x, y) => { const t = Math.max(0, Math.min(1, 1 - (y - yLo) / (darkSpan * 0.62))); return t * t * 0.92; });
   // Interior band: whatever faces down or inward goes darker still, so the crown has a shaded belly instead of one
   // flat top-lit gradient wrapped around a ball.
   const nrm = g.attributes.normal, col = g.attributes.color;
@@ -688,10 +764,18 @@ function treeGeometry(seed: number): THREE.BufferGeometry {
     for (let i = 0; i < lobes.length; i++) reach = Math.max(reach, Math.cos(a) * lobes[i][0] + Math.sin(a) * lobes[i][2] + lobes[i][3] * 0.92);
     const d = reach * rng.range(0.96, 1.08);
     const y = trunkH + rng.range(0.0, 1.5);
-    const card = leafSpray(Math.cos(a) * d, y, Math.sin(a) * d, rng.range(0.7, 1.1), rng.range(0.5, 0.8), a, rng.range(-0.6, 0.6), FURN.crown);
-    blendTo(card, FURN.crownLit, (_x, cy) => Math.max(0, Math.min(1, (cy - yLo) / Math.max(0.2, yHi - yLo) - 0.2)) * 0.3);
+    const card = leafSpray(Math.cos(a) * d, y, Math.sin(a) * d, rng.range(0.6, 0.95), rng.range(0.45, 0.7), a, rng.range(-0.6, 0.6), FURN.crown);
+    // Shaded by the crown's own ramp, not a flat lit tint: a card is a piece of the mass, so it carries the same
+    // top-lit / dark-bellied gradient as the lobes and never stands out as a lighter object against them. What is
+    // left over after that is not albedo and cannot be paid back with any: a card's normal has to point up and out
+    // (see leafSpray — the occlusion pass demands it), and an up-facing leaf normal under this rig mirrors the sky,
+    // so a sunlit card measures 69/255 of green against 52 for the lobe beside it and carries a faint cool cast.
+    // That reads as a leaf catching the sky, which is what it is; the pale mint shards of round 7 were 119.
+    shadeCrown(card, yLo, yHi, 0.5, 1.7);
     parts.push(card);
   }
+  // parts[0] is the trunk and parts[1..limbs] the fork limbs: bark, which the leaf map must not touch.
+  for (let i = 0; i < parts.length; i++) leafMixAttr(parts[i], i <= limbs ? 0 : 1);
   return fuse(parts);
 }
 
@@ -702,7 +786,8 @@ function treeGeometry(seed: number): THREE.BufferGeometry {
  * of needle shadow, not a balloon), a much darker green than the broad crowns, and a lit band only at the very top.
  * Twelve columns, not seven, and half the per-angle wobble: this species is a third of every sidewalk tree, and at
  * the 3 m a pavement is walked past at, seven facets around a deeply notched silhouette read as a folded green shard
- * rather than a tree. About 310 triangles, still the cheapest prop in the foliage batch.
+ * rather than a tree. The spire is built as three overlapping tiers (see below). About 310 triangles, still the
+ * cheapest prop in the foliage batch.
  */
 function cypressGeometry(seed: number): THREE.BufferGeometry {
   const rng = new Random(seed);
@@ -712,13 +797,23 @@ function cypressGeometry(seed: number): THREE.BufferGeometry {
   const lean = rng.range(-0.14, 0.14), leanZ = rng.range(-0.12, 0.12);
   const ripple = rng.range(0, Math.PI * 2);
   const rs = new Float32Array(rows), xs = new Float32Array(rows), zs = new Float32Array(rows);
+  // Three tiers of branch whorls stacked up the spire, each with its own girth. A cypress is not one smooth cone: it
+  // is a stack of overlapping skirts, widest where a tier starts and drawn in under the one above. The step at a tier
+  // boundary (widest foot right above the narrowest top) is the overlap, and it is what gives the silhouette its
+  // shoulders — the old single envelope with a sine ripple read as a folded green shard at 3 m.
+  const TIERS = 3;
+  const tierK = new Float32Array(TIERS);
+  for (let k = 0; k < TIERS; k++) tierK[k] = rng.range(0.93, 1.07);
   for (let i = 0; i < rows; i++) {
     const t = i / (rows - 1);
     // Envelope: columnar, full width from a fifth of the way up to three quarters, then drawn in to the tip — an
-    // Italian cypress is a spire, not a cone. The radius then breathes in and out over a period of ~2.6 stations, so
-    // the silhouette is softly irregular; a hard step every other station reads as a stack of gems, not a tree.
+    // Italian cypress is a spire, not a cone.
     const env = maxR * Math.pow(Math.min(1, Math.sin(Math.PI * (0.30 + 0.70 * t))), 0.4);
-    rs[i] = env * (1 - 0.13 * (0.5 + 0.5 * Math.sin(i * 2.4 + ripple))) * rng.range(0.93, 1.07);
+    const tf = Math.min(TIERS - 1e-4, t * TIERS);
+    const tier = Math.floor(tf), within = tf - tier;
+    // Full at the tier's foot, pinched to 0.82 under the next one, plus the old fine ripple on top of that.
+    const skirt = (1 - 0.18 * within) * tierK[tier];
+    rs[i] = env * skirt * (1 - 0.08 * (0.5 + 0.5 * Math.sin(i * 2.4 + ripple))) * rng.range(0.94, 1.06);
     xs[i] = lean * t * t * H * 0.3;
     zs[i] = leanZ * t * t * H * 0.3;
   }
@@ -741,7 +836,7 @@ function cypressGeometry(seed: number): THREE.BufferGeometry {
   }
   const trunk = lathe([R(0, 0.2), R(0.1, 0.16), R(bole + 0.3, 0.12)], 6, FURN.bark);
   blendTo(trunk, FURN.barkDark, (_x, y) => (y < 0.45 ? 1 - y / 0.45 : 0) * 0.85);
-  return fuse([body, trunk]);
+  return fuse([leafMixAttr(body, 1), leafMixAttr(trunk, 0)]);
 }
 
 /** Hedge profile, ground to ground over the clipped top: (u across in half-depths, v up in heights). */
@@ -786,7 +881,11 @@ function hedgeGeometry(seed: number): THREE.BufferGeometry {
   for (let i = 0; i < n; i++) {
     // The dip spans two neighbouring stations, so the top line sags into it instead of cutting a single sharp notch.
     const dip = i === dipA || i === dipB || i === dipA + 1 || i === dipB + 1 ? rng.range(0.84, 0.93) : 1;
-    hs[i] = h * rng.range(0.88, 1.1) * dip; ws[i] = hd * rng.range(0.88, 1.12); ls[i] = rng.range(-0.06, 0.06);
+    // Shear notch: every third station is clipped 4-8 cm lower than its neighbours. The wobble above is smooth enough
+    // that the top still read as one extruded tube from the pavement; a regular short-long-long rhythm gives the run
+    // the saw-tooth a hedge trimmer actually leaves.
+    const notch = i % 3 === 2 ? rng.range(0.04, 0.08) : 0;
+    hs[i] = h * rng.range(0.88, 1.1) * dip - notch; ws[i] = hd * rng.range(0.88, 1.12); ls[i] = rng.range(-0.06, 0.06);
     for (let j = 0; j < m; j++) noise[i * m + j] = HEDGE_PROFILE[j][1] > 0.6 ? rng.range(-0.07, 0.07) : 0;
   }
   const xy = new Float32Array(m * 2);
@@ -808,7 +907,9 @@ function hedgeGeometry(seed: number): THREE.BufferGeometry {
   const g = fuse([side, cap(0, -1), cap(n - 1, 1)]);
   paint(g, FURN.hedge);
   blendTo(g, FURN.hedgeLit, (_x, y) => Math.max(0, Math.min(1, (y - h * 0.4) / (h * 0.55))) * 0.85);
-  blendTo(g, FURN.hedgeDark, (_x, y) => Math.max(0, Math.min(1, 1 - y / (h * 0.42))) * 0.9);
+  // Bottom third: the deep shade inside a hedge. Squared, so the fall-off is concentrated in the last 30 % instead of
+  // washing halfway up the face — an evenly shaded green box is exactly what reads as untextured plastic.
+  blendTo(g, FURN.hedgeDark, (_x, y) => { const t = Math.max(0, Math.min(1, 1 - y / (h * 0.3))); return t * t * 0.95; });
   // Foot: the last 15 cm goes to bare shaded earth, so the run sits in the ground instead of floating on the pavement.
   blendTo(g, FURN.soil, (_x, y) => Math.max(0, Math.min(1, 1 - y / 0.15)) * 0.7);
   // A little per-vertex dapple so a long run does not read as one flat green.
@@ -846,6 +947,8 @@ function farPalmGeometry(seed: number): THREE.BufferGeometry {
     g.dispose();
     parts.push(bare(both));
   }
+  // parts[0] is the bark trunk; everything after it is a frond.
+  for (let i = 0; i < parts.length; i++) leafMixAttr(parts[i], i === 0 ? 0 : 1);
   return fuse(parts);
 }
 
@@ -876,13 +979,32 @@ export const PROP_RANGE = {
 } as const;
 
 /**
- * Static parked cars closer than `range` are drawn from the full body loft instead of the coarse shell — at 6 m a
- * shell with no lamps, pillars or arches sits next to a properly lofted player car and gives the whole street away.
- * The near loft is ~6x the shell's triangles, so the band is kept to the metres the critic was actually looking at:
- * at 16 m nine tenths of all street and lot positions have fewer neighbours than `cap`, so two cars side by side in
- * the same bay row practically never render at two fidelities. `cap` is a safety valve, not the rule.
+ * Fidelity ladder of the static parked cars. Three tiers, because one hand-over could not pay for itself: the full
+ * body loft is ~3.5k triangles and casts shadows, so widening ITS band to the 30 m a parked car is still readable at
+ * would cost the whole dusk triangle budget, while the coarse shell (~530 triangles, no arch cut, no pillars, no
+ * lamps) is what the eye catches out at anything closer.
+ *
+ * - `near` (<= 8 m, 3 of them): the player's own body loft, `parkedNearGeometry`. Three, not more: at ~3.5k
+ * triangles each (and again in the shadow pass) a fourth costs more than the whole mid band, and the fourth-nearest
+ * car inside 8 m falls back to the mid shell, which is exactly what the mid tier exists to make unremarkable.
+ * - `mid` (<= 32 m, 16 of them): `parkedMidGeometry`, ~900-1000 triangles — the coarse silhouette plus arch fenders,
+ *   greenhouse pillars, lamp cells and 12-sided shouldered tyres with an alloy face. This is the tier the street
+ *   actually renders at: at 8-32 m a kerbside car fills a good part of the frame.
+ * - far: the coarse shell for everything else out to PROP_RANGE.parked / .kerb.
+ *
+ * Both capped bands are BatchedMesh instances whose geometry, matrix and paint are reassigned on the repack, so the
+ * whole ladder is two draw calls (+ their shadow pass) no matter how many cars are in range.
  */
-const NEAR_CARS = { range: 16, cap: 8 } as const;
+const NEAR_CARS = { range: 8, cap: 3 } as const;
+const MID_CARS = { range: 32, cap: 16 } as const;
+/**
+ * How far the camera may travel before the two capped car bands are re-picked. Their own cadence, NOT the generic
+ * `PROP_RANGE.repackMove` of 15 m: the near band is 8 m wide, so on the generic cadence a car written into the mid
+ * batch while it was 12 m away stayed the mid shell all the way to touching distance, and `parkedNearGeometry` could
+ * never be seen doing its job. At 1.5 m every car closer than range - 1.5 m is guaranteed to be in its band, and the
+ * pick is allocation-free over at most `cap` instances (like `aimLampLights`, which runs per frame for this reason).
+ */
+const CAR_TIER_MOVE = 1.5;
 
 /**
  * Real lamp light: a fixed pool of point lights created once and re-aimed at the nearest lamp heads every frame, so
@@ -1009,8 +1131,8 @@ function foliageTint(rng: Random, hue: number, out: THREE.Color): THREE.Color {
 }
 
 /**
- * Builds and adds the prop meshes: five BatchedMeshes (furniture, foliage, parked shells, palm trunks, palm fronds)
- * and four InstancedMeshes (lamp pole / head / glow, shelter glass), 9 draws in all.
+ * Builds and adds the prop meshes: six BatchedMeshes (furniture, foliage, the three parked-car tiers, palm trunks and
+ * palm fronds) and four InstancedMeshes (lamp pole / head / glow, shelter glass), 10 draws in all.
  *
  * The city holds ~1300 lamps, ~500 palms and a few thousand cars, trees and hedges — drawing them all costs hundreds
  * of thousands of triangles per frame even when they are half a kilometre behind the camera. Instead the source
@@ -1046,10 +1168,21 @@ export class PropRenderer {
   private carCoarse = new Int32Array(0);
   private carCount = 0;
   private nearMesh: THREE.BatchedMesh | null = null;
+  private midMesh: THREE.BatchedMesh | null = null;
   private coarseMesh: THREE.BatchedMesh | null = null;
   private readonly nearGeo: number[] = [];
-  private readonly pickIdx = new Int32Array(Math.max(NEAR_CARS.cap, LAMP_LIGHTS.count));
-  private readonly pickD2 = new Float32Array(Math.max(NEAR_CARS.cap, LAMP_LIGHTS.count));
+  private readonly midGeo: number[] = [];
+  /** Car indices handed to the near tier this repack, so the mid tier skips them. */
+  private readonly nearPicked = new Int32Array(NEAR_CARS.cap);
+  private nearPickedN = 0;
+  /** Mid-band picks, kept so their coarse shells can be handed back when the band is re-picked. */
+  private readonly midPicked = new Int32Array(MID_CARS.cap);
+  private midPickedN = 0;
+  private tierX = Infinity;
+  private tierZ = Infinity;
+  private static readonly PICK_CAP = Math.max(NEAR_CARS.cap, MID_CARS.cap, LAMP_LIGHTS.count);
+  private readonly pickIdx = new Int32Array(PropRenderer.PICK_CAP);
+  private readonly pickD2 = new Float32Array(PropRenderer.PICK_CAP);
   /** Catenary wire spans and the line mesh they are packed into by range. */
   private spans: WireSpans | null = null;
   private wireMesh: THREE.LineSegments | null = null;
@@ -1084,10 +1217,14 @@ export class PropRenderer {
       utilityPoleGeometry(), roadSignGeometry(), dumpsterGeometry(), cafeTableGeometry(),
     ], materials.furniture, furnitureCount, true);
     const FG = { bench: 0, hydrant: 1, bin: 2, sign: 3, shelter: 4, bollard: 5, island: 6, planter: 7, pole: 8, roadsign: 9, dumpster: 10, table: 11 } as const;
-    const foliageGeos = [farPalmGeometry(PALM_SEEDS[0])];
-    for (let i = 0; i < TREE_SEEDS.length; i++) foliageGeos.push(treeGeometry(TREE_SEEDS[i]));
-    for (let i = 0; i < CYPRESS_SEEDS.length; i++) foliageGeos.push(cypressGeometry(CYPRESS_SEEDS[i]));
-    for (let i = 0; i < HEDGE_SEEDS.length; i++) foliageGeos.push(hedgeGeometry(HEDGE_SEEDS[i]));
+    // Every part of the foliage batch goes through leafSurface: the leaf albedo's UVs (the material carries the map),
+    // the per-facet value jitter and the `leafMix` mask that keeps the map and the translucency emissive off the bark
+    // these geometries also carry (trunks, limbs, boles - see leafMixAttr). The batch's attribute set comes from the
+    // first geometry, so this has to be all of them or none.
+    const foliageGeos = [leafSurface(farPalmGeometry(PALM_SEEDS[0]), PALM_SEEDS[0], 0.04)];
+    for (let i = 0; i < TREE_SEEDS.length; i++) foliageGeos.push(leafSurface(treeGeometry(TREE_SEEDS[i]), TREE_SEEDS[i]));
+    for (let i = 0; i < CYPRESS_SEEDS.length; i++) foliageGeos.push(leafSurface(cypressGeometry(CYPRESS_SEEDS[i]), CYPRESS_SEEDS[i]));
+    for (let i = 0; i < HEDGE_SEEDS.length; i++) foliageGeos.push(leafSurface(hedgeGeometry(HEDGE_SEEDS[i]), HEDGE_SEEDS[i]));
     // Far palms cast nothing on their own (past 60 m they never enter the shadow box); sharing the batch with the
     // trees and hedges means the odd one at the box corner does, which is harmless.
     const foliage = this.batch(scene, 'foliage', foliageGeos, materials.foliage, counts.palm + counts.tree + counts.hedge, true);
@@ -1105,8 +1242,16 @@ export class PropRenderer {
     for (let i = 0; i < PARKED_SPECS.length; i++) shells.push(parkedShellGeometry(SPECS[PARKED_SPECS[i]]));
     const parkedB = this.batch(scene, 'parked', shells, this.paintMat, parked.length, true);
     parkedB.mesh.receiveShadow = true;
-    // Near shells: the same three specs at the full body loft, in a batch that only ever holds NEAR_CARS.cap
-    // instances — repack reassigns their geometry, matrix and paint to whichever cars are closest.
+    // Mid and near shells: the same three specs at the mid and full body lofts, in batches that only ever hold
+    // MID_CARS.cap / NEAR_CARS.cap instances — repack reassigns their geometry, matrix and paint to whichever cars
+    // are closest, so the two extra fidelities cost two draw calls rather than one per car.
+    const midShells: THREE.BufferGeometry[] = [];
+    for (let i = 0; i < PARKED_SPECS.length; i++) midShells.push(parkedMidGeometry(SPECS[PARKED_SPECS[i]]));
+    const midB = this.batch(scene, 'parkedMid', midShells, this.paintMat, MID_CARS.cap, true);
+    midB.mesh.receiveShadow = true;
+    this.midMesh = midB.mesh;
+    for (let i = 0; i < midB.geo.length; i++) this.midGeo.push(midB.geo[i]);
+    for (let i = 0; i < MID_CARS.cap; i++) midB.mesh.setVisibleAt(midB.mesh.addInstance(midB.geo[0]), false);
     const nearShells: THREE.BufferGeometry[] = [];
     for (let i = 0; i < PARKED_SPECS.length; i++) nearShells.push(parkedNearGeometry(SPECS[PARKED_SPECS[i]]));
     const nearB = this.batch(scene, 'parkedNear', nearShells, this.paintMat, NEAR_CARS.cap, true);
@@ -1307,6 +1452,8 @@ export class PropRenderer {
     this.glowMat.opacity = n * GLOW_OPACITY;
     if (this.wireMat) this.wireMat.opacity = 0.85 - 0.35 * n;
     this.aimLampLights(camX, camZ, n);
+    const tdx = camX - this.tierX, tdz = camZ - this.tierZ;
+    if (tdx * tdx + tdz * tdz >= CAR_TIER_MOVE * CAR_TIER_MOVE) this.repackNearCars(camX, camZ);
     const dx = camX - this.lastX, dz = camZ - this.lastZ;
     if (dx * dx + dz * dz < PROP_RANGE.repackMove * PROP_RANGE.repackMove) return;
     this.repack(camX, camZ);
@@ -1383,29 +1530,57 @@ export class PropRenderer {
   }
 
   /**
-   * Hands the nearest few static parked cars to the full near loft and hides their coarse shells. Runs after the
-   * generic pass, which has already set every coarse shell's visibility from its own range.
+   * Writes one capped fidelity band: the `cap` nearest cars inside `range` are given their geometry, matrix and paint
+   * in `mesh` and their coarse shell is hidden. `skip`/`skipN` is the list of cars a closer band already took (the
+   * near band's picks, so the mid band does not draw the same car twice). Returns the number of cars written, which
+   * the caller keeps to pass down as the next band's skip list. No allocation.
    */
-  private repackNearCars(camX: number, camZ: number): void {
-    const near = this.nearMesh, coarse = this.coarseMesh;
-    if (!near || !coarse) return;
-    for (let k = 0; k < NEAR_CARS.cap; k++) near.setVisibleAt(k, false);
-    const r2 = NEAR_CARS.range * NEAR_CARS.range;
+  private fillCarTier(mesh: THREE.BatchedMesh, geo: number[], cap: number, range: number, camX: number, camZ: number,
+    skip: Int32Array, skipN: number, out: Int32Array | null): number {
+    const coarse = this.coarseMesh;
+    if (!coarse) return 0;
+    for (let k = 0; k < cap; k++) mesh.setVisibleAt(k, false);
+    const r2 = range * range;
     let picked = 0;
     for (let i = 0; i < this.carCount; i++) {
       const dx = this.carX[i] - camX, dz = this.carZ[i] - camZ;
       const d2 = dx * dx + dz * dz;
       if (d2 > r2) continue;
-      picked = PropRenderer.insertNearest(this.pickIdx, this.pickD2, picked, NEAR_CARS.cap, i, d2);
+      let taken = false;
+      for (let k = 0; k < skipN && !taken; k++) taken = skip[k] === i;
+      if (taken) continue;
+      picked = PropRenderer.insertNearest(this.pickIdx, this.pickD2, picked, cap, i, d2);
     }
     for (let k = 0; k < picked; k++) {
       const i = this.pickIdx[k];
-      near.setGeometryIdAt(k, this.nearGeo[this.carGeo[i]]);
-      near.setMatrixAt(k, placementMatrix(this.carX[i], this.carZ[i], this.carYaw[i], 1, this.carY[i]));
-      near.setColorAt(k, scratchColor.setHex(this.carColour[i]));
-      near.setVisibleAt(k, true);
+      mesh.setGeometryIdAt(k, geo[this.carGeo[i]]);
+      mesh.setMatrixAt(k, placementMatrix(this.carX[i], this.carZ[i], this.carYaw[i], 1, this.carY[i]));
+      mesh.setColorAt(k, scratchColor.setHex(this.carColour[i]));
+      mesh.setVisibleAt(k, true);
       coarse.setVisibleAt(this.carCoarse[i], false);
+      if (out) out[k] = i;
     }
+    return picked;
+  }
+
+  /**
+   * Hands the nearest static parked cars to the near loft and the next ring of them to the mid shell, hiding the
+   * coarse shell of every car either band took. Runs after the generic pass, which has already set every coarse
+   * shell's visibility from its own range. Near first, so its picks are the mid band's skip list.
+   */
+  private repackNearCars(camX: number, camZ: number): void {
+    const near = this.nearMesh, mid = this.midMesh, coarse = this.coarseMesh;
+    if (!near || !mid || !coarse) return;
+    this.tierX = camX;
+    this.tierZ = camZ;
+    // Hand every previous pick's coarse shell back first: this runs on its own 1.5 m cadence, so the generic pass
+    // (which sets coarse visibility from range) has usually NOT run since, and a car that has left a capped band
+    // would otherwise keep the hidden coarse shell it was given and vanish from the street. Every previous pick was
+    // within MID_CARS.range, i.e. well inside PROP_RANGE.parked / .kerb, so handing it back is always right.
+    for (let k = 0; k < this.nearPickedN; k++) coarse.setVisibleAt(this.carCoarse[this.nearPicked[k]], true);
+    for (let k = 0; k < this.midPickedN; k++) coarse.setVisibleAt(this.carCoarse[this.midPicked[k]], true);
+    this.nearPickedN = this.fillCarTier(near, this.nearGeo, NEAR_CARS.cap, NEAR_CARS.range, camX, camZ, this.nearPicked, 0, this.nearPicked);
+    this.midPickedN = this.fillCarTier(mid, this.midGeo, MID_CARS.cap, MID_CARS.range, camX, camZ, this.nearPicked, this.nearPickedN, this.midPicked);
   }
 
   /** Copies the wire spans within range into the line mesh's buffer and sets its draw range. */
