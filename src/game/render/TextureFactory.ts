@@ -13,6 +13,13 @@ export const WINDOW_TILE_PX_H = 1024;
 export const ROOF_STRIP_PX = 20;
 /** UV v of the plain strip center (used by roofs/landmark plain parts). */
 export const ROOF_V = 1 - ROOF_STRIP_PX / 2 / WINDOW_TILE_PX_H;
+/**
+ * Felt-roll band inside the plain strip. Everything plain samples the strip at a single point (u = 0.25 for wall trim,
+ * u = 0.5 for caps) and those stay flat white so the vertex colour shows exactly; the band above 0.56 carries painted
+ * roll seams and gravel tone, and a roof deck maps its longer plan axis across it (GeoBuilder.roofCap). A constant-UV
+ * quad has no UV derivative and always samples mip 0, so the two uses never bleed into each other.
+ */
+export const ROOF_SEAM_U = { u0: 0.56, u1: 0.98 } as const;
 /** UV u of a cell in the glow atlas (see glowAtlas()): cell 0 is non-emissive, the rest are night-glow colors. Glow parts use their own material. */
 export const GLOW_U = { none: 0.0625, magenta: 0.1875, cyan: 0.3125, yellow: 0.4375, orange: 0.5625, red: 0.6875, green: 0.8125, white: 0.9375 } as const;
 const GLOW_CELLS: number[] = [0x000000, 0xff2d95, 0x00e5ff, 0xfff03b, 0xff7a00, 0xff2418, 0x2bff6a, 0xf0f4ff];
@@ -516,14 +523,19 @@ export class TextureFactory {
     r.ctx.scale(0.25, 0.25);
     n.ctx.fillStyle = grey(0.5);
     n.ctx.fillRect(0, 0, W, H);
+    // Roughness map: three reads .g, so .r is free and carries the glazing mask (Materials lifts the sky probe on the
+    // panes and keeps the plaster detail normal off them). Everything painted into `r` goes through this.
+    const rgh = (rough: number, pane = 0): string => rgba(pane * 255, rough * 255, 0, 1);
     const wall = style === 'glass' ? 0x9fb4c8 : style === 'concrete' ? 0xb8b8b4 : style === 'artdeco' ? 0xd8d0c0 : style === 'neon' ? 0xe8e0e8 : 0xd4cfc4;
     m.ctx.fillStyle = hex(wall);
     m.ctx.fillRect(0, 0, W, H);
-    // Render: a few soft patches the size of a bay, and nothing finer.
-    this.mottle(m.ctx, W, H, rng, 16, 220, 420, 0.03, 0, 0, true);
+    // Render: two scales of soft patch, both far larger than a pane, and nothing finer. The plaster grain that gives
+    // the wall surface at 12 m is a tiling detail normal (Materials.detailNormal), never albedo noise.
+    this.mottle(m.ctx, W, H, rng, 8, 520, 900, 0.05, 0, 0, true);
+    this.mottle(m.ctx, W, H, rng, 16, 220, 420, 0.045, 0, 0, true);
     e.ctx.fillStyle = '#000';
     e.ctx.fillRect(0, 0, W, H);
-    r.ctx.fillStyle = grey(0.92);
+    r.ctx.fillStyle = rgh(0.92);
     r.ctx.fillRect(0, 0, W, H);
     const cols = 4, rows = 8;
     const top = ROOF_STRIP_PX * (H / WINDOW_TILE_PX_H);
@@ -541,7 +553,7 @@ export class TextureFactory {
         const x = c * cw;
         m.ctx.fillStyle = tint(wall, 0.2);
         m.ctx.fillRect(x - 22, top, 44, H - top);
-        r.ctx.fillStyle = grey(0.82);
+        r.ctx.fillStyle = rgh(0.82);
         r.ctx.fillRect(x - 22, top, 44, H - top);
         n.ctx.fillStyle = grey(0.62);
         n.ctx.fillRect(x - 22, top, 44, H - top);
@@ -557,7 +569,6 @@ export class TextureFactory {
     const cell = WINDOW_CELL[style], groundCell = WINDOW_CELL.ground;
     const fpx = WINDOW_CELL_FRAME_PX[style];
     // Punched windows are a slate that still reads as glass beside a light wall; the curtain wall bakes its own sky.
-    const glassBase = '#5c728c';
     // Bright on purpose: downtown vertex colours (0x3e4a5e, 0x4c5a6e) multiply these down to a slate by the time they are lit.
     const GLASS_TONES = ['#a8ccec', '#a4dadc', '#b8c4d0'];
     // Night colour temperatures: warm white, tungsten, cool fluorescent. Each seed favours one of them.
@@ -569,7 +580,7 @@ export class TextureFactory {
       m.ctx.fillRect(x, y, w, h);
       e.ctx.fillStyle = '#000';
       e.ctx.fillRect(x, y, w, h);
-      r.ctx.fillStyle = grey(0.6);
+      r.ctx.fillStyle = rgh(0.6);
       r.ctx.fillRect(x, y, w, h);
       n.ctx.fillStyle = grey(0.6);
       n.ctx.fillRect(x, y, w, h);
@@ -590,10 +601,34 @@ export class TextureFactory {
         m.ctx.fillRect(sx, sy, sw, 14);
         e.ctx.fillStyle = '#000';
         e.ctx.fillRect(sx, sy, sw, 14);
-        r.ctx.fillStyle = grey(0.7);
+        r.ctx.fillStyle = rgh(0.7);
         r.ctx.fillRect(sx, sy, sw, 14);
         n.ctx.fillStyle = grey(0.66);
         n.ctx.fillRect(sx, sy, sw, 14);
+      }
+    };
+    /**
+     * Stylised weathering under a sill: one broad wash the width of the opening and two or three narrow darker runs
+     * off it, all soft-edged gradients with no grain - dirt washed off a sill by the rain, drawn the way a poster
+     * would draw it rather than as noise. `v` (the cell variant) picks the pattern so no two cells streak alike.
+     */
+    const sillStreaks = (sx: number, sy: number, sw: number, len: number, v: number): void => {
+      if (len < 24) return;
+      const wash = m.ctx.createLinearGradient(0, sy, 0, sy + len);
+      wash.addColorStop(0, rgba(78, 70, 58, 0.2));
+      wash.addColorStop(0.55, rgba(78, 70, 58, 0.07));
+      wash.addColorStop(1, rgba(78, 70, 58, 0));
+      m.ctx.fillStyle = wash;
+      m.ctx.fillRect(sx + 4, sy, sw - 8, len);
+      const runs = 2 + (v & 1);
+      for (let k = 0; k < runs; k++) {
+        const rw = 9 + 7 * ((v >> k) & 1), rl = len * (0.55 + 0.3 * ((v >> (k + 2)) & 1));
+        const cx = sx + 6 + ((k + 0.5 + 0.16 * (((v >> (k + 1)) & 3) - 1.5)) / runs) * (sw - 12);
+        const run = m.ctx.createLinearGradient(0, sy, 0, sy + rl);
+        run.addColorStop(0, rgba(62, 54, 44, 0.34));
+        run.addColorStop(1, rgba(62, 54, 44, 0));
+        m.ctx.fillStyle = run;
+        m.ctx.fillRect(cx - rw / 2, sy, rw, rl);
       }
     };
     // One variant per cell of the tile, dealt from a shuffled deck, so no two cells of a tile show the same thing
@@ -603,6 +638,17 @@ export class TextureFactory {
     for (let i = deck.length - 1; i > 0; i--) { const j = rng.int(0, i); const t = deck[i]; deck[i] = deck[j]; deck[j] = t; }
     const CURTAINS: [number, number, number][] = [[236, 226, 210], [196, 118, 88], [128, 146, 96], [248, 246, 240]];
     const BLIND_DROP = [0.4, 0.6, 0.8, 1];
+    // Plinth grime: the foot of a wall is splash-dirty and traffic-grey. Painted before the cells so the glazing stays
+    // clean, and only over the tile's ground row - bandRows only ever lands that row on the ground, so it can never
+    // show up as a dirt band across an upper floor.
+    const plinth = m.ctx.createLinearGradient(0, H, 0, H - rh * 0.75);
+    plinth.addColorStop(0, rgba(56, 50, 42, 0.3));
+    plinth.addColorStop(0.45, rgba(56, 50, 42, 0.1));
+    plinth.addColorStop(1, rgba(56, 50, 42, 0));
+    m.ctx.fillStyle = plinth;
+    m.ctx.fillRect(0, H - rh * 0.75, W, rh * 0.75);
+    // Panes are not all one slate: a cool north light, a warm reflected one and a neutral, dealt per cell.
+    const PANE_TINTS = ['#5c728c', '#5a6d80', '#6b7484', '#55708e', '#66707e'];
     for (let row = 0; row < rows; row++) {
       const y0 = top + row * rh;
       const ground = row === rows - 1;
@@ -623,7 +669,7 @@ export class TextureFactory {
           m.ctx.fillStyle = dark ? rgba(56 + d, 68 + d, 84 + d, 0.9) : rgba(104 + d, 118 + d, 134 + d, 0.9);
           m.ctx.fillRect(c * cw, y0 + rh * 0.78, cw, rh * 0.22);
         }
-        r.ctx.fillStyle = grey(0.5);
+        r.ctx.fillStyle = rgh(0.5);
         r.ctx.fillRect(0, y0 + rh * 0.78, W, rh * 0.22);
         n.ctx.fillStyle = grey(0.47);
         n.ctx.fillRect(0, y0 + rh * 0.78, W, rh * 0.22);
@@ -651,7 +697,7 @@ export class TextureFactory {
           m.ctx.fillStyle = sky;
           m.ctx.fillRect(gx, gy, gw, gh);
         } else {
-          m.ctx.fillStyle = glassBase;
+          m.ctx.fillStyle = PANE_TINTS[(variant * 3 + row) % PANE_TINTS.length];
           m.ctx.fillRect(gx, gy, gw, gh);
         }
         m.ctx.fillStyle = rowLum > 0 ? rgba(255, 255, 255, rowLum) : rgba(0, 0, 0, -rowLum);
@@ -714,8 +760,10 @@ export class TextureFactory {
         grad.addColorStop(1, rgba(0, 0, 0, 0.08));
         m.ctx.fillStyle = grad;
         m.ctx.fillRect(gx, gy, gw, gh);
-        // Glazing is glass whatever sits behind it: 0.26 keeps the sky probe as a broad sheen, not a pinpoint.
-        r.ctx.fillStyle = grey(blinds ? 0.32 : 0.26);
+        // Glazing is glass whatever sits behind it, and far smoother than the render around it: that split (0.15 on
+        // the pane against 0.92 on the wall) is what makes a window catch the sky at all. The .r channel marks the
+        // pane so Materials can lift the sky probe on it and keep the plaster grain off it.
+        r.ctx.fillStyle = rgh(blinds ? 0.24 : 0.15, 1);
         r.ctx.fillRect(gx, gy, gw, gh);
         // Night: a lit pane is brightest at the ceiling and falls off to the floor; hue and level vary per pane.
         if (rng.chance(rowLit)) {
@@ -758,13 +806,18 @@ export class TextureFactory {
             m.ctx.fillRect(gx, gy, sw, gh);
             e.ctx.fillStyle = '#000';
             e.ctx.fillRect(gx, gy, sw, gh);
-            r.ctx.fillStyle = grey(0.7);
+            r.ctx.fillStyle = rgh(0.7);
             r.ctx.fillRect(gx, gy, sw, gh);
           }
           opening(gx, gy, gw, gh, fpx, rgba(250, 248, 244, 0.92), true);
         } else {
           bar(gx + gw / 2 - 3, gy, 6, gh, rgba(40, 44, 50, 0.8));
           opening(gx, gy, gw, gh, WINDOW_CELL_FRAME_PX.ground, rgba(52, 56, 62, 0.92), false);
+        }
+        // Dirt washed off the sill, on every style that has one (the sill band is 14 px tall under the opening).
+        if (!ground && style !== 'glass') {
+          const sy = gy + gh + 14;
+          sillStreaks(gx - fpx - 6, sy, gw + 2 * fpx + 12, Math.min(rh * 0.72, y0 + rh - sy - 4), variant);
         }
       }
     }
@@ -774,14 +827,56 @@ export class TextureFactory {
     m.ctx.fillRect(0, 0, W, top);
     e.ctx.fillStyle = '#000';
     e.ctx.fillRect(0, 0, W, top);
-    r.ctx.fillStyle = grey(0.9);
+    r.ctx.fillStyle = rgh(0.9);
     r.ctx.fillRect(0, 0, W, top);
+    // Roof deck band (ROOF_SEAM_U, u >= 0.56): bitumen felt in rolls, each roll a tone of its own with a light kerb
+    // and a hard dark line where the next one laps over it. A deck maps its longer plan axis across the band
+    // (GeoBuilder.roofCap), so it breaks into ten strips instead of reading as one painted lid; the plain parts at
+    // u = 0.25 / 0.5 keep the pure white beside it. The lap lines are echoed in the structure canvas so a low sun
+    // catches them.
+    const bu0 = ROOF_SEAM_U.u0 * W, bu1 = ROOF_SEAM_U.u1 * W, rolls = 10, rlw = (bu1 - bu0) / rolls;
+    for (let i = 0; i < rolls; i++) {
+      const x = bu0 + i * rlw;
+      m.ctx.fillStyle = grey(0.82 + rng.range(0, 0.1));
+      m.ctx.fillRect(x, 0, rlw, top);
+      m.ctx.fillStyle = grey(0.9);
+      m.ctx.fillRect(x + rlw - 7, 0, 4, top);
+      m.ctx.fillStyle = grey(0.64);
+      m.ctx.fillRect(x + rlw - 3, 0, 3, top);
+      n.ctx.fillStyle = grey(0.6);
+      n.ctx.fillRect(x + rlw - 7, 0, 4, top);
+      n.ctx.fillStyle = grey(0.4);
+      n.ctx.fillRect(x + rlw - 3, 0, 3, top);
+    }
     this.soften(m.ctx, W, mapH);
     const map = this.finish(key + ':map', m.canvas, true);
     const emissive = this.finish(key + ':emi', e.canvas, true);
     const normal = this.normalFromLuminance(key + ':nrm', n.canvas, 4.5, 8);
     const rough = this.finish(key + ':rgh', r.canvas, false);
     return { map, emissive, normal, rough };
+  }
+
+  /**
+   * Tiling plaster grain as a detail NORMAL only (256 px, ~0.35 MB with its mips, no albedo of its own): float marks
+   * at a hand's width over a finer trowel grit. Materials blends it into every facade normal at a few metres per
+   * repeat, which is what gives a wall surface at 1440p and at 3 m from the camera - adding it to the albedo instead
+   * would need four times the window-tile resolution and would still tile visibly. Masked off the glazing by the
+   * pane channel of the roughness map.
+   */
+  detailNormal(): THREE.CanvasTexture {
+    const key = 'plaster:nrm';
+    const hit = this.cache.get(key) as THREE.CanvasTexture | undefined;
+    if (hit) return hit;
+    const S = 256;
+    const h = this.canvas(S, S);
+    const rng = new Random(48017);
+    h.ctx.fillStyle = grey(0.5);
+    h.ctx.fillRect(0, 0, S, S);
+    this.mottle(h.ctx, S, S, rng, 22, 30, 72, 0.2, 0, 0, false);
+    this.mottle(h.ctx, S, S, rng, 70, 8, 20, 0.15, 0, 0, false);
+    this.grain(h.ctx, S, S, rng, 0.1, 0);
+    this.blur3(h.ctx, S, S);
+    return this.normalFromLuminance(key, h.canvas, 2.0, 20);
   }
 
   /**
@@ -2525,38 +2620,49 @@ export class TextureFactory {
     return this.finish(key, canvas, true);
   }
 
-  /** One 512 x 1024 atlas (2 MB) with a glowing white row per word - the words are short, so half the width of the old square atlas keeps the same 52 px row height; tint via vertex colors. Returns per-word UV rects. */
+  /**
+   * One 512 x 1024 atlas (2 MB) of glowing white words, tinted per sign through vertex colors; returns per-word UV
+   * rects. The layout is COLUMNS of at most ATLAS_ROWS words, not one row per word: a neon sign is 2.2 m tall and
+   * looked at from 5 m, so the glyph strip has to keep its ~40-50 px height however long the word list grows. One
+   * column of 32 words would have left 19 px glyphs magnified 8x on the most emissive object in the night skyline.
+   */
   neonAtlas(words: readonly string[]): { texture: THREE.CanvasTexture; rects: Map<string, AtlasRect> } {
     const key = 'neonAtlas';
     const c = this.cache.get(key) as THREE.CanvasTexture | undefined;
     if (c && this.atlasRects) return { texture: c, rects: this.atlasRects };
-    const SW = 512, SH = 1024;
+    const SW = 512, SH = 1024, ATLAS_ROWS = 16;
     const { canvas, ctx } = this.canvas(SW, SH);
     ctx.clearRect(0, 0, SW, SH);
-    const rows = Math.max(1, words.length);
+    const cols = Math.max(1, Math.ceil(words.length / ATLAS_ROWS));
+    const rows = Math.max(1, Math.ceil(words.length / cols));
+    const cw = Math.floor(SW / cols);
     const rh = Math.floor(SH / rows);
     const fontPx = Math.floor(rh * 0.62);
+    // Side margin doubles as the halo pad of the UV rect, so a rect can never reach into the next column.
+    const padX = Math.max(6, Math.floor(cw * 0.04));
+    const maxW = cw - 2 * padX;
     ctx.font = `900 ${fontPx}px 'Trebuchet MS', 'Segoe UI', Arial, sans-serif`;
     ctx.textBaseline = 'middle';
     ctx.textAlign = 'left';
     const rects = new Map<string, AtlasRect>();
     for (let i = 0; i < words.length; i++) {
       const w = words[i];
-      const y = i * rh + rh / 2;
-      const tw = Math.min(SW - 40, ctx.measureText(w).width);
-      const x = 20;
+      const col = Math.floor(i / rows), row = i % rows;
+      const y = row * rh + rh / 2;
+      const tw = Math.min(maxW, ctx.measureText(w).width);
+      const x = col * cw + padX;
       ctx.shadowColor = 'rgba(255,255,255,0.95)';
       ctx.shadowBlur = fontPx * 0.5;
       ctx.fillStyle = 'rgba(255,255,255,0.6)';
-      ctx.fillText(w, x, y, SW - 40);
-      ctx.fillText(w, x, y, SW - 40);
-      ctx.fillText(w, x, y, SW - 40);
+      ctx.fillText(w, x, y, maxW);
+      ctx.fillText(w, x, y, maxW);
+      ctx.fillText(w, x, y, maxW);
       ctx.shadowBlur = fontPx * 0.12;
       ctx.fillStyle = '#ffffff';
-      ctx.fillText(w, x, y, SW - 40);
+      ctx.fillText(w, x, y, maxW);
       ctx.shadowBlur = 0;
-      const pad = fontPx * 0.35;
-      rects.set(w, { u0: (x - pad) / SW, u1: (x + tw + pad) / SW, v0: 1 - (i * rh + rh) / SH, v1: 1 - (i * rh) / SH });
+      const pad = Math.min(fontPx * 0.35, padX);
+      rects.set(w, { u0: (x - pad) / SW, u1: (x + tw + pad) / SW, v0: 1 - (row * rh + rh) / SH, v1: 1 - (row * rh) / SH });
     }
     const texture = this.finish(key, canvas, true, false);
     this.atlasRects = rects;

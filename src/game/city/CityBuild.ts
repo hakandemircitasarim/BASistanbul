@@ -77,9 +77,15 @@ export function addCircle(ctx: GenContext, cx: number, cz: number, r: number, ta
   return c;
 }
 
+/** Collider height per prop kind (scaled by the instance scale for the two tree kinds); 1 m is "anything waist high". */
+const PROP_HEIGHT: Record<Prop['kind'], number> = {
+  palm: 7, tree: 6.5, lamp: 6, sign: 2.6, shelter: 2.5, pole: 8.4, roadsign: 2.4, dumpster: 1.3, table: 2.2,
+  bench: 1, hydrant: 1, bin: 1, bollard: 1, hedge: 1,
+};
+
 export function addProp(ctx: GenContext, kind: Prop['kind'], x: number, z: number, yaw: number, scale: number, colliderR: number): void {
   ctx.props.push({ kind, x, z, yaw, scale });
-  if (colliderR > 0) addCircle(ctx, x, z, colliderR * scale, 'prop', kind === 'palm' ? 7 * scale : kind === 'tree' ? 6.5 * scale : kind === 'lamp' ? 6 : kind === 'sign' ? 2.6 : kind === 'shelter' ? 2.5 : 1);
+  if (colliderR > 0) addCircle(ctx, x, z, colliderR * scale, 'prop', PROP_HEIGHT[kind] * (kind === 'palm' || kind === 'tree' ? scale : 1));
 }
 
 /** Prop with a box footprint (a hedge unit): half sizes `hw` across x `hl` along the nose at a quarter-turn yaw. */

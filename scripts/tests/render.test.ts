@@ -2,7 +2,7 @@
 import { test, expect, approx, createHeadless } from './harness';
 import { DayNightSystem, DAY_TUNING } from '../../src/game/systems/DayNightSystem';
 import { ARCADE, BAND, CELL_KIND, CELL_STYLES, FacadeCellList, GeoBuilder, Outline, appendBuilding, appendBuildingDetail, appendStreetLevel, bandHeight, buildingGeometry, buildingTint, footprint, hasCrown, landmarkGeometries, massingOf } from '../../src/game/render/BuildingGeometry';
-import { MARK_UV, PLINTH_BAYS, PLINTH_TILE_W, ROOF_STRIP_PX, SHOP_BAYS, SHOP_BAY_W, SHOP_DOOR_W, SHOP_FASCIA_Y, SHOP_ROWS, SHOP_TILE_W, WINDOW_CELL, WINDOW_TILE_H, WINDOW_TILE_PX_H } from '../../src/game/render/TextureFactory';
+import { MARK_UV, PLINTH_BAYS, PLINTH_TILE_W, ROOF_SEAM_U, ROOF_STRIP_PX, SHOP_BAYS, SHOP_BAY_W, SHOP_DOOR_W, SHOP_FASCIA_Y, SHOP_ROWS, SHOP_TILE_W, WINDOW_CELL, WINDOW_TILE_H, WINDOW_TILE_PX_H } from '../../src/game/render/TextureFactory';
 import { FACADE_RANGE, FacadeDetailRenderer } from '../../src/game/render/FacadeDetailRenderer';
 import { MeshStandardMaterial, Scene } from 'three';
 import type { BufferGeometry } from 'three';
@@ -98,16 +98,20 @@ test('BuildingGeometry: side UVs are in meters (u = width/tw, v = height/th), wh
   const g = buildingGeometry(plain);
   const pos = g.attributes.position, uv = g.attributes.uv, col = g.attributes.color;
   expect(pos.count === 20 && uv.count === 20 && col.count === 20, `flat box = 5 faces x 4 verts (got ${pos.count})`);
-  // South face (first quad): u spans w/16 = 1, v spans (14 - (-0.2)) / 28; offsets are whole cells / whole rows.
+  // South face (first quad): u spans w/tw, v spans (14 - (-0.2)) / th; offsets are whole cells / whole rows.
+  const mp = massingOf(plain);
   const u0 = uv.getX(0), u1 = uv.getX(1), v0 = uv.getY(0), v1 = uv.getY(2);
-  approx(u1 - u0, 16 / 16, 1e-6, 'u spans width / 16');
-  approx(v1 - v0, 14.2 / 28, 1e-6, 'v spans height / 28');
-  const cellsU = u0 * 4, rowH = ((1 - 20 / 1024) / 8) * 28, rowsV = (v0 * 28 + 0.2) / rowH;
+  approx(u1 - u0, 16 / mp.tw, 1e-6, `u spans width / tw (${mp.tw})`);
+  approx(v1 - v0, 14.2 / mp.th, 1e-6, `v spans height / th (${mp.th})`);
+  const cellsU = u0 * 4, rowH = ((1 - 20 / 1024) / 8) * mp.th, rowsV = (v0 * mp.th + 0.2) / rowH;
   expect(Math.abs(cellsU - Math.round(cellsU)) < 1e-6 && Math.abs(rowsV - Math.round(rowsV)) < 1e-6, `UV offsets are whole window cells / rows (u ${cellsU.toFixed(3)} rows ${rowsV.toFixed(3)})`);
   expect(v0 >= -0.021 && v1 <= 0.981, `the wall stays inside the tile's window rows, never crossing the roof strip (v ${v0.toFixed(3)}..${v1.toFixed(3)})`);
-  // Roof quad = last 4 vertices: v in the plain strip, darker color than the walls.
+  // Roof deck = last 4 vertices: v in the plain strip, mapped across the felt-roll band, bitumen-dark.
   expect(uv.getY(16) > 0.98, 'roof v in the plain strip');
-  expect(col.getX(16) < col.getX(0), 'roof darker than wall');
+  const ru0 = uv.getX(16), ru1 = uv.getX(17);
+  expect(Math.min(ru0, ru1) >= ROOF_SEAM_U.u0 - 1e-6 && Math.max(ru0, ru1) <= ROOF_SEAM_U.u1 + 1e-6 && Math.abs(ru1 - ru0) > 0.3,
+    `the roof deck spans the felt-roll band, not a single point (u ${ru0.toFixed(3)}..${ru1.toFixed(3)})`);
+  expect(col.getX(16) < col.getX(0) * 0.75, 'roof deck is bitumen, well below the wall tint');
   expect(g.boundingSphere !== null && g.boundingSphere.radius > 8, 'bounding sphere computed');
   // Downtown towers cycle their window rhythm: id 7 stretches the glass tile to two storeys a row (th = 56).
   const tower = sampleBuilding({});
@@ -116,7 +120,15 @@ test('BuildingGeometry: side UVs are in meters (u = width/tw, v = height/th), wh
   expect(m7.th === 56 && m7.tw === 16, `tower id 7 uses the two-storey tile (tw ${m7.tw} th ${m7.th})`);
   const m8 = massingOf(sampleBuilding({ id: 8 }));
   expect(m8.tw === 12, `tower id 8 uses the slender 12 m tile (tw ${m8.tw})`);
-  expect(massingOf(plain).tw === 16 && massingOf(plain).th === 28, 'low buildings keep the 16 x 28 tile');
+  // Low-rise grids vary per building too (3.0-5.0 m bays, 2.9-3.9 m storeys) so a street is not one window rhythm.
+  const tws = new Set<number>(), ths = new Set<number>();
+  for (let id = 1; id <= 40; id++) {
+    const mm = massingOf(sampleBuilding({ id, district: 'suburb', style: 'residential', w: 18, d: 14, h: 15 }));
+    tws.add(mm.tw); ths.add(mm.th);
+    expect(mm.tw >= 12 && mm.tw <= 20 && mm.th >= 24 && mm.th <= 32, `low-rise tile stays sane (${mm.tw} x ${mm.th})`);
+    approx(mm.bayW, mm.tw / 4, 1e-9, 'four bays a tile');
+  }
+  expect(tws.size >= 3 && ths.size >= 2, `low-rise window grids vary (${tws.size} widths, ${ths.size} heights)`);
   // Tall walls split into bands of four rows, each with its own cell offset, at the same row lines.
   expect(tg.attributes.position.count > 20, `a 56 m tower face is more than one quad (got ${tg.attributes.position.count / 4})`);
   const stepped = buildingGeometry(sampleBuilding({ roofKind: 'stepped', h: 60 }));
@@ -227,7 +239,9 @@ test('BuildingGeometry: street level = 6 m bays with recessed doors and palette 
   const low = sampleBuilding({ id: 4, district: 'suburb', style: 'concrete', h: 10.7, w: 20, d: 16 });
   appendBuildingDetail(gb, trim, low, new Random(1), [], 0);
   expect(massingOf(low).kind === 'box', 'low flat suburb building is a box');
-  expect(trim.vertexCount === 13 * 4, `roof under 12 m: two-step cornice only (13 quads), no walls or clutter (got ${trim.vertexCount / 4} quads)`);
+  // 16 = the two-step cornice: 4 fillet faces, 4 soffit, 4 slab faces and a 4-quad top RING (never a full cap - that
+  // would lay a pale slab of the cornice colour over the roof deck 2 cm under it).
+  expect(trim.vertexCount === 16 * 4, `roof under 12 m: two-step cornice only (16 quads), no walls or clutter (got ${trim.vertexCount / 4} quads)`);
   expect(gb.vertexCount === 0, 'no street faces: no relief on the style mesh');
   // With one street face the suburb concrete building gets a floor slab (0.25 m proud) at every floor line of that face.
   const gbR = new GeoBuilder();
@@ -238,7 +252,11 @@ test('BuildingGeometry: street level = 6 m bays with recessed doors and palette 
   const tall = sampleBuilding({ id: 8, district: 'suburb', style: 'concrete', h: 21.2, w: 24, d: 20 });
   const gb2 = new GeoBuilder(), trim2 = new GeoBuilder();
   appendBuildingDetail(gb2, trim2, tall, new Random(1), [], 0);
-  expect(trim2.vertexCount / 4 >= 13 + 12 + 8 && trim2.vertexCount / 4 <= 90, `tall roof: cornice + parapet + coping + at most one clutter piece (got ${trim2.vertexCount / 4} quads)`);
+  // 36 = cornice 16 + parapet 12 + coping 8; the rooftop kit adds two items (a stair hut, tanks, a condenser bank or
+  // an aerial) on a 24 x 20 m deck, and the whole roof still has to stay a rounding error of the city's triangle budget.
+  expect(trim2.vertexCount / 4 >= 16 + 12 + 8 + 10 && trim2.vertexCount / 4 <= 140, `tall roof: cornice + parapet + coping + a two-item rooftop kit (got ${trim2.vertexCount / 4} quads)`);
+  const kitTop = range(trim2.build(), 'position', 1)[1];
+  expect(kitTop > 21.2 + 1.3 && kitTop < 21.2 + 7, `the kit stands on the deck, clear of the coping and not a tower (top ${kitTop.toFixed(2)})`);
   const tg = trim2.build();
   const copingTop = countWhere(tg, (x, y, z) => y > 21.2 + 1.0 && y <= 21.2 + 1.2 + 0.125 && Math.abs(x - 100) < 12.5 && Math.abs(z - 200) < 10.5);
   expect(copingTop >= 8, `parapet coping tops out 1.1-1.3 m over the roof (got ${copingTop} vertices)`);
@@ -279,7 +297,8 @@ test('BuildingGeometry: long street faces jog, residential street faces recess o
   const det = new GeoBuilder(), trim = new GeoBuilder(), cells = new FacadeCellList();
   appendBuildingDetail(det, trim, long, new Random(1), [], 1, 0, cells, []);
   const kinds = [0, 0, 0, 0];
-  const rowH = ((1 - ROOF_STRIP_PX / WINDOW_TILE_PX_H) / 8) * WINDOW_TILE_H, bayW = 4, wc = WINDOW_CELL.residential;
+  const mLong = massingOf(long);
+  const rowH = mLong.rowH, bayW = mLong.bayW, wc = WINDOW_CELL.residential;
   let onGrid = 0, flushBalconies = 0;
   for (let i = 0; i < cells.n; i++) {
     const kind = cells.get(i, 7) & 7;

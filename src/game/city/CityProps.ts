@@ -2,7 +2,7 @@
 import { BEACH_X0, BLOCK, CITY_MAX_X, CITY_MAX_Z, CITY_MIN_X, CITY_MIN_Z, LAMP_SPACING, LANDMARK_BLOCKS, LANE_W, OCEAN_SIZE, OCEAN_X0, PALMS_PER_BLOCK_EDGE, PLAZA_BLOCKS, ROAD_W, SIDEWALK_W } from './CityConfig';
 import { BUDGET } from '../core/Budget';
 import type { Block, CityData, District, Landmark, Lot, NamedPoint, ParkedSpec } from './CityData';
-import { ASPHALT_HALF, addAabb, addCircle, addParkedCar, addProp, blockIndex, clearance, distToNearestRoadNode, districtOf, nearestLaneYaw, onRoad, rectClear, spotTooClose } from './CityBuild';
+import { ASPHALT_HALF, addAabb, addCircle, addParkedCar, addProp, addPropBox, blockIndex, clearance, distToNearestRoadNode, districtOf, nearestLaneYaw, onRoad, rectClear, spotTooClose } from './CityBuild';
 import type { GenContext } from './CityBuild';
 import type { Random } from '../core/Random';
 import { SPECS } from '../entities/VehicleSpecs';
@@ -55,6 +55,28 @@ const TREE = { pitchMin: 12, pitchMax: 22, first: 8, firstJitter: 6, offset: 2.3
  * district, and hydrants / bus shelters / named points get their own no-parking clearances.
  */
 const KERB = { kerbGap: 0.08, endClear: 6, gapMin: 0.7, gapMax: 1.8, pad: 0.3, hydrantClear: 1.5, shelterClear: 3.2, pointClear: 3.5, height: 1.5 } as const;
+
+/**
+ * Street clutter (all placed after the lamps, trees and hydrants and before the kerbside cars, so the cars leave gaps
+ * for it). Poles stand on the kerb line of the suburb streets in runs along one block edge — the renderer strings
+ * catenary wires between neighbours on the same edge, which is why the pitch is per-run and never crosses a corner.
+ * Signs sit on the intersection approaches, dumpsters in the service alleys between buildings (`depth` inside the
+ * block edge: anywhere a building stands, the clearance test rejects the sample), café tables in the arcade strip
+ * between the block edge and the shopfronts.
+ */
+export const POLE = { off: 2.5, first: 15, firstJitter: 5, pitchMin: 23, pitchMax: 33, endClear: 14, r: 0.19, clear: 1.3 } as const;
+export const ROADSIGN = { off: 2.45, along: 7.5, alongJitter: 2.5, r: 0.12, clear: 1.4, perBlock: 2 } as const;
+export const DUMPSTER = { depth: 5.6, step: 6.5, halfLong: 1.18, halfDeep: 0.74, clear: 1.5, height: 1.35, chance: 0.34, margin: 12 } as const;
+export const CAFE = { inset: 1.15, pitch: 2.9, r: 0.52, clear: 0.95, perRun: 3, everyBlocks: 3, margin: 16 } as const;
+/**
+ * Clearance the clutter keeps from a gameplay parking spot. Spots are placed before this pass and carry no collider
+ * of their own, so nothing here would otherwise notice one (validateCity wants a spot 0.6 m clear of every collider).
+ */
+export const CLUTTER_SPOT_CLEAR = 3.6;
+/** Lamp pitch jitter: +-3.5 m off the LAMP_SPACING picket line, so a street reads as placed rather than stamped. */
+const LAMP_JITTER = 3.5;
+/** Local +Z of a prop placed on block edge 0..3 points away from the block (at the road), like the bus shelters. */
+const EDGE_OUT_YAW = [0, Math.PI / 2, Math.PI, -Math.PI / 2] as const;
 const KERB_FILL: Record<District, number> = { downtown: 0.58, suburb: 0.46, beachfront: 0.52 };
 const KERB_MIX: { key: ParkedSpec; weight: number }[] = [{ key: 'sedan', weight: 62 }, { key: 'sport', weight: 18 }, { key: 'van', weight: 20 }];
 
@@ -152,6 +174,8 @@ export function furnishPark(ctx: GenContext): void {
 export function addStreetProps(ctx: GenContext): void {
   const roads = ctx.roads;
   const lampOffset = ASPHALT_HALF + LAMP_CURB_OFFSET;
+  // Own stream, so the jitter never shifts the rest of the city's seeded decisions.
+  const jrng = ctx.rng.fork();
   for (let s = 0; s < roads.segments.length; s++) {
     const seg = roads.segments[s];
     const a = roads.nodes[seg.a], b = roads.nodes[seg.b];
@@ -161,8 +185,10 @@ export function addStreetProps(ctx: GenContext): void {
       const sgn = side === 0 ? 1 : -1;
       const stagger = side === 0 ? 0 : LAMP_SPACING / 2;
       for (let t = LAMP_SPACING / 2 + stagger; t <= seg.length - LAMP_NODE_CLEAR; t += LAMP_SPACING) {
-        if (t < LAMP_NODE_CLEAR) continue;
-        const x = a.x + dx * t + rx * sgn * lampOffset, z = a.z + dz * t + rz * sgn * lampOffset;
+        // The picket line is broken by +-LAMP_JITTER, clamped back inside the node clearance at both ends.
+        const tj = Math.min(seg.length - LAMP_NODE_CLEAR, Math.max(LAMP_NODE_CLEAR, t + jrng.range(-LAMP_JITTER, LAMP_JITTER)));
+        if (tj < LAMP_NODE_CLEAR) continue;
+        const x = a.x + dx * tj + rx * sgn * lampOffset, z = a.z + dz * tj + rz * sgn * lampOffset;
         addProp(ctx, 'lamp', x, z, Math.atan2(-rx * sgn, -rz * sgn), 1, LAMP_R);
       }
     }
@@ -424,9 +450,97 @@ export function addKerbsideParking(ctx: GenContext, rng: Random): void {
   }
 }
 
-/** Street dressing that needs the finished city (props, points): trees first, then the kerbside cars that avoid them. */
+/**
+ * Utility poles on the kerb line of the suburb streets. One run per block edge (the renderer strings wires between
+ * consecutive poles of a run, matching them by their shared edge coordinate), seeded pitch 23-33 m starting 15-20 m
+ * past the corner and stopping `endClear` before the next one, so no span ever crosses an intersection. A pole is
+ * dropped where a lamp, tree, sign, bin or hydrant already stands.
+ */
+function addUtilityPoles(ctx: GenContext, rng: Random): void {
+  for (let bi = 0; bi < ctx.blocks.length; bi++) {
+    const b = ctx.blocks[bi];
+    if (b.kind !== 'buildings' || districtOf(b.col, b.row) !== 'suburb') continue;
+    for (let edge = 0; edge < 4; edge++) {
+      for (let t = POLE.first + rng.range(0, POLE.firstJitter); t <= BLOCK - POLE.endClear; t += rng.range(POLE.pitchMin, POLE.pitchMax)) {
+        edgePoint(b, edge, t, POLE.off, ep);
+        if (clearance(ctx.hash, ep.x, ep.z, 6) < POLE.clear) continue;
+        if (spotTooClose(ctx.parkedSpots, ep.x, ep.z, CLUTTER_SPOT_CLEAR)) continue;
+        addProp(ctx, 'pole', ep.x, ep.z, EDGE_OUT_YAW[edge], rng.range(0.94, 1.08), POLE.r);
+      }
+    }
+  }
+}
+
+/** Warning / stop plates on the intersection approaches: `perBlock` of a block's four corners, facing the oncoming lane. */
+function addRoadSigns(ctx: GenContext, rng: Random): void {
+  for (let bi = 0; bi < ctx.blocks.length; bi++) {
+    const b = ctx.blocks[bi];
+    if (b.kind === 'park') continue;
+    const first = rng.int(0, 3);
+    for (let k = 0; k < ROADSIGN.perBlock; k++) {
+      const edge = (first + k * 2) % 4;
+      // Near one end of the edge or the other, a few metres past the corner box.
+      const near = rng.chance(0.5);
+      const t = near ? ROADSIGN.along + rng.range(0, ROADSIGN.alongJitter) : BLOCK - ROADSIGN.along - rng.range(0, ROADSIGN.alongJitter);
+      edgePoint(b, edge, t, ROADSIGN.off, ep);
+      if (clearance(ctx.hash, ep.x, ep.z, 5) < ROADSIGN.clear) continue;
+      if (spotTooClose(ctx.parkedSpots, ep.x, ep.z, CLUTTER_SPOT_CLEAR)) continue;
+      // Plate faces the traffic coming down the street: along the edge, back toward the near corner.
+      const yaw = EDGE_OUT_YAW[edge] + (near ? Math.PI / 2 : -Math.PI / 2);
+      addProp(ctx, 'roadsign', ep.x, ep.z, yaw, 1, ROADSIGN.r);
+    }
+  }
+}
+
+/**
+ * Wheeled dumpsters in the service alleys: samples the band `depth` metres inside each block edge every `step` metres.
+ * Anywhere a building stands the clearance test rejects the sample, so what is left is exactly the 5 m alleys between
+ * neighbouring buildings (and the odd deep setback).
+ */
+function addDumpsters(ctx: GenContext, rng: Random): void {
+  for (let bi = 0; bi < ctx.blocks.length; bi++) {
+    const b = ctx.blocks[bi];
+    if (b.kind !== 'buildings') continue;
+    for (let edge = 0; edge < 4; edge++) {
+      for (let t = DUMPSTER.margin; t <= BLOCK - DUMPSTER.margin; t += DUMPSTER.step) {
+        if (!rng.chance(DUMPSTER.chance)) continue;
+        edgePoint(b, edge, t + rng.range(-1.2, 1.2), -DUMPSTER.depth, ep);
+        if (clearance(ctx.hash, ep.x, ep.z, 6) < DUMPSTER.clear) continue;
+        if (spotTooClose(ctx.parkedSpots, ep.x, ep.z, CLUTTER_SPOT_CLEAR + DUMPSTER.halfLong)) continue;
+        // Backed against the alley wall: the long side runs across the alley, i.e. along the block edge.
+        addPropBox(ctx, 'dumpster', ep.x, ep.z, EDGE_OUT_YAW[edge], 1, DUMPSTER.halfLong, DUMPSTER.halfDeep, DUMPSTER.height);
+      }
+    }
+  }
+}
+
+/** Café tables with parasols in the arcade strip between a block edge and its shopfronts, a run of up to 3 per block. */
+function addCafeTables(ctx: GenContext, rng: Random): void {
+  for (let bi = 0; bi < ctx.blocks.length; bi++) {
+    const b = ctx.blocks[bi];
+    if (b.kind !== 'buildings' || bi % CAFE.everyBlocks !== 1) continue;
+    const edge = rng.int(0, 3);
+    const t0 = rng.range(CAFE.margin, BLOCK - CAFE.margin - CAFE.pitch * CAFE.perRun);
+    for (let k = 0; k < CAFE.perRun; k++) {
+      edgePoint(b, edge, t0 + k * CAFE.pitch, -CAFE.inset, ep);
+      if (clearance(ctx.hash, ep.x, ep.z, 5) < CAFE.clear) continue;
+      if (spotTooClose(ctx.parkedSpots, ep.x, ep.z, CLUTTER_SPOT_CLEAR)) continue;
+      addProp(ctx, 'table', ep.x, ep.z, rng.range(0, Math.PI * 2), rng.range(0.94, 1.06), CAFE.r);
+    }
+  }
+}
+
+/**
+ * Street dressing that needs the finished city (props, points): trees, then the batched clutter (poles and their
+ * wires, signs, dumpsters, café tables), then the kerbside cars, which keep clear of all of it.
+ */
 export function furnishStreets(ctx: GenContext): void {
   addStreetTrees(ctx, ctx.rng.fork());
+  const clutter = ctx.rng.fork();
+  addUtilityPoles(ctx, clutter);
+  addRoadSigns(ctx, clutter);
+  addDumpsters(ctx, clutter);
+  addCafeTables(ctx, clutter);
   addKerbsideParking(ctx, ctx.rng.fork());
 }
 

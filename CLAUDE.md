@@ -17,7 +17,12 @@ Ayrıntılı sözleşmeler: `docs/GAME_DESIGN.md` (bölüm 0 = temel kurallar, 2
 - Sabit adım 1/60 s, render interpolasyonu; `fixedUpdate` ve `sync` yollarında **tahsis yok**
   (modül seviyesinde scratch nesneler, `out` parametreleri, sayaç döndüren sorgular).
 - Yoğun nesneler `InstancedMesh`, statik şehir birleştirilmiş (merged) geometri.
-- Çizim çağrısı bütçesi: kare başına < 120 (öğlen ~98, alacakaranlık ~102), üçgen bütçesi öğlen ≤ ~720 bin (şu an ~607 bin); doku belleği ~86 MB RGBA.
+- Çizim çağrısı bütçesi: kare başına < 120 (öğlen ~101, alacakaranlık ~105, gece ~104), üçgen bütçesi öğlen ≤ ~720 bin
+  (ölçülen: öğlen ~669 bin, alacakaranlık ~696 bin, gece ~695 bin — `?autostart=1&hour=12|19|21&quality=high&noadapt=1`
+  doğuş karesi). Bu parantezler bir sonraki turun bütçe payıdır: görsel bir tur açtıktan sonra yeniden ölçülüp güncellenir.
+- Sahnede kalıcı olarak 3 `THREE.PointLight` (lamba havuzu, `LAMP_LIGHTS`) + 2 far SpotLight durur. Gündüz yoğunlukları
+  0'dır ama sahneden çıkarılmazlar (çıkarmak `NUM_POINT_LIGHTS`'ı değiştirip tüm malzemeleri yeniden derler), yani öğlen
+  de her aydınlatılan parça onları hesaplar: havuz bilerek küçük tutulur.
 - Çok sayıda statik nesne (lamba, palmiye, mobilya, park kabukları, ağaç/çit) mesafeye göre paketlenir: `PropRenderer`
   malzeme başına tek `THREE.BatchedMesh` kullanır (`setVisibleAt` ile `PROP_RANGE` dışındakiler gizli) ve kamera 15 m
   hareket edince yeniden paketler; `FacadeDetailRenderer` pencere çerçevesi/denizlik/balkon/klima birimlerini aynı
@@ -30,7 +35,7 @@ Ayrıntılı sözleşmeler: `docs/GAME_DESIGN.md` (bölüm 0 = temel kurallar, 2
 ```sh
 npm run typecheck   # tsc, sıfır hata
 npm run lint        # 0 hata (1 shadcn uyarısı bilinen)
-npm test            # 65 birim + simülasyon testi, tarayıcı gerekmez
+npm test            # 66 birim + simülasyon testi, tarayıcı gerekmez
 npm run build
 npm run shot -- "http://127.0.0.1:8080/?autostart=1&hour=19" out.png   # headless ekran görüntüsü
 ```

@@ -785,7 +785,9 @@ function sedanProfile(s: VehicleSpec, kind: 'sedan' | 'police' | 'taxi'): Vehicl
     station(0.33, c, belt + 0.29, hp * 0.75, belt - 0.005, hp * 0.945, { edge: 0.04, crown: 0.01, seg: GLAZED_SCREEN, inset: IN, topInset: IN }),
     station(cowlZ - SEAL_W, c, belt + 0.105, hp * 0.78, belt - 0.012, hp * 0.93, { edge: 0.03, crown: 0.01, seg: SCREEN_EDGE, topInset: IN * 0.5 }),
     station(cowlZ, c, belt + 0.085, hp * 0.78, belt - 0.012, hp * 0.93, { edge: 0.03, crown: 0.01, lod: true }),
-    station(1.45, c, belt + 0.02, hp * 0.70, belt - 0.04, hp * 0.90, { edge: 0.04, crown: 0.02, bulge: 0.03 }),
+    // Bonnet crown: in the LOD set too, or the coarse shell runs one straight ramp from the cowl to the nose fan and
+    // the front end reads as a pinched beak instead of a bonnet with a lip over the lamps.
+    station(1.45, c, belt + 0.02, hp * 0.70, belt - 0.04, hp * 0.90, { edge: 0.04, crown: 0.02, bulge: 0.03, lod: true }),
     station(hl - 0.30, c, belt - 0.05, hp * 0.66, belt - 0.09, hp * 0.87, { wFloor: hp * 0.80, yLow: belt - 0.28, wLow: hp * 0.86, edge: 0.04, crown: 0.015, seg: FRONT_WRAP, lod: true }),
     nose,
     shrunk(nose, hl + 0.05, 0.5, yCFront, NOSE_FAN, true),
@@ -883,7 +885,7 @@ function sportProfile(s: VehicleSpec): VehicleProfile {
     station(0.25, c, belt + 0.30, hp * 0.74, belt, hp * 0.94, { edge: 0.04, crown: 0.01, seg: GLAZED_SCREEN, inset: IN, topInset: IN }),
     station(cowlZ - SEAL_W, c, belt + 0.105, hp * 0.78, belt - 0.015, hp * 0.94, { edge: 0.03, crown: 0.01, seg: SCREEN_EDGE, topInset: IN * 0.5 }),
     station(cowlZ, c, belt + 0.085, hp * 0.78, belt - 0.015, hp * 0.94, { edge: 0.03, crown: 0.01, lod: true }),
-    station(1.40, c, belt - 0.01, hp * 0.70, belt - 0.06, hp * 0.91, { edge: 0.04, crown: 0.02, bulge: 0.03 }),
+    station(1.40, c, belt - 0.01, hp * 0.70, belt - 0.06, hp * 0.91, { edge: 0.04, crown: 0.02, bulge: 0.03, lod: true }),
     station(hl - 0.32, c, belt - 0.08, hp * 0.66, belt - 0.12, hp * 0.88, { wFloor: hp * 0.82, yLow: belt - 0.24, wLow: hp * 0.87, edge: 0.03, crown: 0.015, seg: FRONT_WRAP, lod: true }),
     nose,
     shrunk(nose, hl + 0.045, 0.5, yCFront, NOSE_FAN, true),
@@ -1051,6 +1053,8 @@ export function bodyGeometry(s: VehicleSpec): THREE.BufferGeometry {
  * tread fall to tyre black.
  */
 const LOD_RIM = 0x848a92;
+/** Tyre black of the near parked shell's baked wheels (the lathed wheel's TYRE, matte like the rest of the shell). */
+const TYRE_BLACK = 0x1a1b1e;
 
 /**
  * Cheap shell for the static parked cars of the lots: the same loft at the coarse ring through the `lod` stations only
@@ -1063,22 +1067,78 @@ export function parkedShellGeometry(s: VehicleSpec): THREE.BufferGeometry {
   const stations: Station[] = [];
   for (let i = 0; i < profile.stations.length; i++) if (profile.stations[i].lod) stations.push(profile.stations[i]);
   const geos: THREE.BufferGeometry[] = [loft(stations, LOD_RING)];
+  bakedWheels(geos, s, profile, 8);
+  const merged = mergeGeometries(geos, false);
+  if (!merged) throw new Error('parked shell merge failed (attribute mismatch)');
+  for (let i = 0; i < geos.length; i++) geos[i].dispose();
+  for (let i = 0; i < profile.extras.length; i++) profile.extras[i].dispose();
+  bakeShading(merged, profile.floor, profile.belt);
+  merged.computeBoundingSphere();
+  return merged;
+}
+
+/**
+ * The four baked wheels of a static parked car (which is not a Vehicle, so nothing instances a lathed wheel for it).
+ * `seg`-sided, and at `rim` a shouldered tyre (the tread pulls in at both sidewalls instead of ending in a flat
+ * cylinder cap) with an alloy disc set into its outboard face: without that disc a parked car at 6 m wears four black
+ * balls. The cheap form keeps the plain cylinder, whose cap centre carries the bright hub and whose cap edge and
+ * tread stay tyre black, so the fan still interpolates a rim inside a dark tyre at chase distance.
+ */
+function bakedWheels(out: THREE.BufferGeometry[], s: VehicleSpec, profile: VehicleProfile, seg: number, rim = false): void {
   const R = VEHICLE_RENDER;
   const r = R.wheelRadius * profile.wheelScale, w = R.wheelWidth;
   const hw = s.width * 0.5 - w * 0.5 + WHEEL_INSET, hb = s.wheelbase * 0.5;
   for (let k = 0; k < 4; k++) {
     const x = (k % 2 === 0 ? -1 : 1) * hw, z = k < 2 ? hb : -hb;
-    const disc = new THREE.CylinderGeometry(r, r, w, 8, 1, false);
-    disc.rotateZ(Math.PI / 2); // axle y -> x
-    disc.translate(x, r, z);
-    // Rim faces: the cap centre vertex carries the bright hub, the cap edge and the tread ring stay tyre-black, so the
-    // fan interpolates a bright rim inside a dark tyre like the lathed wheel does at chase distance.
-    geos.push(shade(decorate(disc, LOD_RIM, MATTE_MIX), (px, py, pz) => (Math.abs(Math.abs(px - x) - w * 0.5) < 1e-4 && Math.hypot(py - r, pz - z) < r * 0.5 ? 1 : 0.2)));
+    if (!rim) {
+      const disc = new THREE.CylinderGeometry(r, r, w, seg, 1, false);
+      disc.rotateZ(Math.PI / 2); // axle y -> x
+      disc.translate(x, r, z);
+      out.push(shade(decorate(disc, LOD_RIM, MATTE_MIX), (px, py, pz) => (Math.abs(Math.abs(px - x) - w * 0.5) < 1e-4 && Math.hypot(py - r, pz - z) < r * 0.5 ? 1 : 0.2)));
+      continue;
+    }
+    // Tyre: rings along the axle (authored about y, rotated onto x with the rest). The tread pulls in hard at both
+    // sidewalls, so the outer face is a narrow bead ring rather than the flat black wall a plain cylinder shows.
+    const tyre = tube([
+      { y: -w * 0.5, rx: r * 0.6, rz: r * 0.6 }, { y: -w * 0.4, rx: r * 0.82, rz: r * 0.82 }, { y: -w * 0.26, rx: r, rz: r },
+      { y: w * 0.26, rx: r, rz: r }, { y: w * 0.4, rx: r * 0.82, rz: r * 0.82 }, { y: w * 0.5, rx: r * 0.6, rz: r * 0.6 },
+    ], seg, false, false);
+    tyre.rotateZ(Math.PI / 2);
+    tyre.translate(x, r, z);
+    out.push(decorate(tyre, TYRE_BLACK, MATTE_MIX));
+    // Alloy plugging the open bead on both flanks (one geometry per corner, so each disc closes its own side): a
+    // bright dish inside a darker rim, shaded by radius from the axle so the lathe's orientation does not matter.
+    for (let e = -1; e <= 1; e += 2) {
+      const face = tube([{ y: -0.008, rx: r * 0.63, rz: r * 0.63 }, { y: 0.008, rx: r * 0.6, rz: r * 0.6 }], 8, true, true);
+      face.rotateZ(Math.PI / 2);
+      face.translate(x + e * w * 0.5, r, z);
+      out.push(shade(decorate(face, LOD_RIM, MATTE_MIX), (_px, py, pz) => (Math.hypot(py - r, pz - z) < r * 0.4 ? 1 : 0.5)));
+    }
   }
+}
+
+/**
+ * Near shell for the handful of static parked cars closest to the camera (CityRendererProps' near group, within
+ * ~35 m): the player's own body loft — every station at FULL_RING, so the belt crease, the gasket bands and the lens
+ * split are all there — with the pillars, shut lines, rocker strip, handles, mirrors, plates, grille, bumpers, the
+ * lamp blocks with their lens quads, the arch fenders and the exhaust, plus a 12-sided baked wheel per corner. About
+ * seven times the coarse shell's triangles, which is why only a capped near set is drawn from it; the coarse shell
+ * takes over past the near range. Same attribute set and paint material, so the batch colour still tints the paint.
+ */
+export function parkedNearGeometry(s: VehicleSpec): THREE.BufferGeometry {
+  const profile = profileFor(s);
+  const geos: THREE.BufferGeometry[] = [loft(profile.stations, FULL_RING)];
+  for (let i = 0; i < profile.parts.length; i++) geos.push(prism(profile.parts[i]));
+  for (let i = 0; i < profile.extras.length; i++) geos.push(profile.extras[i]);
+  for (let i = 0; i < profile.arches.length; i++) {
+    const a = profile.arches[i];
+    geos.push(...archGeometry(a, 1), ...archGeometry(a, -1));
+  }
+  geos.push(exhaustGeometry(profile.exhaust.x, profile.exhaust.y, profile.exhaust.zFace));
+  bakedWheels(geos, s, profile, 10, true);
   const merged = mergeGeometries(geos, false);
-  if (!merged) throw new Error('parked shell merge failed (attribute mismatch)');
+  if (!merged) throw new Error('parked near shell merge failed (attribute mismatch)');
   for (let i = 0; i < geos.length; i++) geos[i].dispose();
-  for (let i = 0; i < profile.extras.length; i++) profile.extras[i].dispose();
   bakeShading(merged, profile.floor, profile.belt);
   merged.computeBoundingSphere();
   return merged;

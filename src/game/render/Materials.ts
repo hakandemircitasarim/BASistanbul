@@ -39,11 +39,27 @@ const LEAF_EMISSIVE_NIGHT = 0.045;
 const FOLIAGE_NIGHT_DIM = 0.65;
 /** Daylight roughness of the alpha fronds (0.97 at full night: no moon highlight on the leaves). */
 const PALM_FROND_ROUGHNESS = 0.65;
-/** Half width of the frond alpha ramp around alphaTest (see the palmFrond shader patch). */
-const PALM_ALPHA_RAMP = 0.08;
+/**
+ * Half width of the frond alpha ramp around alphaTest (see the palmFrond shader patch). Alpha-to-coverage dithers
+ * whatever lands inside this band into an MSAA sample mask, and on a 4-sample resolve that mask is a visible stipple:
+ * at +-0.08 the leaflet serrations (which cross the band over a texel or two) grew a horizontal comb at 15-40 m on
+ * the software GL of the screenshot harness. Halving the band leaves the dither only on the true silhouette edge,
+ * which is what the coverage feathering is for.
+ */
+const PALM_ALPHA_RAMP = 0.04;
 /** Distance-driven alpha boost of the fronds: x(1 + gain) reached `span` metres beyond `from` (see the palmFrond shader patch). */
 const PALM_ALPHA_DIST = { from: 12, span: 33, gain: 1.6 } as const;
 
+/**
+ * Facade surface split (see TextureFactory.windows and facadeSurfacePatch). The roughness map's .g is the roughness
+ * three samples (pane 0.15, render 0.92) and its .r marks the glazing, which buys two things a uniform cannot:
+ * the sky probe is lifted on the panes only, so a window answers the sky while the wall beside it stays matte, and
+ * the tiling plaster grain is kept off the glass. `tile` is the grain's repeat in tile UVs - 2.6 across a 16 m tile
+ * and 4.6 up a 28 m one is ~6 m either way, so the grain reads at the same size however the massing scales the window
+ * grid. Amount and repeat are deliberately gentle: at half this repeat and twice this amount the render came out as
+ * coarse sandpaper, which is the fine noise a stylised facade must never have.
+ */
+const FACADE_GRAIN = { tile: [2.6, 4.6] as const, amount: 0.3, amountCurtain: 0.12, paneEnv: 0.6, paneEnvCurtain: 0.2 } as const;
 /**
  * Roughness / metalness / sky-probe strength per surface family. Everything lit is MeshStandardMaterial so the PMREM
  * sky probe actually shows up: without a specular term the whole city answers light identically and reads flat.
@@ -126,6 +142,7 @@ export class Materials {
         // The curtain wall bakes a sky-to-slate reflection into its albedo and leans harder on the sky probe over it.
         roughness: SURF.building.roughness, metalness: SURF.building.metalness, envMapIntensity: style === 'glass' ? SURF.building.envGlass : SURF.building.env,
       });
+      this.facadeSurfacePatch(this.building[style], tex.detailNormal(), style === 'glass' || style === 'neon');
     }
     this.plain = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: SURF.plain.roughness, metalness: SURF.plain.metalness, envMapIntensity: SURF.plain.env });
     this.glow = new THREE.MeshStandardMaterial({ vertexColors: true, emissiveMap: tex.glowAtlas(), emissive: 0xffffff, emissiveIntensity: 0, roughness: SURF.plain.roughness, metalness: SURF.plain.metalness, envMapIntensity: SURF.plain.env });
@@ -205,7 +222,7 @@ export class Materials {
         '}',
       ].join('\n'));
     };
-    this.palmFrond.customProgramCacheKey = () => 'palmFrondSharpen4';
+    this.palmFrond.customProgramCacheKey = () => 'palmFrondSharpen6';
     // Solid foliage (PropRenderer bakes the normals: canopy normals on the far fronds, face normals on the crowns and
     // hedges) with the same daylight-only translucency emissive as the fronds, so the far palm LOD and the tree crowns
     // fall dark with the near fronds after sunset instead of standing in the street as pale cut-outs.
@@ -253,6 +270,36 @@ export class Materials {
         }`);
     };
     m.customProgramCacheKey = () => 'macro' + scale.toFixed(4) + amount.toFixed(3);
+  }
+
+  /**
+   * Facade surface: a tiling plaster grain blended into the normal, and the sky probe lifted on the glazing only.
+   * Both are driven by the roughness map's pane channel (.r, free because three reads roughness from .g), so the two
+   * materials a facade actually has - render and glass - stop answering the light identically. The normal chunk is
+   * rewritten rather than appended to: the grain has to join the painted relief in TANGENT space, before the tbn
+   * transform, or a wall at a grazing angle picks up a normal that is no longer a unit vector in the surface frame.
+   */
+  private facadeSurfacePatch(m: THREE.MeshStandardMaterial, detail: THREE.Texture, curtainWall: boolean): void {
+    const amount = curtainWall ? FACADE_GRAIN.amountCurtain : FACADE_GRAIN.amount;
+    const paneEnv = curtainWall ? FACADE_GRAIN.paneEnvCurtain : FACADE_GRAIN.paneEnv;
+    m.onBeforeCompile = (shader) => {
+      shader.uniforms.uGrain = { value: detail };
+      shader.uniforms.uGrainTile = { value: new THREE.Vector2(FACADE_GRAIN.tile[0], FACADE_GRAIN.tile[1]) };
+      shader.uniforms.uGrainAmt = { value: amount };
+      shader.uniforms.uPaneEnv = { value: paneEnv };
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nuniform sampler2D uGrain;\nuniform vec2 uGrainTile;\nuniform float uGrainAmt;\nuniform float uPaneEnv;\nfloat vPaneMask;')
+        .replace('#include <normal_fragment_maps>', [
+          'vPaneMask = texture2D( roughnessMap, vRoughnessMapUv ).r;',
+          'vec3 mapN = texture2D( normalMap, vNormalMapUv ).xyz * 2.0 - 1.0;',
+          'mapN.xy *= normalScale;',
+          'vec3 grainN = texture2D( uGrain, vNormalMapUv * uGrainTile ).xyz * 2.0 - 1.0;',
+          'mapN.xy += grainN.xy * uGrainAmt * ( 1.0 - vPaneMask );',
+          'normal = normalize( tbn * mapN );',
+        ].join('\n'))
+        .replace('#include <lights_fragment_maps>', '#include <lights_fragment_maps>\nradiance *= 1.0 + uPaneEnv * vPaneMask;');
+    };
+    m.customProgramCacheKey = () => `facadeSurface1:${amount.toFixed(2)}:${paneEnv.toFixed(2)}`;
   }
 
   /** Dielectric F0 scale of the leaf materials (palmFrond, foliage): 1 by day, 0 at full night (see leafSpecularPatch). */

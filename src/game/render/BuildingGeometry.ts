@@ -2,7 +2,7 @@
 import * as THREE from 'three';
 import type { Building, BuildingStyle, Landmark } from '../city/CityData';
 import type { Random } from '../core/Random';
-import { GLOW_U, PLINTH_BAND_H, PLINTH_BAYS, PLINTH_DOOR_BAY, PLINTH_TILE_W, ROOF_STRIP_PX, ROOF_V, SHOP_BAND_H, SHOP_BAYS, SHOP_BAY_W, SHOP_DOOR_W, SHOP_FASCIA_Y, SHOP_PLAIN_UV, SHOP_ROWS, SHOP_TILE_W, WINDOW_CELL, WINDOW_TILE_H, WINDOW_TILE_PX_H, WINDOW_TILE_W } from './TextureFactory';
+import { GLOW_U, PLINTH_BAND_H, PLINTH_BAYS, PLINTH_DOOR_BAY, PLINTH_TILE_W, ROOF_SEAM_U, ROOF_STRIP_PX, ROOF_V, SHOP_BAND_H, SHOP_BAYS, SHOP_BAY_W, SHOP_DOOR_W, SHOP_FASCIA_Y, SHOP_PLAIN_UV, SHOP_ROWS, SHOP_TILE_W, WINDOW_CELL, WINDOW_TILE_H, WINDOW_TILE_PX_H, WINDOW_TILE_W } from './TextureFactory';
 
 /** Material key for a landmark part: a windowed building style (plain parts use the white strip UV) or 'glow' (emissive neon parts). */
 export type LandmarkStyle = BuildingStyle | 'glow';
@@ -31,6 +31,19 @@ const TIERS = 2;
 const CLUTTER_MIN_H = 12;
 /** Face bits for GeoBuilder.boxFaces. */
 export const FACE = { pz: 1, nz: 2, px: 4, nx: 8, top: 16, bot: 32, sides: 15, all: 63 } as const;
+/**
+ * Baked ambient per face orientation for the small plain solids (roof kit, crowns, spires). The sun already shades
+ * them, but a sky probe that answers every direction alike leaves a 3 m box on a roof reading as one flat pastel
+ * colour at any distance; pulling the north and west faces down gives it form in the silhouette. The noon sun leans
+ * south (+Z), so +Z stays full.
+ */
+const FACE_SHADE = { top: 1, pz: 0.98, px: 0.9, nz: 0.7, nx: 0.78 } as const;
+/** FACE_SHADE for an arbitrary outward plan direction: the round crowns, drums and tanks read the same way. */
+function dirShade(dx: number, dz: number): number {
+  const ax = Math.abs(dx), az = Math.abs(dz), t = ax + az;
+  if (t < 1e-9) return FACE_SHADE.top;
+  return ((dx >= 0 ? FACE_SHADE.px : FACE_SHADE.nx) * ax + (dz >= 0 ? FACE_SHADE.pz : FACE_SHADE.nz) * az) / t;
+}
 /** World face bit of building face 0..3 (+Z, +X, -Z, -X). */
 const FACE_BIT = [FACE.pz, FACE.px, FACE.nz, FACE.nx];
 /** Towers above this height get a crown (chamfered top, cornice at its foot, plant room, mast). */
@@ -67,6 +80,8 @@ const CHAMFER_MIN = 2.2, CHAMFER_VAR = 0.8;
 const SLAB_OUT = 0.25, SLAB_H = 0.22;
 /** Parapet: 1.0-1.2 m walls on the cornice with a coping slab on top. */
 const PARAPET_MIN = 1.0, PARAPET_VAR = 0.2, COPING_H = 0.12, COPING_OUT = 0.08;
+/** Baked occlusion at the head of a parapet, under the coping's oversail (see parapetWalls). */
+const PARAPET_AO = 0.66;
 /** Door cell of a shop bay steps this far into the wall (dark reveal faces either side, a door leaf and a threshold step at the back). */
 const DOOR_RECESS = 1.2;
 /** Door leaf: proud of the recess back, inset from the door cell's jambs; the threshold step in front of it. */
@@ -401,15 +416,21 @@ export class GeoBuilder {
     this.quad(bx0, top, bz1, bx1, top, bz1, bx1, top, bz0, bx0, top, bz0, 0, 1, 0, u, v, u, v, u, v, u, v);
   }
 
-  /** Chamfered top: four 45-degree slopes from the rect at y0 to the rect inset by `inset` at y1, plus the flat top. */
+  /**
+   * Chamfered top: four 45-degree slopes from the rect at y0 to the rect inset by `inset` at y1, plus the flat top.
+   * The slopes carry FACE_SHADE so a crown has form from 200 m instead of four identical pastel facets.
+   */
   chamferTop(x0: number, z0: number, x1: number, z1: number, y0: number, y1: number, inset: number, color: number, top: number): void {
     const u = 0.25, v = ROOF_V;
     const ix0 = x0 + inset, ix1 = x1 - inset, iz0 = z0 + inset, iz1 = z1 - inset;
     const n = Math.SQRT1_2;
-    this.setColor(color);
+    this.setColor(color, FACE_SHADE.pz);
     this.quad(x0, y0, z1, x1, y0, z1, ix1, y1, iz1, ix0, y1, iz1, 0, n, n, u, v, u, v, u, v, u, v);
+    this.setColor(color, FACE_SHADE.nz);
     this.quad(x1, y0, z0, x0, y0, z0, ix0, y1, iz0, ix1, y1, iz0, 0, n, -n, u, v, u, v, u, v, u, v);
+    this.setColor(color, FACE_SHADE.px);
     this.quad(x1, y0, z1, x1, y0, z0, ix1, y1, iz0, ix1, y1, iz1, n, n, 0, u, v, u, v, u, v, u, v);
+    this.setColor(color, FACE_SHADE.nx);
     this.quad(x0, y0, z0, x0, y0, z1, ix0, y1, iz1, ix0, y1, iz0, -n, n, 0, u, v, u, v, u, v, u, v);
     this.setColor(top);
     this.quad(ix0, y1, iz1, ix1, y1, iz1, ix1, y1, iz0, ix0, y1, iz0, 0, 1, 0, u, v, u, v, u, v, u, v);
@@ -424,13 +445,15 @@ export class GeoBuilder {
     for (let i = 0; i < segments; i++) {
       const a0 = phase + (i / segments) * Math.PI * 2, a1 = phase + ((i + 1) / segments) * Math.PI * 2, am = (a0 + a1) / 2;
       const nx = Math.cos(am) * dy / nl, nz = Math.sin(am) * dy / nl, ny = dr / nl;
+      this.setColor(color, dirShade(Math.cos(am), Math.sin(am)));
       this.quad(cx + Math.cos(a1) * rx0, y0, cz + Math.sin(a1) * rz0, cx + Math.cos(a0) * rx0, y0, cz + Math.sin(a0) * rz0,
         cx + Math.cos(a0) * rx1, y1, cz + Math.sin(a0) * rz1, cx + Math.cos(a1) * rx1, y1, cz + Math.sin(a1) * rz1, nx, ny, nz, u, v, u, v, u, v, u, v);
     }
     this.setColor(top);
     for (let i = 0; i < segments; i++) {
       const a0 = phase + (i / segments) * Math.PI * 2, a1 = phase + ((i + 1) / segments) * Math.PI * 2;
-      this.tri(cx, y1, cz, cx + Math.cos(a0) * rx1, y1, cz + Math.sin(a0) * rz1, cx + Math.cos(a1) * rx1, y1, cz + Math.sin(a1) * rz1, u, v);
+      // Same +Y winding as cylinder's cap: an open cone read as a folded card from any roof or tower.
+      this.tri(cx, y1, cz, cx + Math.cos(a1) * rx1, y1, cz + Math.sin(a1) * rz1, cx + Math.cos(a0) * rx1, y1, cz + Math.sin(a0) * rz1, u, v);
     }
   }
 
@@ -444,14 +467,50 @@ export class GeoBuilder {
     this.quad(ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, ua, va, ub, vb, uc, vc, ud, vd);
   }
 
-  /** Four-sided pyramid over the rectangle x0..x1 / z0..z1 from y0 to apexY. */
+  /**
+   * Four-sided pyramid over the rectangle x0..x1 / z0..z1 from y0 to apexY. The four faces carry FACE_SHADE, a baked
+   * ambient term that keeps the north and west slopes down: a roof cone lit only by the sun and a uniform sky probe
+   * comes out as four flat pastel triangles, which is exactly what makes a spire read as a primitive from 200 m.
+   */
   pyramid(x0: number, z0: number, x1: number, z1: number, y0: number, apexY: number, color: number): void {
     const cx = (x0 + x1) / 2, cz = (z0 + z1) / 2, u = 0.5, v = ROOF_V;
-    this.setColor(color);
+    this.setColor(color, FACE_SHADE.pz);
     this.tri(x0, y0, z1, x1, y0, z1, cx, apexY, cz, u, v);
+    this.setColor(color, FACE_SHADE.nz);
     this.tri(x1, y0, z0, x0, y0, z0, cx, apexY, cz, u, v);
+    this.setColor(color, FACE_SHADE.px);
     this.tri(x1, y0, z1, x1, y0, z0, cx, apexY, cz, u, v);
+    this.setColor(color, FACE_SHADE.nx);
     this.tri(x0, y0, z0, x0, y0, z1, cx, apexY, cz, u, v);
+  }
+
+  /**
+   * Plain box with the FACE_SHADE ambient baked in (a lit top, mid south / east flanks, dark north / west ones) and no
+   * bottom: the rooftop kit and the crown plant rooms are small boxes on a skyline, and without it they are the flat
+   * pastel cubes the critic saw. Five quads, the same as boxPlain.
+   */
+  litBox(x0: number, y0: number, z0: number, x1: number, y1: number, z1: number, color: number): void {
+    this.setColor(color, FACE_SHADE.top);
+    this.boxFacesRaw(x0, y0, z0, x1, y1, z1, FACE.top);
+    this.setColor(color, FACE_SHADE.pz);
+    this.boxFacesRaw(x0, y0, z0, x1, y1, z1, FACE.pz);
+    this.setColor(color, FACE_SHADE.px);
+    this.boxFacesRaw(x0, y0, z0, x1, y1, z1, FACE.px);
+    this.setColor(color, FACE_SHADE.nz);
+    this.boxFacesRaw(x0, y0, z0, x1, y1, z1, FACE.nz);
+    this.setColor(color, FACE_SHADE.nx);
+    this.boxFacesRaw(x0, y0, z0, x1, y1, z1, FACE.nx);
+  }
+
+  /** boxFaces without the setColor: emits the masked faces in whatever colour is current. */
+  private boxFacesRaw(x0: number, y0: number, z0: number, x1: number, y1: number, z1: number, mask: number): void {
+    const u = 0.25, v = ROOF_V;
+    if (mask & FACE.pz) this.quad(x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1, 0, 0, 1, u, v, u, v, u, v, u, v);
+    if (mask & FACE.nz) this.quad(x1, y0, z0, x0, y0, z0, x0, y1, z0, x1, y1, z0, 0, 0, -1, u, v, u, v, u, v, u, v);
+    if (mask & FACE.px) this.quad(x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, 1, 0, 0, u, v, u, v, u, v, u, v);
+    if (mask & FACE.nx) this.quad(x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, -1, 0, 0, u, v, u, v, u, v, u, v);
+    if (mask & FACE.top) this.quad(x0, y1, z1, x1, y1, z1, x1, y1, z0, x0, y1, z0, 0, 1, 0, u, v, u, v, u, v, u, v);
+    if (mask & FACE.bot) this.quad(x0, y0, z0, x1, y0, z0, x1, y0, z1, x0, y0, z1, 0, -1, 0, u, v, u, v, u, v, u, v);
   }
 
   /** Elliptical cylinder (rx along X, rz along Z); sides with meter UVs (windows) or plain, optional top cap. */
@@ -468,13 +527,17 @@ export class GeoBuilder {
       nx /= nl; nz /= nl;
       const ua = windows ? (i / segments) * circ / WINDOW_TILE_W : u, ub = windows ? ((i + 1) / segments) * circ / WINDOW_TILE_W : u;
       const va = windows ? y0 / WINDOW_TILE_H : v, vb = windows ? y1 / WINDOW_TILE_H : v;
+      // Plain drums (tanks, crown rings) take the same baked ambient as the boxes; a windowed shaft keeps its tile.
+      if (!windows && glow === GLOW_U.none) b.setColor(color, dirShade(Math.cos(am), Math.sin(am)));
       b.quad(bx, y0, bz, ax, y0, az, ax, y1, az, bx, y1, bz, nx, 0, nz, ua, va, ub, va, ub, vb, ua, vb);
     }
     if (top !== null) {
       b.setColor(top);
       for (let i = 0; i < segments; i++) {
         const a0 = phase + (i / segments) * Math.PI * 2, a1 = phase + ((i + 1) / segments) * Math.PI * 2;
-        b.tri(cx, y1, cz, cx + Math.cos(a0) * rx, y1, cz + Math.sin(a0) * rz, cx + Math.cos(a1) * rx, y1, cz + Math.sin(a1) * rz, u, v);
+        // Fan wound so the cap faces +Y: a tank, a drum gallery or a fountain basin is looked down on, and the
+        // other winding made every one of them an open tube.
+        b.tri(cx, y1, cz, cx + Math.cos(a1) * rx, y1, cz + Math.sin(a1) * rz, cx + Math.cos(a0) * rx, y1, cz + Math.sin(a0) * rz, u, v);
       }
     }
   }
@@ -531,14 +594,55 @@ export class GeoBuilder {
     }
   }
 
-  /** Vertical wall around an outline between y0 and y1 (plain UV): one outward quad per edge. */
-  private polySides(ol: Outline, y0: number, y1: number): void {
+  /**
+   * Flat roof deck over an outline: the same quad / fan as polyCap, but mapped across the tile's felt-roll band
+   * (ROOF_SEAM_U) along the deck's longer plan axis, so a roof shows roll seams and gravel tone instead of one flat
+   * fill. Ten seams span the band, i.e. 1-4 m apart on the roofs this city has.
+   */
+  roofCap(ol: Outline, y: number, color: number): void {
+    let bx0 = Infinity, bx1 = -Infinity, bz0 = Infinity, bz1 = -Infinity;
+    for (let i = 0; i < ol.n; i++) { bx0 = Math.min(bx0, ol.x[i]); bx1 = Math.max(bx1, ol.x[i]); bz0 = Math.min(bz0, ol.z[i]); bz1 = Math.max(bz1, ol.z[i]); }
+    const alongX = bx1 - bx0 >= bz1 - bz0;
+    const a0 = alongX ? bx0 : bz0, span = Math.max(1e-3, alongX ? bx1 - bx0 : bz1 - bz0);
+    const U = (i: number): number => ROOF_SEAM_U.u0 + (((alongX ? ol.x[i] : ol.z[i]) - a0) / span) * (ROOF_SEAM_U.u1 - ROOF_SEAM_U.u0);
+    const v = ROOF_V;
+    this.setColor(color);
+    if (ol.n === 4) {
+      this.quad(ol.x[0], y, ol.z[0], ol.x[1], y, ol.z[1], ol.x[2], y, ol.z[2], ol.x[3], y, ol.z[3], 0, 1, 0, U(0), v, U(1), v, U(2), v, U(3), v);
+      return;
+    }
+    for (let i = 1; i < ol.n - 1; i++) {
+      const a = this.vertex(ol.x[0], y, ol.z[0], 0, 1, 0, U(0), v);
+      this.vertex(ol.x[i], y, ol.z[i], 0, 1, 0, U(i), v);
+      this.vertex(ol.x[i + 1], y, ol.z[i + 1], 0, 1, 0, U(i + 1), v);
+      this.idx.push(a, a + 1, a + 2);
+    }
+  }
+
+  /**
+   * Vertical wall around an outline between y0 and y1 (plain UV): one outward quad per edge, the vertices shaded from
+   * `kBot` at y0 to `kTop` at y1. The ramp is how a parapet gets the occlusion of the coping that oversails it without
+   * a single extra quad; with kBot = kTop = 1 this is the plain wall.
+   */
+  private polySides(ol: Outline, y0: number, y1: number, color = -1, kBot = 1, kTop = 1): void {
     const u = 0.25, v = ROOF_V;
+    const ramp = color >= 0 && kBot !== kTop;
     for (let i = 0; i < ol.n; i++) {
       const j = (i + 1) % ol.n;
       const nx = -(ol.z[j] - ol.z[i]), nz = ol.x[j] - ol.x[i], l = Math.hypot(nx, nz) || 1;
-      this.quad(ol.x[i], y0, ol.z[i], ol.x[j], y0, ol.z[j], ol.x[j], y1, ol.z[j], ol.x[i], y1, ol.z[i], nx / l, 0, nz / l, u, v, u, v, u, v, u, v);
+      if (!ramp) {
+        this.quad(ol.x[i], y0, ol.z[i], ol.x[j], y0, ol.z[j], ol.x[j], y1, ol.z[j], ol.x[i], y1, ol.z[i], nx / l, 0, nz / l, u, v, u, v, u, v, u, v);
+        continue;
+      }
+      this.setColor(color, kBot);
+      const a = this.vertex(ol.x[i], y0, ol.z[i], nx / l, 0, nz / l, u, v);
+      this.vertex(ol.x[j], y0, ol.z[j], nx / l, 0, nz / l, u, v);
+      this.setColor(color, kTop);
+      this.vertex(ol.x[j], y1, ol.z[j], nx / l, 0, nz / l, u, v);
+      this.vertex(ol.x[i], y1, ol.z[i], nx / l, 0, nz / l, u, v);
+      this.idx.push(a, a + 1, a + 2, a, a + 2, a + 3);
     }
+    if (ramp) this.setColor(color);
   }
 
   /** Plain prism over an outline: sides, optionally the top and the bottom cap. */
@@ -567,18 +671,25 @@ export class GeoBuilder {
     }
     this.setColor(color);
     this.polySides(B, ym, top);
-    this.polyCap(B, top, color, true);
+    // Top ledge as a RING from the slab's outer edge in to the wall line, never a full cap. A full cap laid a pale
+    // slab of the cornice colour over the whole roof deck 2 cm beneath it: up close the deck won the depth test and
+    // the cap was invisible, but at 150 m the two coplanar caps fought and the roof read as a flat pale lid of the
+    // wall tint - the single loudest "pile of pastel boxes" cue in the skyline.
+    for (let i = 0; i < ol.n; i++) {
+      const j = (i + 1) % ol.n;
+      this.quad(B.x[j], top, B.z[j], ol.x[j], top, ol.z[j], ol.x[i], top, ol.z[i], B.x[i], top, B.z[i], 0, 1, 0, u, v, u, v, u, v, u, v);
+    }
   }
 
   /**
    * Hollow wall following an outline (the polygon twin of `frame`): outer faces, inner faces `t` in and the top ring;
    * `inner` false drops the inner faces (a coping seen from the street only).
    */
-  frameOutline(ol: Outline, y0: number, y1: number, t: number, color: number, inner = true): void {
+  frameOutline(ol: Outline, y0: number, y1: number, t: number, color: number, inner = true, kBot = 1, kTop = 1): void {
     const u = 0.25, v = ROOF_V;
     const I = ol.offset(-t, olC);
     this.setColor(color);
-    this.polySides(ol, y0, y1);
+    this.polySides(ol, y0, y1, color, kBot, kTop);
     for (let i = 0; i < ol.n; i++) {
       const j = (i + 1) % ol.n;
       if (inner) {
@@ -616,6 +727,22 @@ function lighten(color: number, k: number): number {
   return tmpColor.getHex();
 }
 
+/** Linear blend from `a` (k = 0) to `b` (k = 1). */
+function mix(a: number, b: number, k: number): number {
+  const ar = (a >> 16) & 255, ag = (a >> 8) & 255, ab = a & 255;
+  const br = (b >> 16) & 255, bg = (b >> 8) & 255, bb = b & 255;
+  return ((((ar + (br - ar) * k) | 0) << 16) | (((ag + (bg - ag) * k) | 0) << 8) | ((ab + (bb - ab) * k) | 0));
+}
+
+/**
+ * Roof deck colour. A roof is felt, bitumen sheet or gravel, never the wall render: darkening the wall tint left every
+ * flat top a pale slab of the building's own pastel, which from 60 m turned the skyline into a heap of tinted boxes.
+ * Each deck keeps ROOF_TINT_KEEP of its building's hue over a bitumen grey, so roofs still differ from each other
+ * without ever reading as wall.
+ */
+const ROOF_GREY = 0x55565a, ROOF_TINT_KEEP = 0.2;
+function roofTint(base: number): number { return mix(ROOF_GREY, darken(base, ROOF_DARKEN), ROOF_TINT_KEEP); }
+
 /**
  * Massing of one building, decided from its id so the render is deterministic and the same plan feeds the base
  * geometry (appendBuilding) and the dressing (appendBuildingDetail). Downtown towers cycle four silhouettes; low
@@ -637,6 +764,9 @@ export interface Massing {
   /** Window texture tile size in metres (u = s / tw, v = y / th) and the cell grid it implies. */
   tw: number; th: number; bayW: number; rowH: number;
 }
+/** Window-tile widths / heights a low-rise building picks from (16 x 28 stays the most common). */
+const LOW_TW = [12, 14, 16, 16, 20] as const;
+const LOW_TH = [24, 28, 28, 32] as const;
 const massingOut: Massing = { kind: 'box', tx0: 0, tz0: 0, tx1: 0, tz1: 0, top: 0, wallTop: 0, stepY: 0, roofVariant: 0, tw: WINDOW_TILE_W, th: WINDOW_TILE_H, bayW: WINDOW_TILE_W / 4, rowH: ROW_V * WINDOW_TILE_H };
 
 /** Fills `massingOut` for the building (shared scratch: copy the fields you need before calling it again). */
@@ -650,6 +780,13 @@ export function massingOf(b: Building): Massing {
     const rhythm = (b.id >> 2) % 3;
     if (rhythm === 1) { if (b.style === 'glass' || b.style === 'neon') m.th = 2 * WINDOW_TILE_H; else m.tw = 20; }
     else if (rhythm === 2) m.tw = 12;
+  } else {
+    // Low-rise grids vary too. Every block using the same 4 m bay and the same 3.43 m storey is what turns a mid-
+    // distance street into one repeated box: these give 3.0-5.0 m bays and 2.9-3.9 m storeys, all whole tiles, so the
+    // painted cells, the built window units and the floor slabs still line up exactly.
+    const g = hashU(b.id * 23 + 5);
+    m.tw = LOW_TW[g % LOW_TW.length];
+    m.th = LOW_TH[(g >>> 3) % LOW_TH.length];
   }
   m.bayW = m.tw / 4; m.rowH = ROW_V * m.th;
   if (b.roofKind === 'stepped' && b.h > 9) {
@@ -745,8 +882,8 @@ export function footprint(b: Building, mask: number, m: Massing, out: Outline): 
  * the jog of each segment (0 or -0.7..-1.0 on a long street face, alternating, the end segments always flush so the
  * corners and the cornice stay intact); a recessed bay (BAY_RECESS) is its own piece inside a flush segment.
  */
-interface FaceLayout { n: number; s: Float64Array; depth: Float64Array; seg: Int8Array; nSeg: number; segS: Float64Array; segDepth: Float64Array }
-const layoutScratch: FaceLayout = { n: 0, s: new Float64Array(40), depth: new Float64Array(40), seg: new Int8Array(40), nSeg: 0, segS: new Float64Array(12), segDepth: new Float64Array(12) };
+interface FaceLayout { n: number; s: Float64Array; depth: Float64Array; seg: Int8Array; nSeg: number; segS: Float64Array; segDepth: Float64Array; segTint: Int8Array; nTint: number }
+const layoutScratch: FaceLayout = { n: 0, s: new Float64Array(40), depth: new Float64Array(40), seg: new Int8Array(40), nSeg: 0, segS: new Float64Array(12), segDepth: new Float64Array(12), segTint: new Int8Array(12), nTint: 1 };
 function layoutFace(len: number, bayW: number, key: number, jog: boolean, recess: boolean, out: FaceLayout = layoutScratch): FaceLayout {
   // Segments at whole bays.
   let nSeg = len > SEG_MIN ? Math.min(10, Math.max(2, Math.round(len / WALL_SEG_LEN))) : 1;
@@ -764,6 +901,16 @@ function layoutFace(len: number, bayW: number, key: number, jog: boolean, recess
     out.segDepth[i] = 0;
     if (jog && nSeg >= 3 && i > 0 && i < nSeg - 1 && (i + jogParity) % 2 === 1) out.segDepth[i] = -(0.7 + 0.3 * hash01(key * 7 + i));
   }
+  // Tint groups. Segments exist to break the window rhythm, and their UV offsets may change at any boundary (the
+  // cells stay on the bay grid, so nothing moves), but the WALL TINT may only change where the plan actually steps:
+  // a tone step across a flat wall reads as a rendering seam, the same step on the reveal of a jog reads as two
+  // blocks built at different times. Flush neighbours therefore share one tint group.
+  let tg = 0;
+  for (let i = 0; i < nSeg; i++) {
+    if (i > 0 && Math.abs(out.segDepth[i] - out.segDepth[i - 1]) > 1e-6) tg++;
+    out.segTint[i] = tg;
+  }
+  out.nTint = tg + 1;
   // Pieces: walk the bays, cutting at segment boundaries and around recessed bays.
   const nBays = Math.floor(len / bayW + 1e-6);
   const phase = hashU(key * 11 + 3) % 3;
@@ -843,7 +990,8 @@ function facade(gb: GeoBuilder, b: Building, ol: Outline, y0: number, y1: number
     const a = [0, 0, 0], c = [0, 0, 0], d = [0, 0, 0], e = [0, 0, 0];
     for (let p = 0; p < lay.n; p++) {
       const s0 = lay.s[p], s1 = lay.s[p + 1], dep = lay.depth[p], seg = lay.seg[p];
-      const col = lay.nSeg === 1 ? wall : perturb(wall, (hash01(key * 31 + seg) - 0.5) * (8 / 360), (hash01(key * 37 + seg) - 0.5) * 0.1);
+      const tg = lay.segTint[seg];
+      const col = lay.nTint === 1 ? wall : perturb(wall, (hash01(key * 31 + tg) - 0.5) * (8 / 360), (hash01(key * 37 + tg) - 0.5) * 0.1);
       gb.setColor(col);
       for (let j = 0; j < bands.n; j++) {
         const ya = bands.y[j], yb = bands.y[j + 1], kv = bands.kv[j];
@@ -872,7 +1020,7 @@ function facade(gb: GeoBuilder, b: Building, ol: Outline, y0: number, y1: number
       gb.texQuad(a[0], a[1], a[2], c[0], c[1], c[2], d[0], d[1], d[2], e[0], e[1], e[2], 0.25, ROOF_V, 0.25, ROOF_V, 0.25, ROOF_V, 0.25, ROOF_V);
     }
   }
-  gb.polyCap(ol, y1, roof, true);
+  gb.roofCap(ol, y1, roof);
 }
 
 /**
@@ -884,7 +1032,7 @@ function facade(gb: GeoBuilder, b: Building, ol: Outline, y0: number, y1: number
  */
 export function appendBuilding(gb: GeoBuilder, b: Building, y0 = BASE_Y, streetMask = 0): void {
   const base = buildingTint(b);
-  const roof = darken(base, ROOF_DARKEN);
+  const roof = roofTint(base);
   const wall = lighten(base, WALL_LIGHTEN);
   const x0 = b.x - b.w / 2, x1 = b.x + b.w / 2, z0 = b.z - b.d / 2, z1 = b.z + b.d / 2;
   const m = massingOf(b);
@@ -1459,7 +1607,10 @@ function parapetWalls(gb: GeoBuilder, ol: Outline, top: number, ph: number, cap:
   let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
   for (let i = 0; i < ol.n; i++) { x0 = Math.min(x0, ol.x[i]); x1 = Math.max(x1, ol.x[i]); z0 = Math.min(z0, ol.z[i]); z1 = Math.max(z1, ol.z[i]); }
   if (x1 - x0 <= 4 || z1 - z0 <= 4 || top < CLUTTER_MIN_H) return;
-  gb.frameOutline(ol.offset(0.25, olE), top - 0.15, top + ph, 0.65, cap);
+  // The coping oversails the parapet by COPING_OUT, so the head of the wall never sees the sky: the outer ring is
+  // ramped from full at its foot to PARAPET_AO under the coping. That band is what tells a roofline apart from the
+  // wall below it at 60 m, and it costs nothing - the quads were already there.
+  gb.frameOutline(ol.offset(0.25, olE), top - 0.15, top + ph, 0.65, cap, true, 1, PARAPET_AO);
   gb.frameOutline(ol.offset(0.25 + COPING_OUT, olE), top + ph, top + ph + COPING_H, 0.65 + 2 * COPING_OUT, lighten(cap, 0.3), false);
 }
 function parapetWallsRect(gb: GeoBuilder, x0: number, z0: number, x1: number, z1: number, top: number, ph: number, cap: number): void {
@@ -1468,10 +1619,90 @@ function parapetWallsRect(gb: GeoBuilder, x0: number, z0: number, x1: number, z1
 
 /** Plant room / AC enclosure with a louvre screen (one dark slat band around it). */
 function plantBox(gb: GeoBuilder, x0: number, y0: number, z0: number, x1: number, y1: number, z1: number, color: number): void {
-  gb.boxPlain(x0, y0, z0, x1, y1, z1, color);
+  gb.litBox(x0, y0, z0, x1, y1, z1, color);
   const slat = darken(color, 0.55), o = 0.06;
   const ya = y0 + (y1 - y0) * 0.5;
   gb.boxPlain(x0 - o, ya - 0.1, z0 - o, x1 + o, ya + 0.1, z1 + o, slat);
+}
+
+/** Margin kept between the rooftop kit and the parapet's inner face, and the colours the kit is built from. */
+const KIT = { margin: 2.4, tank: 0xe8e4da, cradle: 0x6a6560, ac: 0xb0b6bc, acBase: 0x8e8a84, hut: 0xc8c2b6, door: 0x39332c, mast: 0xb0b4ba } as const;
+
+/**
+ * One rooftop kit item centred at (cx, cz) on a deck at `top`, laid out along the deck's long axis (`alongX`).
+ * Kind 0 stair bulkhead, 1 water tanks on a cradle (the flat-roof staple of any Istanbul block), 2 a bank of
+ * condensers on a low plinth, 3 an aerial mast with a dish. 6-19 quads each, all baked-shaded (GeoBuilder.litBox)
+ * and all inside the city-wide trim mesh, which stays out of the shadow pass.
+ */
+function roofKitItem(gb: GeoBuilder, rng: Random, kind: number, cx: number, cz: number, top: number, alongX: boolean): void {
+  // Long axis of the item follows the deck's, so a bank of condensers runs along the roof instead of across it.
+  const L = (l: number, w: number, k: 0 | 1): number => (alongX === (k === 0) ? l : w);
+  if (kind === 0) {
+    const hw = L(1.6, 1.3, 0), hd = L(1.6, 1.3, 1), h = rng.range(2.3, 2.9);
+    gb.litBox(cx - hw, top, cz - hd, cx + hw, top + h, cz + hd, KIT.hut);
+    // Door on the +Z face (or +X when the hut is turned), and a coping lip so the box is not a bare cube.
+    if (alongX) gb.plainQuad(cx - 0.5, top, cz + hd + 0.01, cx + 0.5, top, cz + hd + 0.01, cx + 0.5, top + 1.9, cz + hd + 0.01, cx - 0.5, top + 1.9, cz + hd + 0.01, KIT.door);
+    else gb.plainQuad(cx + hw + 0.01, top, cz + 0.5, cx + hw + 0.01, top, cz - 0.5, cx + hw + 0.01, top + 1.9, cz - 0.5, cx + hw + 0.01, top + 1.9, cz + 0.5, KIT.door);
+    gb.litBox(cx - hw - 0.12, top + h, cz - hd - 0.12, cx + hw + 0.12, top + h + 0.16, cz + hd + 0.12, darken(KIT.hut, 0.8));
+    return;
+  }
+  if (kind === 1) {
+    const n = 1 + rng.int(0, 1), r = 0.82, pitch = 1.95;
+    // Both halves take the same (long, cross) pair; `k` alone does the flipping, so the cradle runs under the row.
+    const cl = n * pitch * 0.5 + 0.35, cc = r + 0.35;
+    const hw = L(cl, cc, 0), hd = L(cl, cc, 1);
+    gb.litBox(cx - hw, top, cz - hd, cx + hw, top + 0.55, cz + hd, KIT.cradle);
+    for (let i = 0; i <= n; i++) {
+      const o = (i - n / 2) * pitch;
+      gb.cylinder(cx + (alongX ? o : 0), cz + (alongX ? 0 : o), r, r, top + 0.55, top + 0.55 + rng.range(1.5, 1.9), 6, KIT.tank, false, lighten(KIT.tank, 0.25));
+    }
+    return;
+  }
+  if (kind === 2) {
+    const n = 2 + rng.int(0, 1), pitch = 1.5;
+    const pl = n * pitch * 0.5 + 0.3;
+    const hw = L(pl, 0.9, 0), hd = L(pl, 0.9, 1);
+    gb.litBox(cx - hw, top, cz - hd, cx + hw, top + 0.22, cz + hd, KIT.acBase);
+    for (let i = 0; i < n; i++) {
+      const o = (i - (n - 1) / 2) * pitch;
+      const ax = cx + (alongX ? o : 0), az = cz + (alongX ? 0 : o);
+      const bw = L(0.62, 0.72, 0), bd = L(0.62, 0.72, 1);
+      gb.litBox(ax - bw, top + 0.22, az - bd, ax + bw, top + 0.22 + rng.range(0.8, 1.0), az + bd, KIT.ac);
+    }
+    return;
+  }
+  const mh = rng.range(3.4, 5.2);
+  gb.bar(cx, top, cz, cx, top + mh, cz, 0.16, KIT.mast);
+  gb.bar(cx - 0.9, top + mh * 0.62, cz, cx + 0.9, top + mh * 0.62, cz, 0.1, KIT.mast);
+  gb.bar(cx, top + mh * 0.82, cz - 0.7, cx, top + mh * 0.82, cz + 0.7, 0.1, KIT.mast);
+  // Satellite dish on a short stand beside the mast: a shallow open cone, six sides.
+  const dx = cx + (alongX ? 1.25 : 0), dz = cz + (alongX ? 0 : 1.25);
+  gb.litBox(dx - 0.18, top, dz - 0.18, dx + 0.18, top + 0.75, dz + 0.18, KIT.cradle);
+  gb.frustum(dx, dz, 0.28, 0.28, 0.72, 0.72, top + 0.75, top + 1.25, 6, lighten(KIT.tank, 0.1), KIT.tank);
+}
+
+/**
+ * Rooftop kit on the deck rx0..rx1 / rz0..rz1. Items are dealt without repeats into disjoint slots down the deck's
+ * long axis (so they can never intersect) and jittered across it. A flat roof in this city is seen from the towers,
+ * from the promenade and from every hill in the skyline shot: a bare deck behind a parapet is the single clearest
+ * "untextured box" cue a stylised city can give, and one to three small solids per roof buy the whole mid-distance read.
+ */
+function roofKit(gb: GeoBuilder, rng: Random, rx0: number, rz0: number, rx1: number, rz1: number, top: number): void {
+  const alongX = rx1 - rx0 >= rz1 - rz0;
+  const len = (alongX ? rx1 - rx0 : rz1 - rz0) - 2 * KIT.margin;
+  const cross = (alongX ? rz1 - rz0 : rx1 - rx0) - 2 * KIT.margin;
+  if (len < 5 || cross < 3) return;
+  // One item per ~9 m of deck, so a 90 m block roof is not dressed like a 12 m one. Three is the cap: the kit reads
+  // from a tower at two items a roof already, and every extra slot is paid for on every roof in view at once.
+  const slots = Math.max(1, Math.min(3, Math.floor(len / 9)));
+  const a0 = (alongX ? rx0 : rz0) + KIT.margin, mid = alongX ? (rz0 + rz1) / 2 : (rx0 + rx1) / 2;
+  const deck = [0, 1, 2, 3];
+  for (let i = 3; i > 0; i--) { const j = rng.int(0, i); const t = deck[i]; deck[i] = deck[j]; deck[j] = t; }
+  const jitter = Math.max(0, cross / 2 - 1.7);
+  for (let s = 0; s < slots; s++) {
+    const a = a0 + ((s + 0.5) / slots) * len, c = mid + rng.range(-jitter, jitter);
+    roofKitItem(gb, rng, deck[s % 4], alongX ? a : c, alongX ? c : a, top, alongX);
+  }
 }
 
 /** Depth (0 or negative) of the wall at position s along a laid-out face. */
@@ -1563,7 +1794,7 @@ function facadeUnits(cells: FacadeCellList, keep: FacadeKeepOut[] | null, b: Bui
 export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Building, rng: Random, signs: WallSign[], streetMask = 15, bandTop = 0, cells: FacadeCellList | null = null, keep: FacadeKeepOut[] | null = null): void {
   const x0 = b.x - b.w / 2, x1 = b.x + b.w / 2, z0 = b.z - b.d / 2, z1 = b.z + b.d / 2;
   const base = buildingTint(b);
-  const roof = darken(base, ROOF_DARKEN);
+  const roof = roofTint(base);
   const wall = lighten(base, WALL_LIGHTEN);
   const h = b.h;
   const downtown = b.district === 'downtown';
@@ -1621,7 +1852,8 @@ export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Buildi
     // Chamfered shaft: a coping ring on the podium edge; the crown handles the shaft top.
     parapetBand(trim, ol, PODIUM_H, wall);
     const rx = (b.w / 2 - 0.4) / Math.cos(OCT), rz = (b.d / 2 - 0.4) / Math.cos(OCT);
-    if (!crown) trim.cylinder(b.x, b.z, rx + 0.3, rz + 0.3, h - 0.6, h - 0.02, 8, darken(wall, 0.85), false, darken(wall, 0.85), GLOW_U.none, OCT);
+    // The coping ring's own cap is the deck it sits on: in the wall tint it laid a pale disc over the whole octagon roof.
+    if (!crown) trim.cylinder(b.x, b.z, rx + 0.3, rz + 0.3, h - 0.6, h - 0.02, 8, darken(wall, 0.85), false, roof, GLOW_U.none, OCT);
     const k = 0.62;
     rx0 = b.x - (b.w / 2) * k; rx1 = b.x + (b.w / 2) * k; rz0 = b.z - (b.d / 2) * k; rz1 = b.z + (b.d / 2) * k;
   } else if (kind === 'podium') {
@@ -1644,7 +1876,9 @@ export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Buildi
     // The top CHAMFER_H metres of the shaft are cut back at 45 degrees (a lighter wall tint on the slopes), with a
     // two-step cornice and a darker string band at the foot of the cut. No saturated accent band: only the neon
     // style keeps a glowing strip there.
-    const slope = lighten(base, 0.42), band = darken(wall, 0.72);
+    // 0.2, not 0.42: a chalk-pale chamfer is what made a crown read as a pastel primitive against the sky. The slopes
+    // stay close to the wall and take their form from FACE_SHADE and the sun instead.
+    const slope = lighten(base, 0.2), band = darken(wall, 0.72);
     if (kind === 'octagon') {
       const rx = (b.w / 2 - 0.4) / Math.cos(OCT), rz = (b.d / 2 - 0.4) / Math.cos(OCT);
       gb.frustum(b.x, b.z, rx, rz, rx - CHAMFER_H, rz - CHAMFER_H, topY, top, 8, slope, roof, OCT);
@@ -1661,6 +1895,12 @@ export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Buildi
     rw = rx1 - rx0; rd = rz1 - rz0;
     const mw = rw * 0.4, md = rd * 0.4, mx = (rx0 + rx1) / 2, mz = (rz0 + rz1) / 2;
     if (mw > 3 && md > 3) plantBox(trim, mx - mw / 2, top, mz - md / 2, mx + mw / 2, top + 4, mz + md / 2, darken(base, 0.7));
+    // A crown deck is the most-seen roof in the city (every taller tower looks down on it), and the plant room alone
+    // left it bare: an aerial and a tank stand flank it, clear of the middle 40 % the plant room takes.
+    if (rw > 15 && rd > 8) {
+      roofKitItem(trim, rng, 3, rx0 + 3.2, mz, top, false);
+      roofKitItem(trim, rng, 1, rx1 - 3.2, mz, top, false);
+    }
     if (b.id % 4 === 2) {
       const sh = Math.max(10, top * 0.14);
       trim.bar(mx, top + 4, mz, mx, top + 4 + sh, mz, 0.7, 0xb0b4ba);
@@ -1669,34 +1909,9 @@ export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Buildi
     }
   }
 
-  // --- Roof clutter (one piece; roofs under CLUTTER_MIN_H are never seen from the street) ----------------
-  // Everything stays inside the parapet's inner face (0.4 m in from the roof edge) with room to spare.
-  if (b.roofKind !== 'spire' && rw > 9 && rd > 9 && !crown && top >= CLUTTER_MIN_H) {
-    {
-      const cx = rng.range(rx0 + 2.4, rx1 - 2.4), cz = rng.range(rz0 + 2.4, rz1 - 2.4);
-      const kindR = rng.int(0, 3);
-      if (kindR === 0) {
-        // Water tank on a short cradle.
-        trim.boxPlain(cx - 1.15, top, cz - 1.15, cx + 1.15, top + 0.65, cz + 1.15, 0x5f5a55);
-        trim.cylinder(cx, cz, 1.2, 1.2, top + 0.65, top + 3.1, 6, 0x8a6742, false, 0x6d5238);
-      } else if (kindR === 1) {
-        // Pair of AC condensers.
-        trim.boxPlain(cx - 0.95, top, cz - 0.65, cx + 0.95, top + 0.95, cz + 0.65, 0xacb2b8);
-        if (cx + 3.15 <= rx1 - 0.5) trim.boxPlain(cx + 1.25, top, cz - 0.65, cx + 3.15, top + 0.95, cz + 0.65, 0xacb2b8);
-      } else if (kindR === 2) {
-        // Roof access box with a door.
-        trim.boxPlain(cx - 1.5, top, cz - 1.25, cx + 1.5, top + 2.5, cz + 1.25, lighten(roof, 0.3));
-        trim.plainQuad(cx - 0.55, top, cz + 1.26, cx + 0.55, top, cz + 1.26, cx + 0.55, top + 1.8, cz + 1.26, cx - 0.55, top + 1.8, cz + 1.26, 0x39332c);
-      } else {
-        trim.cylinder(cx, cz, 0.36, 0.36, top, top + 1.5, 5, 0x9aa0a6, false, 0x767c82);
-      }
-    }
-  }
-  // Plant / AC enclosure on one roof in four.
-  if (b.roofKind !== 'spire' && rw > 8 && rd > 8 && !crown && top >= CLUTTER_MIN_H && rng.chance(1 / 4)) {
-    const cx = rng.range(rx0 + 2.5, rx1 - 2.5), cz = rng.range(rz0 + 2.4, rz1 - 2.4);
-    plantBox(trim, cx - 1.5, top, cz - 1.25, cx + 1.5, top + 2, cz + 1.25, 0x9a948c);
-  }
+  // --- Rooftop kit (roofs under CLUTTER_MIN_H are never seen from the street) --------------------------
+  // Everything stays inside the parapet's inner face (KIT.margin in from the roof edge) with room to spare.
+  if (b.roofKind !== 'spire' && rw > 9 && rd > 9 && !crown && top >= CLUTTER_MIN_H) roofKit(trim, rng, rx0, rz0, rx1, rz1, top);
   if (top > 26 && top <= CROWN_MIN_H && b.roofKind !== 'spire' && rng.chance(0.5)) {
     const ax = (rx0 + rx1) / 2 + rng.range(-rw * 0.22, rw * 0.22), az = (rz0 + rz1) / 2 + rng.range(-rd * 0.22, rd * 0.22);
     const mastTop = top + rng.range(5, 13);

@@ -17,8 +17,16 @@ import { WINDOW_CELL, WINDOW_CELL_FRAME_PX } from './TextureFactory';
 export const FACADE_RANGE = { window: 55, balcony: 90, ac: 45, pipe: 70, highWindow: 30, highFloorY: 20.5, repackMove: 15 } as const;
 /** Instance budget of the batch (units inside the ranges are packed nearest-first until it is full). */
 const MAX_UNITS = 3000;
-/** Frame depth (m proud of the wall), sill depth and thickness, balcony slab / parapet / rail sizes. */
-const UNIT = { frameOut: 0.15, sillOut: 0.22, sillH: 0.07, balconyDepth: 0.9, balconyH: 1.15, slabH: 0.14, parapetT: 0.1, railT: 0.06, acD: 0.32, pipeD: 0.1 } as const;
+/**
+ * Frame depth (m proud of the wall), sill depth and thickness, balcony slab / parapet / rail sizes.
+ * frameOut is the whole point of the near LOD: the painted cell lies on the wall plane, so a surround standing this
+ * far proud of it puts the pane at the back of a real 0.26 m box. At the old 0.15 m the relief was a picture frame
+ * and the glass read as flush paint; at 0.26 m the head and the jambs throw a reveal shadow onto the pane and the
+ * sill at every sun angle, which is what a punched window actually looks like from the far pavement.
+ */
+const UNIT = { frameOut: 0.26, sillOut: 0.32, sillH: 0.07, balconyDepth: 0.9, balconyH: 1.15, slabH: 0.14, parapetT: 0.1, railT: 0.06, acD: 0.32, pipeD: 0.1 } as const;
+/** Baked AO along a reveal: this much of the frame colour at the pane, this much at the outer face. */
+const REVEAL = { deep: 0.3, front: 0.88 } as const;
 /** Frame / sill colours per style: white PVC on residential, precast on concrete, bronze with stone sills on art deco, charcoal on the neon strip. */
 const FRAME_COLOR: Record<BuildingStyle, { frame: number; sill: number }> = {
   residential: { frame: 0xf2eee6, sill: 0xe4e0d8 },
@@ -53,6 +61,18 @@ class UnitBuilder {
   }
 
   /**
+   * Quad with a shade multiplier per vertex on top of `hex`: baked AO down a reveal. A reveal is a 0.26 m slot whose
+   * far end never sees the sky, and the vertex ramp says so at every hour without a second light or an AO pass.
+   */
+  shadedQuad(ax: number, ay: number, az: number, bx: number, by: number, bz: number, cx: number, cy: number, cz: number, dx: number, dy: number, dz: number, nx: number, ny: number, nz: number,
+    hex: number, ka: number, kb: number, kc: number, kd: number): void {
+    color.setHex(hex);
+    const v = (x: number, y: number, z: number, k: number): void => { this.pos.push(x, y, z); this.nor.push(nx, ny, nz); this.col.push(color.r * k, color.g * k, color.b * k); };
+    v(ax, ay, az, ka); v(bx, by, bz, kb); v(cx, cy, cz, kc);
+    v(ax, ay, az, ka); v(cx, cy, cz, kc); v(dx, dy, dz, kd);
+  }
+
+  /**
    * Axis-aligned box in unit space (x across the wall, y up, z out of the wall) emitting only the faces in `faces`:
    * bit 1 front (+z), 2 back (-z), 4 right (+x), 8 left (-x), 16 top, 32 bottom.
    */
@@ -80,26 +100,33 @@ const F = { front: 1, back: 2, right: 4, left: 8, top: 16, bottom: 32 } as const
 
 /**
  * Window unit for a pane `w` x `h` (its centre at the origin on the wall plane): a head bar and two jambs UNIT.frameOut
- * proud of the wall whose faces toward the opening are the dark reveals, and a sill UNIT.sillOut deep under the pane.
- * 11 quads: head front + underside, jambs front + reveal + outer flank, sill front + top + underside.
+ * proud of the wall, the three faces looking into that slot drawn as reveals shaded from REVEAL.front at the outer
+ * face down to REVEAL.deep where they meet the pane, and a sill UNIT.sillOut deep under the pane whose top carries the
+ * same ramp (the shadow the head throws onto it). The painted cell sits at the back of the slot, so the glass reads as
+ * recessed instead of flush.
+ * 11 quads: head front + reveal, jambs front + reveal + outer flank, sill front + top + underside.
  */
 function windowUnit(w: number, h: number, jamb: number, head: number, style: BuildingStyle): THREE.BufferGeometry {
   const u = new UnitBuilder();
   const c = FRAME_COLOR[style];
   const d = UNIT.frameOut, x0 = -w / 2, x1 = w / 2, y0 = -h / 2, y1 = h / 2;
+  const jx0 = x0 - jamb, jx1 = x1 + jamb, hy = y1 + head;
+  const F0 = REVEAL.deep, F1 = REVEAL.front;
   u.setColor(c.frame);
-  u.box(x0 - jamb, y1, 0, x1 + jamb, y1 + head, d, F.front);
-  u.box(x0 - jamb, y0, 0, x0, y1 + head, d, F.front | F.left);
-  u.box(x1, y0, 0, x1 + jamb, y1 + head, d, F.front | F.right);
-  // Reveals: the faces looking into the opening, kept dark whatever the sun does.
-  u.setColor(c.frame, 0.5);
-  u.box(x0 - jamb, y1, 0, x1 + jamb, y1 + head, d, F.bottom);
-  u.box(x0 - jamb, y0, 0, x0, y1 + head, d, F.right);
-  u.box(x1, y0, 0, x1 + jamb, y1 + head, d, F.left);
+  u.box(jx0, y1, 0, jx1, hy, d, F.front);
+  u.box(jx0, y0, 0, x0, hy, d, F.front | F.left);
+  u.box(x1, y0, 0, jx1, hy, d, F.front | F.right);
+  // Head reveal (faces down over the pane), then both jamb reveals (facing into the opening).
+  u.shadedQuad(jx0, y1, 0, jx1, y1, 0, jx1, y1, d, jx0, y1, d, 0, -1, 0, c.frame, F0, F0, F1, F1);
+  u.shadedQuad(x0, y0, d, x0, y0, 0, x0, hy, 0, x0, hy, d, 1, 0, 0, c.frame, F1, F0, F0, F1);
+  u.shadedQuad(x1, y0, 0, x1, y0, d, x1, hy, d, x1, hy, 0, -1, 0, 0, c.frame, F0, F1, F1, F0);
+  const sx0 = jx0 - 0.05, sx1 = jx1 + 0.05, sy = y0 - UNIT.sillH, so = UNIT.sillOut;
   u.setColor(c.sill);
-  u.box(x0 - jamb - 0.05, y0 - UNIT.sillH, 0, x1 + jamb + 0.05, y0, UNIT.sillOut, F.front | F.top);
+  u.box(sx0, sy, 0, sx1, y0, so, F.front);
+  // Sill top: bright where it runs out past the surround, dark back inside the reveal.
+  u.shadedQuad(sx0, y0, so, sx1, y0, so, sx1, y0, 0, sx0, y0, 0, 0, 1, 0, c.sill, 1, 1, F0, F0);
   u.setColor(c.sill, 0.6);
-  u.box(x0 - jamb - 0.05, y0 - UNIT.sillH, 0, x1 + jamb + 0.05, y0, UNIT.sillOut, F.bottom);
+  u.box(sx0, sy, 0, sx1, y0, so, F.bottom);
   return u.build();
 }
 

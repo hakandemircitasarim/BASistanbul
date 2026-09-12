@@ -1,15 +1,21 @@
 // Street props for CityRenderer: palms (two seeded variants: trunk + alpha fronds near, one solid far LOD beyond
-// PROP_RANGE.palmNear), seeded round-crown sidewalk trees, lumpy hedge units, lamps (pole + head + glow), benches,
-// hydrants, bins, signs, shelters (frame + glazing), bollards; plus the static parked cars (one cheap shell per spec,
-// paint per instance) of the lot bays and the kerbs, kerb islands and planters. Track B.
+// PROP_RANGE.palmNear), sidewalk trees in two species (broad forked crowns and tall tiered cypresses), clipped hedge
+// units, lamps (pole + head + pavement pool), benches, hydrants, bins, signs, shelters (frame + glazing), bollards,
+// the batched street clutter (utility poles with catenary wires, traffic signs, alley dumpsters, café tables with
+// parasols); plus the static parked cars of the lot bays and the kerbs (a coarse shell per spec, the full body loft
+// for the handful nearest the camera, paint per instance), kerb islands and planters. Track B.
 //
 // Everything is sculpted from lathes, swept tubes and rounded slabs rather than raw boxes: a gooseneck lamp arm, a
 // chamfered bollard, a slatted bench with cast-iron ends, a glazed shelter with a rounded roof, fronds that arch from
 // their base with a V midrib and a fibrous crown. Every part that shares a material lives in ONE THREE.BatchedMesh per
 // material (multi-draw): all the vertex-coloured furniture is a single draw call (+ one shadow draw), so is the
-// foliage (tree variants, hedge variants, far palms), the parked shells (paint per instance through the batch colour),
-// the palm trunks and the alpha fronds. Only the lamp parts (three materials), the shelter glass and the additive glow
-// quads keep their own InstancedMesh, so the whole prop pass is 9 meshes.
+// foliage (tree species, hedge variants, far palms), the coarse parked shells and the near ones (paint per instance
+// through the batch colour), the palm trunks and the alpha fronds. Only the lamp parts (three materials), the shelter
+// glass, the additive pool quads and the wire LineSegments keep their own mesh, so the prop pass is 11 meshes.
+//
+// After dark the lamps closest to the camera also carry real THREE.PointLights (LAMP_LIGHTS): a small fixed pool
+// created once and re-aimed at the nearest heads every frame, so the asphalt's normal map and its damp night
+// roughness answer the street lighting instead of only an additive disc painting over them.
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
@@ -20,21 +26,31 @@ import { SPECS } from '../entities/VehicleSpecs';
 import { Random } from '../core/Random';
 import type { Materials } from './Materials';
 import { surface, tube, type Ring } from './PlayerRenderer';
-import { makeVehiclePaintMaterial, parkedShellGeometry } from './VehicleRenderer';
+import { makeVehiclePaintMaterial, parkedNearGeometry, parkedShellGeometry } from './VehicleRenderer';
 
-export const PROP_DIMS = { palmTrunkH: 6.4, palmFrondLen: 4.4, palmFrondW: 2.3, lampH: 6.5, lampArm: 1.4, poolRadius: 9 } as const;
+export const PROP_DIMS = { palmTrunkH: 6.4, palmFrondLen: 4.4, palmFrondW: 2.3, lampH: 6.5, lampArm: 1.4, poolRadius: 5.5 } as const;
 
 /** Street furniture colours; each part is baked into the vertex colours so one material covers every kind. */
 const FURN = {
   binBody: 0x33513f, binLid: 0x1d3025, binBand: 0x9aa4a8, pole: 0x8b9298, blade: 0x1d6a49,
   post: 0x4a5058, roof: 0x2f353b, fascia: 0xb8702c, frame: 0x30353a, seat: 0x9a6a3c, iron: 0x2b2f33,
   bollard: 0x3c4147, bollardCap: 0xc3c8cd, hydrant: 0xd8302a, hydrantDark: 0x8e1f1a,
-  kerb: 0x9c988f, kerbTop: 0xaaa69d, gravel: 0x5a5148, pot: 0x8f897d, potRim: 0x9d978b, soil: 0x3d3229, shrub: 0x3f6d38, shrubLit: 0x6f9a4c,
+  kerb: 0x9c988f, kerbTop: 0xaaa69d, gravel: 0x5a5148, pot: 0x8f897d, potRim: 0x9d978b, soil: 0x3d3229, shrub: 0x44663f, shrubLit: 0x709056,
   // Trees (foliage material): bark, crown mass, its lit top and shaded underside; the far palm's trunk and fans.
-  bark: 0x5c4634, barkDark: 0x3d2e22, crown: 0x477536, crownLit: 0x84b258, crownDark: 0x2f5228,
+  // Every green here is the old hue at 75 % of its saturation: the lime crowns read as poster paint next to the
+  // desaturated stone and asphalt of the rest of the city, and a stylised city wants its foliage a shade dustier.
+  bark: 0x5c4634, barkDark: 0x3d2e22, crown: 0x4b6d3e, crownLit: 0x7a9459, crownDark: 0x2c4128,
   // Hedges: a deeper, less lime green than the planter shrubs, lit along the clipped top and shaded at the foot.
-  hedge: 0x3a6a33, hedgeLit: 0x6a9c4b, hedgeDark: 0x22421f,
-  palmBarkFar: 0x8b7252, frondFar: 0x5b8f3c, frondFarTip: 0x7fae4e,
+  hedge: 0x3f633a, hedgeLit: 0x62874e, hedgeDark: 0x263e23,
+  // Conifer: darker and bluer than the broad crowns, so a cypress reads as the shadow note in a row of them.
+  conifer: 0x35512f, coniferLit: 0x5c7a48, coniferDark: 0x1e3220,
+  palmBarkFar: 0x8b7252, frondFar: 0x5e8546, frondFarTip: 0x7fa25a,
+  // Clutter: creosoted pole timber, its steel crossarm and porcelain insulators; sign post / plate / face; dumpster
+  // steel, its heavier lid and rubber castors; café table top, its rim and the two tones of the parasol canopy.
+  poleWood: 0x7a6247, poleWoodDark: 0x4e3e2c, poleArm: 0x6b6f74, insulator: 0xbfd4cf,
+  signPost: 0x8d949b, signFace: 0xe9e5da, signRed: 0xb52f27, signBack: 0x6f757c,
+  dumpster: 0x3c6a72, dumpsterLid: 0x2a4a50, castor: 0x1d2023,
+  tableTop: 0xd8cdb8, tableRim: 0x8d8471, parasolA: 0xd8623c, parasolB: 0xe9e2d2, parasolPole: 0x8d8471,
 } as const;
 
 /** Lot floor height (CityRenderer's STREET.lotFloorY: the asphalt sits 2 cm above the block pavement). */
@@ -175,6 +191,100 @@ function shelterGlassGeometry(): THREE.BufferGeometry {
   const end = new THREE.BoxGeometry(0.012, 1.74, 1.22);
   end.translate(-1.72, 1.31, 0.04);
   return fuse([back, end]);
+}
+
+/** Height of the wire crossarm on a utility pole, and the insulator offsets across it (the renderer strings wires here). */
+export const UTILITY = { height: 8.2, armY: 7.35, armHalf: 0.62, wireDrop: 0.16 } as const;
+
+/**
+ * Timber utility pole: an 8-sided creosoted trunk with a slight taper and a dark base band, a steel crossarm across
+ * the street, three porcelain insulators (the wires hang from these) and a small service box strapped low down.
+ * Authored with local +Z pointing at the road, so the crossarm runs along local X (the line of poles).
+ */
+function utilityPoleGeometry(): THREE.BufferGeometry {
+  const H = UTILITY.height;
+  const post = lathe([R(0, 0.16), R(0.35, 0.145), R(H * 0.55, 0.125), R(H, 0.105)], 8, FURN.poleWood, true);
+  blendTo(post, FURN.poleWoodDark, (_x, y) => (y < 1.1 ? 1 - y / 1.1 : 0) * 0.85);
+  const parts: THREE.BufferGeometry[] = [post];
+  parts.push(slab(UTILITY.armHalf * 2 + 0.2, 0.09, 0.075, 0, UTILITY.armY, 0, FURN.poleArm));
+  // Diagonal brace under the arm.
+  const brace = slab(0.05, 0.05, 0.6, 0, 0, 0, FURN.poleArm);
+  brace.rotateX(0.75);
+  brace.translate(0, UTILITY.armY - 0.26, 0);
+  parts.push(brace);
+  for (let k = -1; k <= 1; k++) {
+    const x = k * UTILITY.armHalf;
+    parts.push(lathe([R(UTILITY.armY + 0.04, 0.045, x), R(UTILITY.armY + 0.1, 0.07, x), R(UTILITY.armY + 0.15, 0.05, x), R(UTILITY.armY + 0.2, 0.065, x)], 6, FURN.insulator, true));
+  }
+  parts.push(slab(0.3, 0.42, 0.2, 0, 2.5, 0.16, FURN.poleArm, 0.03));
+  return fuse(parts);
+}
+
+/**
+ * Traffic sign: a slim galvanised post with a round plate on it — a red ring around a pale face, a darker back — plus
+ * a small rectangular plate below it. The faces look along local -Z (the yaw the generator gives it aims that at the
+ * oncoming lane).
+ */
+function roadSignGeometry(): THREE.BufferGeometry {
+  const post = lathe([R(0, 0.06), R(0.07, 0.06), R(0.1, 0.042), R(2.35, 0.036)], 6, FURN.signPost, true);
+  const parts: THREE.BufferGeometry[] = [post];
+  const y = 2.0;
+  // Plate: a 10-sided disc standing across local z — a red rim around a pale face, dark on the back.
+  const plate = new THREE.CylinderGeometry(0.3, 0.3, 0.026, 10, 1, false);
+  plate.rotateX(Math.PI / 2);
+  plate.translate(0, y, -0.045);
+  const face = paint(bare(plate), FURN.signFace);
+  blendTo(face, FURN.signRed, (x, py) => (Math.hypot(x, py - y) > 0.2 ? 1 : 0));
+  blendTo(face, FURN.signBack, (_x, _py, z) => (z > -0.045 ? 1 : 0));
+  parts.push(face);
+  parts.push(slab(0.46, 0.2, 0.02, 0, 1.5, -0.045, FURN.signFace));
+  return fuse(parts);
+}
+
+/**
+ * Wheeled dumpster: a tapered steel tub (wider at the lip), a heavier hinged lid sloping to the front, a kick rail and
+ * four small castors. Authored long along local X, backed against the alley wall at local +Z.
+ */
+function dumpsterGeometry(): THREE.BufferGeometry {
+  const parts: THREE.BufferGeometry[] = [];
+  // Tub: a 4-sided lathe (a box that flares), so the walls lean out like a real skip.
+  const tub = tube([{ y: 0.16, rx: 1.02, rz: 0.6 }, { y: 1.12, rx: 1.16, rz: 0.72 }, { y: 1.2, rx: 1.18, rz: 0.74 }], 4, false, true);
+  tub.rotateY(Math.PI / 4); // 4-gon lathe -> a box with flat sides facing the axes
+  parts.push(blendTo(paint(tub, FURN.dumpster), FURN.dumpsterLid, (_x, y) => Math.max(0, Math.min(1, 1 - y / 0.7)) * 0.55));
+  const lid = slab(2.34, 0.09, 1.42, 0, 1.24, 0, FURN.dumpsterLid, 0.04);
+  lid.rotateX(0.07);
+  parts.push(lid);
+  parts.push(slab(2.3, 0.07, 0.07, 0, 0.58, -0.62, FURN.dumpsterLid));
+  for (let k = 0; k < 4; k++) {
+    const x = (k < 2 ? -1 : 1) * 0.82, z = (k % 2 === 0 ? -1 : 1) * 0.42;
+    parts.push(lathe([R(0.0, 0.12, x, z), R(0.14, 0.12, x, z)], 6, FURN.castor, true, true));
+  }
+  return fuse(parts);
+}
+
+/**
+ * Café table: a round top on a cast column and a cross foot, with a parasol standing through it — an 8-panel canopy
+ * in two alternating tones on a pole, the classic striped awning of a Turkish çay bahçesi.
+ */
+function cafeTableGeometry(): THREE.BufferGeometry {
+  const parts: THREE.BufferGeometry[] = [];
+  const top = lathe([R(0.70, 0.40), R(0.74, 0.42), R(0.76, 0.40)], 10, FURN.tableTop, true, true);
+  blendTo(top, FURN.tableRim, (x, _y, z) => (Math.hypot(x, z) > 0.36 ? 1 : 0));
+  parts.push(top);
+  parts.push(lathe([R(0.02, 0.16), R(0.05, 0.1), R(0.70, 0.07)], 6, FURN.tableRim, false, true));
+  parts.push(lathe([R(0.76, 0.035), R(2.05, 0.032)], 6, FURN.parasolPole));
+  // Canopy: alternating panels, so the parasol reads as striped rather than as one orange cone.
+  for (let k = 0; k < 8; k++) {
+    const a0 = (k / 8) * Math.PI * 2, a1 = ((k + 1) / 8) * Math.PI * 2;
+    const panel = surface(2, 2, false, false, (i, j, out) => {
+      const a = j === 0 ? a0 : a1;
+      if (i === 0) out.set(0, 2.16, 0);
+      else out.set(Math.sin(a) * 1.05, 1.82, Math.cos(a) * 1.05);
+    });
+    const both = fuse([panel, flipFaces(panel)]);
+    parts.push(paint(both, k % 2 === 0 ? FURN.parasolA : FURN.parasolB));
+  }
+  return fuse(parts);
 }
 
 /** Promenade bollard: a chamfered post with a domed light cap. */
@@ -436,47 +546,208 @@ export function frondsGeometry(topX: number, topY: number, seed: number): THREE.
 }
 
 /**
- * Sidewalk tree `seed`: an 8-sided tapered trunk with a darker foot and a crown of 4-6 overlapping icosahedral lobes
- * (one big central mass, the rest scattered around it at seeded angles, heights and radii), lit from the top through
- * the vertex colours (crownLit at the top of the mass, crownDark on the underside) so the faceted lobes read as one
- * round volume of leaves. 380-550 triangles; the three seeds, the per-instance scale (0.8-1.3) and the batch colour
- * tint keep a street from repeating.
+ * Direction-driven wobble in [-1, 1]: three sine products of the *normalised* vertex direction, so a non-indexed
+ * primitive (three's polyhedra duplicate their corners per face) displaces every copy of a corner identically and the
+ * shell never tears. `p` shifts the pattern per lobe.
+ */
+function lobeWobble(x: number, y: number, z: number, p: number): number {
+  const l = Math.max(1e-4, Math.sqrt(x * x + y * y + z * z));
+  const nx = x / l, ny = y / l, nz = z / l;
+  return Math.sin(nx * 5.3 + p) * Math.sin(ny * 4.1 + p * 1.7 + 1.1) * Math.sin(nz * 6.2 + p * 0.6 + 2.3);
+}
+
+/**
+ * One crown lobe: an icosahedron (detail 1 for the big masses, 0 for the small outer ones) pushed in and out by
+ * `lobeWobble` so no two lobes share a silhouette, then re-normalled flat and blended `soft` of the way back toward
+ * the direction out of the crown centre — the facets stay visible (low poly, not a smooth ball) but the lobe still
+ * shades as one volume, lit on top and dark underneath.
+ */
+function crownLobe(r: number, detail: 0 | 1, phase: number, amp: number, squash: number, soft: number): THREE.BufferGeometry {
+  const g = bare(new THREE.IcosahedronGeometry(r, detail));
+  const pos = g.attributes.position;
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+    const k = 1 + amp * lobeWobble(x, y, z, phase);
+    pos.setXYZ(i, x * k, y * k * squash, z * k);
+  }
+  g.computeVertexNormals();
+  canopyNormals(g, 0, soft);
+  return g;
+}
+
+/**
+ * Leaf fringe: a spray of two crossed cards (with back faces, so it never disappears edge-on) hanging off the crown
+ * silhouette at (ox, oy, oz). Breaks the ball outline into something leafy without an alpha map.
+ */
+function leafSpray(ox: number, oy: number, oz: number, w: number, h: number, yaw: number, tilt: number, hex: number): THREE.BufferGeometry {
+  const cards: THREE.BufferGeometry[] = [];
+  for (let c = 0; c < 2; c++) {
+    // A rhombus, not a quad: a rectangle hanging off a crown reads as exactly what it is.
+    const p = new THREE.BufferGeometry();
+    p.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
+      0, -h * 0.5, 0, w * 0.5, 0, 0, 0, h * 0.5, 0,
+      0, -h * 0.5, 0, 0, h * 0.5, 0, -w * 0.5, 0, 0,
+    ]), 3));
+    p.computeVertexNormals();
+    p.rotateZ(tilt);
+    p.rotateY(yaw + c * Math.PI * 0.5);
+    p.translate(ox, oy, oz);
+    cards.push(p, flipFaces(p));
+  }
+  const g = fuse(cards);
+  // Both faces keep a canopy normal (out of a point below the crown axis), so a card never goes black edge-on the way
+  // a back face with a negated normal does.
+  canopyNormals(g, oy - 2.2, 1);
+  return paint(g, hex);
+}
+
+/** Copy of a non-indexed geometry with every triangle's winding reversed (its normals are left pointing where they were). */
+function flipFaces(src: THREE.BufferGeometry): THREE.BufferGeometry {
+  const g = src.clone();
+  for (const name of ['position', 'normal'] as const) {
+    const a = g.attributes[name] as THREE.BufferAttribute | undefined;
+    if (!a) continue;
+    const arr = a.array as Float32Array, s = a.itemSize;
+    for (let i = 0; i + 3 * s <= arr.length; i += 3 * s) {
+      for (let k = 0; k < s; k++) { const t = arr[i + s + k]; arr[i + s + k] = arr[i + 2 * s + k]; arr[i + 2 * s + k] = t; }
+    }
+    a.needsUpdate = true;
+  }
+  return g;
+}
+
+/** Crown shading shared by both tree species: lit toward the top of the mass, dark at the foot and on the undersides. */
+function shadeCrown(g: THREE.BufferGeometry, yLo: number, yHi: number, lit: number, darkSpan: number): void {
+  paint(g, FURN.crown);
+  blendTo(g, FURN.crownLit, (_x, y) => Math.max(0, Math.min(1, (y - yLo) / Math.max(0.2, yHi - yLo) - 0.25)) * lit);
+  blendTo(g, FURN.crownDark, (_x, y) => Math.max(0, Math.min(1, 1 - (y - yLo) / darkSpan)) * 0.85);
+  // Interior band: whatever faces down or inward goes darker still, so the crown has a shaded belly instead of one
+  // flat top-lit gradient wrapped around a ball.
+  const nrm = g.attributes.normal, col = g.attributes.color;
+  scratchColor.setHex(FURN.crownDark);
+  for (let i = 0; i < nrm.count; i++) {
+    const t = Math.max(0, Math.min(1, (-nrm.getY(i) - 0.05) / 0.55)) * 0.55;
+    if (t <= 0) continue;
+    col.setXYZ(i, col.getX(i) + (scratchColor.r - col.getX(i)) * t, col.getY(i) + (scratchColor.g - col.getY(i)) * t, col.getZ(i) + (scratchColor.b - col.getZ(i)) * t);
+  }
+}
+
+/**
+ * Broad sidewalk tree `seed`: a short tapered trunk that forks into two or three limbs, and a crown of 8-10 noisy
+ * lobes (2-3 big masses at icosahedron detail 1, the rest small detail-0 balls scattered around and below them), plus
+ * a fringe of crossed leaf cards hanging off the silhouette. 500-650 triangles; the seeds, the per-instance scale
+ * (0.8-1.3) and the batch colour tint keep a street from repeating.
  */
 function treeGeometry(seed: number): THREE.BufferGeometry {
   const rng = new Random(seed);
-  const trunkH = rng.range(3.3, 3.9);
-  const trunk = lathe([R(0, 0.26), R(0.12, 0.2), R(1.5, 0.15), R(trunkH * 0.8, 0.12), R(trunkH + 0.4, 0.09)], 8, FURN.bark);
-  blendTo(trunk, FURN.barkDark, (_x, y) => (y < 0.4 ? 1 - y / 0.4 : 0) * 0.8);
+  const forkH = rng.range(1.9, 2.4), trunkH = forkH + rng.range(1.2, 1.7);
+  const trunk = lathe([R(0, 0.3), R(0.14, 0.22), R(1.2, 0.17), R(forkH, 0.15)], 8, FURN.bark, false, false);
+  blendTo(trunk, FURN.barkDark, (_x, y) => (y < 0.5 ? 1 - y / 0.5 : 0) * 0.85);
   const parts: THREE.BufferGeometry[] = [trunk];
-  const cy = trunkH + 1.0;
-  const lobes: [number, number, number, number][] = [[0, cy + 0.1, 0, rng.range(1.5, 1.8)]];
-  const n = rng.int(4, 6), a0 = rng.range(0, Math.PI * 2);
-  for (let k = 1; k < n; k++) {
-    const a = a0 + ((k - 1) / (n - 1)) * Math.PI * 2 + rng.range(-0.45, 0.45);
-    const d = rng.range(0.55, 1.0), r = rng.range(1.0, 1.4);
-    lobes.push([Math.cos(a) * d, cy + rng.range(-0.55, 0.45), Math.sin(a) * d, r]);
+  // Fork: two or three limbs leaning out of the trunk top toward the big crown masses.
+  const limbs = rng.int(2, 3), a0 = rng.range(0, Math.PI * 2);
+  const limbTop: [number, number, number][] = [];
+  for (let k = 0; k < limbs; k++) {
+    const a = a0 + (k / limbs) * Math.PI * 2 + rng.range(-0.3, 0.3);
+    const lean = rng.range(0.45, 0.85), top = trunkH + rng.range(-0.15, 0.35);
+    const tx = Math.cos(a) * lean, tz = Math.sin(a) * lean;
+    const limb = lathe([R(forkH - 0.25, 0.13, tx * 0.1, tz * 0.1), R((forkH + top) / 2, 0.105, tx * 0.45, tz * 0.45), R(top, 0.075, tx, tz)], 6, FURN.bark);
+    parts.push(limb);
+    limbTop.push([tx, tz, top]);
+  }
+  // Crown: one big mass over each limb, then small lobes filling and overhanging the gaps between them.
+  const lobes: [number, number, number, number, 0 | 1][] = [];
+  for (let k = 0; k < limbs; k++) {
+    const [tx, tz, top] = limbTop[k];
+    lobes.push([tx * 1.25, top + rng.range(0.5, 0.9), tz * 1.25, rng.range(1.15, 1.45), 1]);
+  }
+  const small = rng.int(5, 7), b0 = rng.range(0, Math.PI * 2);
+  for (let k = 0; k < small; k++) {
+    const a = b0 + (k / small) * Math.PI * 2 + rng.range(-0.35, 0.35);
+    const d = rng.range(0.9, 1.75);
+    lobes.push([Math.cos(a) * d, trunkH + rng.range(0.1, 1.35), Math.sin(a) * d, rng.range(0.62, 0.98), 0]);
   }
   let yLo = Infinity, yHi = -Infinity;
-  for (let i = 0; i < lobes.length; i++) { yLo = Math.min(yLo, lobes[i][1] - lobes[i][3] * 0.85); yHi = Math.max(yHi, lobes[i][1] + lobes[i][3] * 0.85); }
+  for (let i = 0; i < lobes.length; i++) { yLo = Math.min(yLo, lobes[i][1] - lobes[i][3]); yHi = Math.max(yHi, lobes[i][1] + lobes[i][3]); }
   for (let i = 0; i < lobes.length; i++) {
-    const [ox, oy, oz, r] = lobes[i];
-    const g = bare(new THREE.IcosahedronGeometry(r, 1));
-    g.scale(1, rng.range(0.8, 0.9), 1);
+    const [ox, oy, oz, r, detail] = lobes[i];
+    const g = crownLobe(r, detail, rng.range(0, 6.3), detail === 1 ? rng.range(0.13, 0.21) : rng.range(0.08, 0.14), rng.range(0.78, 0.92), 0.5);
     g.rotateY(rng.range(0, Math.PI));
     g.translate(ox, oy, oz);
-    paint(g, FURN.crown);
-    const jitter = rng.range(-0.06, 0.06);
-    blendTo(g, FURN.crownLit, (_x, y) => Math.max(0, Math.min(1, (y - yLo) / (yHi - yLo) - 0.25)) * (0.9 + jitter));
-    blendTo(g, FURN.crownDark, (_x, y) => Math.max(0, Math.min(1, 1 - (y - yLo) / 1.4)) * 0.8);
+    shadeCrown(g, yLo, yHi, 0.62 + rng.range(-0.06, 0.06), 1.7);
     parts.push(g);
   }
+  // Fringe: cards hung on the crown's own silhouette, a couple of them drooping under it. The radius is measured per
+  // direction against the lobes actually facing that way — a card dropped at a fixed radius sinks into the mass on the
+  // wide side, and a buried card's canopy normal faces the sun while the lobe around it does not, which paints a bright
+  // chevron across the crown.
+  const fringe = rng.int(6, 8);
+  for (let k = 0; k < fringe; k++) {
+    const a = rng.range(0, Math.PI * 2);
+    let reach = 1.3;
+    for (let i = 0; i < lobes.length; i++) reach = Math.max(reach, Math.cos(a) * lobes[i][0] + Math.sin(a) * lobes[i][2] + lobes[i][3] * 0.92);
+    const d = reach * rng.range(0.96, 1.08);
+    const y = trunkH + rng.range(0.0, 1.5);
+    const card = leafSpray(Math.cos(a) * d, y, Math.sin(a) * d, rng.range(0.7, 1.1), rng.range(0.5, 0.8), a, rng.range(-0.6, 0.6), FURN.crown);
+    blendTo(card, FURN.crownLit, (_x, cy) => Math.max(0, Math.min(1, (cy - yLo) / Math.max(0.2, yHi - yLo) - 0.2)) * 0.3);
+    parts.push(card);
+  }
   return fuse(parts);
+}
+
+/**
+ * The second species: a tall narrow cypress, the vertical note a street of round crowns needs. A lathed spire whose
+ * radius steps in and out from station to station, so the silhouette is tiered like a conifer's branch whorls instead
+ * of a smooth cone, with per-angle wobble on top of that and a short bole under it. Face normals (a conifer is a mass
+ * of needle shadow, not a balloon), a much darker green than the broad crowns, and a lit band only at the very top.
+ * Twelve columns, not seven, and half the per-angle wobble: this species is a third of every sidewalk tree, and at
+ * the 3 m a pavement is walked past at, seven facets around a deeply notched silhouette read as a folded green shard
+ * rather than a tree. About 310 triangles, still the cheapest prop in the foliage batch.
+ */
+function cypressGeometry(seed: number): THREE.BufferGeometry {
+  const rng = new Random(seed);
+  const H = rng.range(6.8, 8.6), maxR = rng.range(0.52, 0.66);
+  const rows = 13, cols = 12;
+  const bole = rng.range(0.6, 0.95);
+  const lean = rng.range(-0.14, 0.14), leanZ = rng.range(-0.12, 0.12);
+  const ripple = rng.range(0, Math.PI * 2);
+  const rs = new Float32Array(rows), xs = new Float32Array(rows), zs = new Float32Array(rows);
+  for (let i = 0; i < rows; i++) {
+    const t = i / (rows - 1);
+    // Envelope: columnar, full width from a fifth of the way up to three quarters, then drawn in to the tip — an
+    // Italian cypress is a spire, not a cone. The radius then breathes in and out over a period of ~2.6 stations, so
+    // the silhouette is softly irregular; a hard step every other station reads as a stack of gems, not a tree.
+    const env = maxR * Math.pow(Math.min(1, Math.sin(Math.PI * (0.30 + 0.70 * t))), 0.4);
+    rs[i] = env * (1 - 0.13 * (0.5 + 0.5 * Math.sin(i * 2.4 + ripple))) * rng.range(0.93, 1.07);
+    xs[i] = lean * t * t * H * 0.3;
+    zs[i] = leanZ * t * t * H * 0.3;
+  }
+  rs[rows - 1] = 0.03;
+  const body = surface(rows, cols, true, false, (i, j, out) => {
+    const a = (j / cols) * Math.PI * 2;
+    const w = 1 + 0.10 * Math.sin(a * 3 + i * 2.1) + 0.05 * Math.sin(a * 5 - i * 1.3);
+    out.set(xs[i] + Math.sin(a) * rs[i] * w, bole + (H - bole) * (i / (rows - 1)), zs[i] + Math.cos(a) * rs[i] * w);
+  });
+  body.computeVertexNormals(); // non-indexed: one normal per face, so every whorl facet catches its own light
+  paint(body, FURN.conifer);
+  blendTo(body, FURN.coniferLit, (_x, y) => Math.max(0, Math.min(1, (y - bole - (H - bole) * 0.55) / ((H - bole) * 0.45))) * 0.55);
+  blendTo(body, FURN.coniferDark, (_x, y) => Math.max(0, Math.min(1, 1 - (y - bole) / ((H - bole) * 0.45))) * 0.8);
+  const nrm = body.attributes.normal, col = body.attributes.color;
+  scratchColor.setHex(FURN.coniferDark);
+  for (let i = 0; i < nrm.count; i++) {
+    const t = Math.max(0, Math.min(1, (-nrm.getY(i) - 0.02) / 0.5)) * 0.6;
+    if (t <= 0) continue;
+    col.setXYZ(i, col.getX(i) + (scratchColor.r - col.getX(i)) * t, col.getY(i) + (scratchColor.g - col.getY(i)) * t, col.getZ(i) + (scratchColor.b - col.getZ(i)) * t);
+  }
+  const trunk = lathe([R(0, 0.2), R(0.1, 0.16), R(bole + 0.3, 0.12)], 6, FURN.bark);
+  blendTo(trunk, FURN.barkDark, (_x, y) => (y < 0.45 ? 1 - y / 0.45 : 0) * 0.85);
+  return fuse([body, trunk]);
 }
 
 /** Hedge profile, ground to ground over the clipped top: (u across in half-depths, v up in heights). */
 const HEDGE_PROFILE: readonly (readonly [number, number])[] = [[-1, 0], [-1.03, 0.5], [-0.94, 0.82], [-0.58, 0.97], [0, 1.03], [0.58, 0.97], [0.94, 0.82], [1.03, 0.5], [1, 0]];
 /** Stations along a hedge unit; the unit runs a little over CityLots' pitch so consecutive units overlap into one run. */
-const HEDGE_STATIONS = 7;
+const HEDGE_STATIONS = 9;
 const HEDGE_OVERLAP = 1.08;
 
 /** Flat cap closing a hedge end: a fan from the ground centre over the profile points, normal along `dir` z. */
@@ -509,9 +780,14 @@ function hedgeGeometry(seed: number): THREE.BufferGeometry {
   const n = HEDGE_STATIONS, m = HEDGE_PROFILE.length;
   const len = HEDGE.pitch * HEDGE_OVERLAP, hd = HEDGE.depth / 2, h = HEDGE.h;
   const hs = new Float32Array(n), ws = new Float32Array(n), ls = new Float32Array(n), noise = new Float32Array(n * m);
+  // One or two stations are clipped noticeably shorter than the rest, so the top line dips instead of running level:
+  // a clipped hedge that has been cut by hand, not a sausage extruded along the kerb.
+  const dipA = rng.int(0, n - 2), dipB = rng.chance(0.55) ? rng.int(0, n - 2) : -2;
   for (let i = 0; i < n; i++) {
-    hs[i] = h * rng.range(0.9, 1.06); ws[i] = hd * rng.range(0.92, 1.08); ls[i] = rng.range(-0.035, 0.035);
-    for (let j = 0; j < m; j++) noise[i * m + j] = HEDGE_PROFILE[j][1] > 0.6 ? rng.range(-0.035, 0.035) : 0;
+    // The dip spans two neighbouring stations, so the top line sags into it instead of cutting a single sharp notch.
+    const dip = i === dipA || i === dipB || i === dipA + 1 || i === dipB + 1 ? rng.range(0.84, 0.93) : 1;
+    hs[i] = h * rng.range(0.88, 1.1) * dip; ws[i] = hd * rng.range(0.88, 1.12); ls[i] = rng.range(-0.06, 0.06);
+    for (let j = 0; j < m; j++) noise[i * m + j] = HEDGE_PROFILE[j][1] > 0.6 ? rng.range(-0.07, 0.07) : 0;
   }
   const xy = new Float32Array(m * 2);
   const at = (i: number, j: number): void => {
@@ -532,7 +808,9 @@ function hedgeGeometry(seed: number): THREE.BufferGeometry {
   const g = fuse([side, cap(0, -1), cap(n - 1, 1)]);
   paint(g, FURN.hedge);
   blendTo(g, FURN.hedgeLit, (_x, y) => Math.max(0, Math.min(1, (y - h * 0.4) / (h * 0.55))) * 0.85);
-  blendTo(g, FURN.hedgeDark, (_x, y) => Math.max(0, Math.min(1, 1 - y / (h * 0.35))) * 0.8);
+  blendTo(g, FURN.hedgeDark, (_x, y) => Math.max(0, Math.min(1, 1 - y / (h * 0.42))) * 0.9);
+  // Foot: the last 15 cm goes to bare shaded earth, so the run sits in the ground instead of floating on the pavement.
+  blendTo(g, FURN.soil, (_x, y) => Math.max(0, Math.min(1, 1 - y / 0.15)) * 0.7);
   // A little per-vertex dapple so a long run does not read as one flat green.
   const col = g.attributes.color;
   for (let i = 0; i < col.count; i++) { const d = rng.range(0.95, 1.05); col.setXYZ(i, col.getX(i) * d, col.getY(i) * d, col.getZ(i) * d); }
@@ -571,17 +849,18 @@ function farPalmGeometry(seed: number): THREE.BufferGeometry {
   return fuse(parts);
 }
 
-/** Lamp glow: the pavement pool and the facade spill merged into one quad pair; the spill is 40% as bright. */
+/**
+ * Lamp glow: one small additive disc on the pavement under the head, and nothing else. The lamps close to the camera
+ * carry real point lights (LAMP_LIGHTS) that the asphalt's normal and roughness answer, so this quad is only the
+ * stand-in for every lamp beyond them: at 5.5 m radius it reads as the hot core right under the luminaire instead of
+ * the 18 m sepia ellipse that used to flatten the lane paint out of the road. The vertical facade-spill quad is gone
+ * — from any angle but head-on it was a translucent slab standing in mid-air beside the pole.
+ */
 function glowGeometry(): THREE.BufferGeometry {
   const pool = new THREE.PlaneGeometry(PROP_DIMS.poolRadius * 2, PROP_DIMS.poolRadius * 2);
   pool.rotateX(-Math.PI / 2);
   pool.translate(0, 0.06, PROP_DIMS.lampArm - 0.3);
-  tintRGB(pool, 1, 1, 1);
-  // Facade spill: a vertical glow behind the pole (the kerb side is -Z; the arm points +Z over the road).
-  const spill = new THREE.PlaneGeometry(2.5, 4.5);
-  spill.translate(0, 2.25, -0.9);
-  tintRGB(spill, 0.4, 0.4, 0.4);
-  return fuse([pool, spill]);
+  return tintRGB(pool, 1, 1, 1);
 }
 
 /**
@@ -590,16 +869,46 @@ function glowGeometry(): THREE.BufferGeometry {
  * kerbside cars sit in plain view down a street and go further. Palms switch from the alpha fronds to the solid far
  * LOD at `palmNear`.
  */
-export const PROP_RANGE = { palm: 165, palmNear: 60, tree: 110, hedge: 95, lamp: 240, bench: 170, hydrant: 140, bin: 130, sign: 175, shelter: 210, bollard: 120, parked: 120, kerb: 135, island: 120, planter: 110, repackMove: 15 } as const;
+export const PROP_RANGE = {
+  palm: 165, palmNear: 60, tree: 110, hedge: 95, lamp: 240, bench: 170, hydrant: 140, bin: 130, sign: 175,
+  shelter: 210, bollard: 120, parked: 120, kerb: 135, island: 120, planter: 110,
+  pole: 125, roadsign: 105, dumpster: 78, table: 78, repackMove: 15,
+} as const;
+
+/**
+ * Static parked cars closer than `range` are drawn from the full body loft instead of the coarse shell — at 6 m a
+ * shell with no lamps, pillars or arches sits next to a properly lofted player car and gives the whole street away.
+ * The near loft is ~6x the shell's triangles, so the band is kept to the metres the critic was actually looking at:
+ * at 16 m nine tenths of all street and lot positions have fewer neighbours than `cap`, so two cars side by side in
+ * the same bay row practically never render at two fidelities. `cap` is a safety valve, not the rule.
+ */
+const NEAR_CARS = { range: 16, cap: 8 } as const;
+
+/**
+ * Real lamp light: a fixed pool of point lights created once and re-aimed at the nearest lamp heads every frame, so
+ * the asphalt's normal map and its damp night roughness actually answer the street lighting (and the lane paint stays
+ * legible inside the pool). Physical units like the player's headlights: decay 2, ~60 cd, which lands at roughly the
+ * same illuminance 6.5 m under the luminaire as a headlight pool 8 m ahead of the car.
+ *
+ * The pool is DELIBERATELY small. The lights never leave the scene (see update()), so every lit material in the city
+ * carries NUM_POINT_LIGHTS of them in its shader at every hour — a noon frame pays for them too, at zero intensity.
+ * Three cover the one or two lamps that are ever close enough to matter; a bigger pool is per-pixel ALU all day for
+ * lamps whose contribution is already under the `distance` cutoff. `fade` is the fraction of `distance` over which a
+ * light ramps out, so a lamp handed over to the next one never changes a pixel in a single frame.
+ */
+const LAMP_LIGHTS = { count: 3, intensity: 140, distance: 30, colour: 0xffc48a, y: 6.4, fade: 0.35 } as const;
 
 /** Seeds of the two palm variants; palms alternate between them by index. */
 const PALM_SEEDS = [1201, 2417] as const;
-/** Seeds of the tree crown variants and the hedge unit variants; instances pick one at random (seeded). */
+/** Seeds of the broad tree variants, the tall cypress variants and the hedge units; instances pick one (seeded). */
 const TREE_SEEDS = [4111, 5237, 6301] as const;
+const CYPRESS_SEEDS = [8117, 8231] as const;
+/** Share of the sidewalk trees drawn as the tall narrow species. */
+const CYPRESS_SHARE = 0.3;
 const HEDGE_SEEDS = [7013, 7121, 7307, 7411] as const;
 
-/** Night opacity of the lamp glow quads (the pavement pool; the spill quad is vertex-tinted to 40% of it). */
-const GLOW_OPACITY = 0.45;
+/** Night opacity of the small additive pavement pool under a lamp head. */
+const GLOW_OPACITY = 0.3;
 
 const PARKED_SPECS: ParkedSpec[] = ['sedan', 'sport', 'van'];
 
@@ -637,6 +946,60 @@ function placementMatrix(x: number, z: number, yaw: number, scale: number, y: nu
 }
 
 /**
+ * Catenary spans between neighbouring utility poles. Poles are placed in runs along one block edge, so two of them are
+ * neighbours when they share a yaw and the coordinate perpendicular to the run and stand `WIRE.minSpan`..`maxSpan`
+ * apart with nothing between them; the runs stop short of the corners, so no span ever crosses an intersection. Each
+ * span carries `WIRE.lines` wires hanging from the crossarm insulators, sagging `sag` at mid-span, drawn as
+ * `WIRE.segments` line segments. Returns the packed segment endpoints (6 floats a segment) plus the span midpoints,
+ * which the range packer uses to draw only the spans near the camera.
+ */
+const WIRE = { minSpan: 12, maxSpan: 42, lines: 3, segments: 6, sag: 0.55, inRange: 118 } as const;
+const WIRE_FLOATS_PER_SPAN = WIRE.lines * WIRE.segments * 6;
+
+interface WireSpans { data: Float32Array; midX: Float32Array; midZ: Float32Array; count: number }
+
+function buildWireSpans(props: Prop[]): WireSpans {
+  const poles: Prop[] = [];
+  for (let i = 0; i < props.length; i++) if (props[i].kind === 'pole') poles.push(props[i]);
+  // Sort into runs: yaw, then the coordinate across the run, then along it.
+  const alongX = (yaw: number): boolean => Math.abs(Math.sin(yaw)) < 0.5; // local +Z along z => the run walks x
+  poles.sort((a, b) => (a.yaw - b.yaw) || ((alongX(a.yaw) ? a.z - b.z : a.x - b.x) || (alongX(a.yaw) ? a.x - b.x : a.z - b.z)));
+  const maxSpans = Math.max(1, poles.length);
+  const data = new Float32Array(maxSpans * WIRE_FLOATS_PER_SPAN);
+  const midX = new Float32Array(maxSpans), midZ = new Float32Array(maxSpans);
+  let n = 0;
+  for (let i = 0; i + 1 < poles.length; i++) {
+    const a = poles[i], b = poles[i + 1];
+    if (Math.abs(a.yaw - b.yaw) > 1e-3) continue;
+    const ax = alongX(a.yaw);
+    if (Math.abs((ax ? a.z - b.z : a.x - b.x)) > 0.05) continue;
+    const d = Math.hypot(b.x - a.x, b.z - a.z);
+    if (d < WIRE.minSpan || d > WIRE.maxSpan) continue;
+    // Insulator offsets run across the street: the crossarm is authored along local x.
+    const cx = Math.cos(a.yaw), sx = Math.sin(a.yaw);
+    let o = n * WIRE_FLOATS_PER_SPAN;
+    for (let w = 0; w < WIRE.lines; w++) {
+      const k = (w - (WIRE.lines - 1) / 2) * UTILITY.armHalf;
+      const ox = cx * k, oz = -sx * k; // local +x of a yaw rotation about y
+      const ya = CURB_H + UTILITY.armY * a.scale - UTILITY.wireDrop, yb = CURB_H + UTILITY.armY * b.scale - UTILITY.wireDrop;
+      for (let sgm = 0; sgm < WIRE.segments; sgm++) {
+        for (let e = 0; e < 2; e++) {
+          const t = (sgm + e) / WIRE.segments;
+          const sag = WIRE.sag * 4 * t * (1 - t);
+          data[o++] = a.x + (b.x - a.x) * t + ox;
+          data[o++] = ya + (yb - ya) * t - sag;
+          data[o++] = a.z + (b.z - a.z) * t + oz;
+        }
+      }
+    }
+    midX[n] = (a.x + b.x) / 2;
+    midZ[n] = (a.z + b.z) / 2;
+    n++;
+  }
+  return { data, midX, midZ, count: n };
+}
+
+/**
  * Foliage tint per instance: value +-8 % and a hue lean of up to `hue` between yellow-green (warm) and blue-green,
  * multiplied into the baked vertex colours through the batch colour.
  */
@@ -665,34 +1028,70 @@ export class PropRenderer {
   private readonly materials: Materials;
   private readonly glowMat: THREE.MeshBasicMaterial;
   private readonly paintMat: THREE.MeshPhysicalMaterial;
+  /** Lamp placements (x, z, yaw) and the point lights parked on the nearest few of them. */
+  private lampX = new Float32Array(0);
+  private lampZ = new Float32Array(0);
+  private lampYaw = new Float32Array(0);
+  private lampCount = 0;
+  private readonly lampLights: THREE.PointLight[] = [];
+  private lampGlowMesh: THREE.InstancedMesh | null = null;
+  private wireMat: THREE.LineBasicMaterial | null = null;
+  /** Near parked cars: source placements, their coarse-shell instance ids, and the capped near batch. */
+  private carX = new Float32Array(0);
+  private carZ = new Float32Array(0);
+  private carYaw = new Float32Array(0);
+  private carY = new Float32Array(0);
+  private carColour = new Int32Array(0);
+  private carGeo = new Int32Array(0);
+  private carCoarse = new Int32Array(0);
+  private carCount = 0;
+  private nearMesh: THREE.BatchedMesh | null = null;
+  private coarseMesh: THREE.BatchedMesh | null = null;
+  private readonly nearGeo: number[] = [];
+  private readonly pickIdx = new Int32Array(Math.max(NEAR_CARS.cap, LAMP_LIGHTS.count));
+  private readonly pickD2 = new Float32Array(Math.max(NEAR_CARS.cap, LAMP_LIGHTS.count));
+  /** Catenary wire spans and the line mesh they are packed into by range. */
+  private spans: WireSpans | null = null;
+  private wireMesh: THREE.LineSegments | null = null;
+  private wirePos: THREE.BufferAttribute | null = null;
   private lastX = Infinity;
   private lastZ = Infinity;
 
   constructor(scene: THREE.Scene, props: Prop[], materials: Materials, parked: ParkedCar[] = [], lotProps: LotProp[] = []) {
     this.materials = materials;
-    const counts: Record<Prop['kind'], number> = { palm: 0, lamp: 0, bench: 0, hydrant: 0, bin: 0, sign: 0, shelter: 0, bollard: 0, tree: 0, hedge: 0 };
+    const counts: Record<Prop['kind'], number> = { palm: 0, lamp: 0, bench: 0, hydrant: 0, bin: 0, sign: 0, shelter: 0, bollard: 0, tree: 0, hedge: 0, pole: 0, roadsign: 0, dumpster: 0, table: 0 };
     for (let i = 0; i < props.length; i++) counts[props[i].kind]++;
     const lotCounts: Record<LotProp['kind'], number> = { island: 0, planter: 0, booth: 0 };
     for (let i = 0; i < lotProps.length; i++) lotCounts[lotProps[i].kind]++;
-    // Pool and spill share one additive material (same glow sprite and tint as Materials' lightPool); the spill's
-    // lower intensity is baked into its vertex colour and the night opacity is synced in update().
+    // The pavement pool shares the glow sprite and tint of Materials' lightPool; its night opacity is synced in update().
     const poolSrc = materials.lightPool();
     this.glowMat = new THREE.MeshBasicMaterial({ map: poolSrc.map, color: poolSrc.color, vertexColors: true, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, fog: false, toneMapped: false });
     this.paintMat = makeVehiclePaintMaterial();
+    for (let i = 0; i < LAMP_LIGHTS.count; i++) {
+      const l = new THREE.PointLight(LAMP_LIGHTS.colour, 0, LAMP_LIGHTS.distance, 2);
+      l.castShadow = false;
+      scene.add(l);
+      this.lampLights.push(l);
+    }
     // Seeded per-instance variety (variant pick, tint) in placement order, so a given city always looks the same.
     const rng = new Random(0x9e37);
 
     // --- batches: one per material -------------------------------------------------------------------------------
-    const furnitureCount = counts.bench + counts.hydrant + counts.bin + counts.sign + counts.shelter + counts.bollard + lotCounts.island + lotCounts.planter;
-    const furniture = this.batch(scene, 'furniture', [benchGeometry(), hydrantGeometry(), binGeometry(), signGeometry(), shelterGeometry(), bollardGeometry(), islandGeometry(), planterGeometry()], materials.furniture, furnitureCount, true);
-    const FG = { bench: 0, hydrant: 1, bin: 2, sign: 3, shelter: 4, bollard: 5, island: 6, planter: 7 } as const;
+    const furnitureCount = counts.bench + counts.hydrant + counts.bin + counts.sign + counts.shelter + counts.bollard
+      + counts.pole + counts.roadsign + counts.dumpster + counts.table + lotCounts.island + lotCounts.planter;
+    const furniture = this.batch(scene, 'furniture', [
+      benchGeometry(), hydrantGeometry(), binGeometry(), signGeometry(), shelterGeometry(), bollardGeometry(), islandGeometry(), planterGeometry(),
+      utilityPoleGeometry(), roadSignGeometry(), dumpsterGeometry(), cafeTableGeometry(),
+    ], materials.furniture, furnitureCount, true);
+    const FG = { bench: 0, hydrant: 1, bin: 2, sign: 3, shelter: 4, bollard: 5, island: 6, planter: 7, pole: 8, roadsign: 9, dumpster: 10, table: 11 } as const;
     const foliageGeos = [farPalmGeometry(PALM_SEEDS[0])];
     for (let i = 0; i < TREE_SEEDS.length; i++) foliageGeos.push(treeGeometry(TREE_SEEDS[i]));
+    for (let i = 0; i < CYPRESS_SEEDS.length; i++) foliageGeos.push(cypressGeometry(CYPRESS_SEEDS[i]));
     for (let i = 0; i < HEDGE_SEEDS.length; i++) foliageGeos.push(hedgeGeometry(HEDGE_SEEDS[i]));
     // Far palms cast nothing on their own (past 60 m they never enter the shadow box); sharing the batch with the
     // trees and hedges means the odd one at the box corner does, which is harmless.
     const foliage = this.batch(scene, 'foliage', foliageGeos, materials.foliage, counts.palm + counts.tree + counts.hedge, true);
-    const FOL_FAR_PALM = 0, FOL_TREE = 1, FOL_HEDGE = 1 + TREE_SEEDS.length;
+    const FOL_FAR_PALM = 0, FOL_TREE = 1, FOL_CYPRESS = 1 + TREE_SEEDS.length, FOL_HEDGE = FOL_CYPRESS + CYPRESS_SEEDS.length;
     const trunkGeos: THREE.BufferGeometry[] = [], frondGeos: THREE.BufferGeometry[] = [];
     for (let v = 0; v < PALM_SEEDS.length; v++) {
       const trunk = trunkGeometry(PALM_SEEDS[v]);
@@ -706,6 +1105,38 @@ export class PropRenderer {
     for (let i = 0; i < PARKED_SPECS.length; i++) shells.push(parkedShellGeometry(SPECS[PARKED_SPECS[i]]));
     const parkedB = this.batch(scene, 'parked', shells, this.paintMat, parked.length, true);
     parkedB.mesh.receiveShadow = true;
+    // Near shells: the same three specs at the full body loft, in a batch that only ever holds NEAR_CARS.cap
+    // instances — repack reassigns their geometry, matrix and paint to whichever cars are closest.
+    const nearShells: THREE.BufferGeometry[] = [];
+    for (let i = 0; i < PARKED_SPECS.length; i++) nearShells.push(parkedNearGeometry(SPECS[PARKED_SPECS[i]]));
+    const nearB = this.batch(scene, 'parkedNear', nearShells, this.paintMat, NEAR_CARS.cap, true);
+    nearB.mesh.receiveShadow = true;
+    this.nearMesh = nearB.mesh;
+    this.coarseMesh = parkedB.mesh;
+    for (let i = 0; i < nearB.geo.length; i++) this.nearGeo.push(nearB.geo[i]);
+    for (let i = 0; i < NEAR_CARS.cap; i++) {
+      const id = nearB.mesh.addInstance(nearB.geo[0]);
+      nearB.mesh.setVisibleAt(id, false);
+    }
+    // Overhead wires: one LineSegments refilled by range, so a suburb street gets its catenaries without a draw call
+    // per span and without a web of them stretching to the far side of the city.
+    this.spans = buildWireSpans(props);
+    if (this.spans.count > 0) {
+      const cap = Math.min(this.spans.count, 140) * WIRE_FLOATS_PER_SPAN / 3;
+      const wireGeo = new THREE.BufferGeometry();
+      this.wirePos = new THREE.BufferAttribute(new Float32Array(cap * 3), 3);
+      this.wirePos.setUsage(THREE.DynamicDrawUsage);
+      wireGeo.setAttribute('position', this.wirePos);
+      wireGeo.setDrawRange(0, 0);
+      const wireMat = new THREE.LineBasicMaterial({ color: 0x23262b, fog: true, transparent: true, opacity: 0.85, depthWrite: false });
+      this.wireMesh = new THREE.LineSegments(wireGeo, wireMat);
+      this.wireMesh.name = 'prop:wires';
+      this.wireMesh.frustumCulled = false;
+      this.geometries.push(wireGeo);
+      this.wireMat = wireMat;
+      this.meshes.push(this.wireMesh);
+      scene.add(this.wireMesh);
+    }
 
     // --- instanced meshes: the lamp parts (three materials) and the shelter glass -------------------------------
     const mk = (name: string, g: THREE.BufferGeometry, m: THREE.Material, n: number, shadow: boolean): THREE.InstancedMesh => {
@@ -757,15 +1188,18 @@ export class PropRenderer {
     hedgeG.batched.push(target(foliage, counts.hedge));
     // Furniture kinds: one batched target each (the shelter also fills the glass instances), lamps instanced only.
     const furnG: Partial<Record<Prop['kind'], PropGroup>> = {};
-    for (const kind of ['bench', 'hydrant', 'bin', 'sign', 'shelter', 'bollard'] as const) {
+    for (const kind of ['bench', 'hydrant', 'bin', 'sign', 'shelter', 'bollard', 'pole', 'roadsign', 'dumpster', 'table'] as const) {
       const g = newGroup(counts[kind], PROP_RANGE[kind]);
       g.batched.push(target(furniture, counts[kind]));
       furnG[kind] = g;
     }
     furnG.shelter!.inst.push(shelterGlassM);
     const lampG = newGroup(counts.lamp, PROP_RANGE.lamp);
-    lampG.inst.push(poleM, headM, glowM);
+    lampG.inst.push(poleM, headM);
+    // The glow quad is filled by repackLampGlow instead (one disc per in-range lamp).
+    this.lampGlowMesh = glowM;
     let palmIdx = 0;
+    const lampXs: number[] = [], lampZs: number[] = [], lampYaws: number[] = [];
     for (let i = 0; i < props.length; i++) {
       const p = props[i];
       if (p.kind === 'palm') {
@@ -775,13 +1209,19 @@ export class PropRenderer {
         palmG.near[1].ids[k] = add(fronds, fronds.geo[v], p.x, p.z, p.yaw, p.scale, CURB_H, null);
         palmG.far[0].ids[k] = add(foliage, foliage.geo[FOL_FAR_PALM], p.x, p.z, p.yaw, p.scale, CURB_H, scratchColor.setRGB(1, 1, 1));
       } else if (p.kind === 'tree') {
-        const k = push(treeG, p.x, p.z, p.yaw, p.scale, CURB_H);
-        treeG.batched[0].ids[k] = add(foliage, foliage.geo[FOL_TREE + rng.int(0, TREE_SEEDS.length - 1)], p.x, p.z, p.yaw, p.scale, CURB_H, foliageTint(rng, 0.5, scratchColor));
+        // Roughly a third of the street trees are the tall narrow species; the rest are broad crowns. Cypresses are
+        // drawn a little smaller than their placement scale asks, so a 1.3 one is not a 12 m spike over a shopfront.
+        const cypress = rng.chance(CYPRESS_SHARE);
+        const gi = cypress ? FOL_CYPRESS + rng.int(0, CYPRESS_SEEDS.length - 1) : FOL_TREE + rng.int(0, TREE_SEEDS.length - 1);
+        const sc = cypress ? p.scale * 0.86 : p.scale;
+        const k = push(treeG, p.x, p.z, p.yaw, sc, CURB_H);
+        treeG.batched[0].ids[k] = add(foliage, foliage.geo[gi], p.x, p.z, p.yaw, sc, CURB_H, foliageTint(rng, 0.5, scratchColor));
       } else if (p.kind === 'hedge') {
         const k = push(hedgeG, p.x, p.z, p.yaw, p.scale, CURB_H);
         hedgeG.batched[0].ids[k] = add(foliage, foliage.geo[FOL_HEDGE + rng.int(0, HEDGE_SEEDS.length - 1)], p.x, p.z, p.yaw, p.scale, CURB_H, foliageTint(rng, 0.35, scratchColor));
       } else if (p.kind === 'lamp') {
         push(lampG, p.x, p.z, p.yaw, p.scale, CURB_H);
+        lampXs.push(p.x); lampZs.push(p.z); lampYaws.push(p.yaw);
       } else {
         const g = furnG[p.kind]!;
         const k = push(g, p.x, p.z, p.yaw, p.scale, CURB_H);
@@ -806,13 +1246,30 @@ export class PropRenderer {
     const lotCarG = newGroup(lotN, PROP_RANGE.parked), kerbCarG = newGroup(kerbN, PROP_RANGE.kerb);
     lotCarG.batched.push(target(parkedB, lotN));
     kerbCarG.batched.push(target(parkedB, kerbN));
+    this.carX = new Float32Array(Math.max(1, parked.length));
+    this.carZ = new Float32Array(Math.max(1, parked.length));
+    this.carYaw = new Float32Array(Math.max(1, parked.length));
+    this.carY = new Float32Array(Math.max(1, parked.length));
+    this.carColour = new Int32Array(Math.max(1, parked.length));
+    this.carGeo = new Int32Array(Math.max(1, parked.length));
+    this.carCoarse = new Int32Array(Math.max(1, parked.length));
     for (let i = 0; i < parked.length; i++) {
       const p = parked[i];
       const lot = p.at === 'lot';
       const g = lot ? lotCarG : kerbCarG, y = lot ? LOT_FLOOR_Y : CURB_H;
       const k = push(g, p.x, p.z, p.yaw, 1, y);
-      g.batched[0].ids[k] = add(parkedB, parkedB.geo[PARKED_SPECS.indexOf(p.spec)], p.x, p.z, p.yaw, 1, y, scratchColor.setHex(p.colour));
+      const spec = PARKED_SPECS.indexOf(p.spec);
+      const id = add(parkedB, parkedB.geo[spec], p.x, p.z, p.yaw, 1, y, scratchColor.setHex(p.colour));
+      g.batched[0].ids[k] = id;
+      const c = this.carCount++;
+      this.carX[c] = p.x; this.carZ[c] = p.z; this.carYaw[c] = p.yaw; this.carY[c] = y;
+      this.carColour[c] = p.colour; this.carGeo[c] = spec; this.carCoarse[c] = id;
     }
+    this.lampX = new Float32Array(Math.max(1, lampXs.length));
+    this.lampZ = new Float32Array(Math.max(1, lampXs.length));
+    this.lampYaw = new Float32Array(Math.max(1, lampXs.length));
+    for (let i = 0; i < lampXs.length; i++) { this.lampX[i] = lampXs[i]; this.lampZ[i] = lampZs[i]; this.lampYaw[i] = lampYaws[i]; }
+    this.lampCount = lampXs.length;
     this.repack(0, 0);
   }
 
@@ -840,12 +1297,134 @@ export class PropRenderer {
     return { mesh, geo };
   }
 
-  /** Syncs the glow opacity with the night factor, then re-evaluates the draw ranges if the camera moved enough. */
+  /**
+   * Syncs the glow opacity with the night factor, re-aims the lamp point lights (every frame, not on the 15 m repack
+   * cadence: a light that jumped lamps only when the packer ran popped a whole pavement pool in one frame), then
+   * re-evaluates the draw ranges if the camera moved enough.
+   */
   update(camX: number, camZ: number): void {
-    this.glowMat.opacity = this.materials.nightFactor * GLOW_OPACITY;
+    const n = this.materials.nightFactor;
+    this.glowMat.opacity = n * GLOW_OPACITY;
+    if (this.wireMat) this.wireMat.opacity = 0.85 - 0.35 * n;
+    this.aimLampLights(camX, camZ, n);
     const dx = camX - this.lastX, dz = camZ - this.lastZ;
     if (dx * dx + dz * dz < PROP_RANGE.repackMove * PROP_RANGE.repackMove) return;
     this.repack(camX, camZ);
+  }
+
+  /**
+   * Keeps the `n` smallest entries of a stream in `pickIdx` / `pickD2` (insertion into a cap-sized buffer: the
+   * candidates that get this far are the handful already inside the near radius, so the shifting costs nothing).
+   * Returns the new count.
+   */
+  private static insertNearest(idx: Int32Array, d2s: Float32Array, count: number, cap: number, i: number, d2: number): number {
+    if (count === cap && d2 >= d2s[count - 1]) return count;
+    let at = count < cap ? count : cap - 1;
+    while (at > 0 && d2s[at - 1] > d2) { d2s[at] = d2s[at - 1]; idx[at] = idx[at - 1]; at--; }
+    d2s[at] = d2;
+    idx[at] = i;
+    return Math.min(cap, count + 1);
+  }
+
+  /**
+   * Re-aims the point-light pool at the nearest lamp heads. Called every frame: the pool used to follow the 15 m
+   * range packer, which meant a boundary lamp swapped between a real 140 cd pool and a flat additive disc in one
+   * frame, every 0.75 s of straight-line driving. Re-aiming per frame makes the hand-over happen where two lamps are
+   * equidistant, and `fade` ramps a light out over the last third of its range so nothing changes discontinuously.
+   * No allocation, and by day (n === 0) it is a three-iteration loop and an early out.
+   */
+  private aimLampLights(camX: number, camZ: number, n: number): void {
+    const lights = this.lampLights;
+    if (n <= 0 || this.lampCount === 0) {
+      // Intensity, never visibility: a light that leaves the scene changes NUM_POINT_LIGHTS and recompiles every lit
+      // material in the city, which would hitch at every dusk. At intensity 0 they still cost a per-fragment
+      // evaluation in every lit material, which is why the pool is three lights and not a dozen.
+      for (let k = 0; k < lights.length; k++) lights[k].intensity = 0;
+      return;
+    }
+    let picked = 0;
+    for (let i = 0; i < this.lampCount; i++) {
+      const dx = this.lampX[i] - camX, dz = this.lampZ[i] - camZ;
+      picked = PropRenderer.insertNearest(this.pickIdx, this.pickD2, picked, LAMP_LIGHTS.count, i, dx * dx + dz * dz);
+    }
+    const fadeFrom = LAMP_LIGHTS.distance * (1 - LAMP_LIGHTS.fade);
+    for (let k = 0; k < lights.length; k++) {
+      const l = lights[k];
+      // A city with fewer lamps than lights would leave the tail parked on the last one; harmless, and it keeps the
+      // light count (and therefore the compiled programs) fixed for the whole session.
+      const slot = Math.min(k, Math.max(0, picked - 1));
+      const i = this.pickIdx[slot], yaw = this.lampYaw[i];
+      // The luminaire hangs at the arm tip: local (0, lampH + 0.35, lampArm - 0.32), turned by the lamp's yaw.
+      const arm = PROP_DIMS.lampArm - 0.32;
+      l.position.set(this.lampX[i] + Math.sin(yaw) * arm, LAMP_LIGHTS.y, this.lampZ[i] + Math.cos(yaw) * arm);
+      const d = Math.sqrt(this.pickD2[slot]);
+      const fade = d <= fadeFrom ? 1 : Math.max(0, (LAMP_LIGHTS.distance - d) / (LAMP_LIGHTS.distance - fadeFrom));
+      l.intensity = n * LAMP_LIGHTS.intensity * fade;
+    }
+  }
+
+  /**
+   * Fills the additive pavement pools. Every lamp in range gets one, including the two or three carrying a real
+   * point light: the disc is small enough to read as the hot core of the luminaire rather than a sepia ellipse over
+   * the lane paint, and making it depend on which lamp holds a light is what put a pop on the pool boundary.
+   */
+  private repackLampGlow(camX: number, camZ: number): void {
+    const glow = this.lampGlowMesh;
+    if (!glow) return;
+    glow.count = 0;
+    const range2 = PROP_RANGE.lamp * PROP_RANGE.lamp;
+    for (let i = 0; i < this.lampCount; i++) {
+      const dx = this.lampX[i] - camX, dz = this.lampZ[i] - camZ;
+      if (dx * dx + dz * dz > range2) continue;
+      placementMatrix(this.lampX[i], this.lampZ[i], this.lampYaw[i], 1, CURB_H);
+      glow.setMatrixAt(glow.count, mat);
+      glow.count++;
+    }
+  }
+
+  /**
+   * Hands the nearest few static parked cars to the full near loft and hides their coarse shells. Runs after the
+   * generic pass, which has already set every coarse shell's visibility from its own range.
+   */
+  private repackNearCars(camX: number, camZ: number): void {
+    const near = this.nearMesh, coarse = this.coarseMesh;
+    if (!near || !coarse) return;
+    for (let k = 0; k < NEAR_CARS.cap; k++) near.setVisibleAt(k, false);
+    const r2 = NEAR_CARS.range * NEAR_CARS.range;
+    let picked = 0;
+    for (let i = 0; i < this.carCount; i++) {
+      const dx = this.carX[i] - camX, dz = this.carZ[i] - camZ;
+      const d2 = dx * dx + dz * dz;
+      if (d2 > r2) continue;
+      picked = PropRenderer.insertNearest(this.pickIdx, this.pickD2, picked, NEAR_CARS.cap, i, d2);
+    }
+    for (let k = 0; k < picked; k++) {
+      const i = this.pickIdx[k];
+      near.setGeometryIdAt(k, this.nearGeo[this.carGeo[i]]);
+      near.setMatrixAt(k, placementMatrix(this.carX[i], this.carZ[i], this.carYaw[i], 1, this.carY[i]));
+      near.setColorAt(k, scratchColor.setHex(this.carColour[i]));
+      near.setVisibleAt(k, true);
+      coarse.setVisibleAt(this.carCoarse[i], false);
+    }
+  }
+
+  /** Copies the wire spans within range into the line mesh's buffer and sets its draw range. */
+  private repackWires(camX: number, camZ: number): void {
+    const spans = this.spans, attr = this.wirePos;
+    if (!spans || !attr || !this.wireMesh) return;
+    const dst = attr.array as Float32Array;
+    const capSpans = Math.floor(dst.length / WIRE_FLOATS_PER_SPAN);
+    const r2 = WIRE.inRange * WIRE.inRange;
+    let n = 0;
+    for (let i = 0; i < spans.count && n < capSpans; i++) {
+      const dx = spans.midX[i] - camX, dz = spans.midZ[i] - camZ;
+      if (dx * dx + dz * dz > r2) continue;
+      dst.set(spans.data.subarray(i * WIRE_FLOATS_PER_SPAN, (i + 1) * WIRE_FLOATS_PER_SPAN), n * WIRE_FLOATS_PER_SPAN);
+      n++;
+    }
+    attr.needsUpdate = true;
+    this.wireMesh.geometry.setDrawRange(0, (n * WIRE_FLOATS_PER_SPAN) / 3);
+    this.wireMesh.visible = n > 0;
   }
 
   private static show(list: BatchTarget[], i: number, visible: boolean): void {
@@ -881,6 +1460,9 @@ export class PropRenderer {
         }
       }
     }
+    this.repackLampGlow(camX, camZ);
+    this.repackNearCars(camX, camZ);
+    this.repackWires(camX, camZ);
     for (let i = 0; i < this.instanced.length; i++) this.instanced[i].instanceMatrix.needsUpdate = true;
   }
 
@@ -895,6 +1477,13 @@ export class PropRenderer {
     for (let i = 0; i < this.instanced.length; i++) this.instanced[i].dispose();
     for (let i = 0; i < this.batches.length; i++) this.batches[i].dispose();
     for (let i = 0; i < this.geometries.length; i++) this.geometries[i].dispose();
+    for (let i = 0; i < this.lampLights.length; i++) {
+      const l = this.lampLights[i];
+      if (l.parent) l.parent.remove(l);
+      l.dispose();
+    }
+    this.lampLights.length = 0;
+    if (this.wireMat) this.wireMat.dispose();
     this.glowMat.dispose();
     this.paintMat.dispose();
     this.meshes.length = 0;

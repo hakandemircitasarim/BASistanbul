@@ -7,6 +7,7 @@ import { Random } from '../../src/game/core/Random';
 import { BLOCK, INTERSECTION_R, LANE_W, PITCH, ROAD_W, SIDEWALK_W } from '../../src/game/city/CityConfig';
 import { ASPHALT_HALF, colliderDistance, districtOf, onRoad } from '../../src/game/city/CityBuild';
 import { HEDGE, LOT_BAYS, lotLayout } from '../../src/game/city/CityLots';
+import { CAFE, CLUTTER_SPOT_CLEAR, DUMPSTER, POLE, ROADSIGN } from '../../src/game/city/CityProps';
 import type { Lot, ParkedCar } from '../../src/game/city/CityData';
 import { SPECS } from '../../src/game/entities/VehicleSpecs';
 import type { LanePos } from '../../src/game/city/RoadGraph';
@@ -536,3 +537,130 @@ test('street trees and lot hedges: placement, clearances, colliders', () => {
 });
 
 function halfWOf(): number { return LANE_W / 2; }
+
+/** Distance from (x, z) to the nearest edge of the block that contains it, with that edge's index (null when outside every block). */
+function insetOffset(c: { blocks: { x0: number; z0: number; x1: number; z1: number }[] }, x: number, z: number): { edge: number; off: number } | null {
+  for (const b of c.blocks) {
+    if (x < b.x0 || x > b.x1 || z < b.z0 || z > b.z1) continue;
+    const d = [b.z1 - z, b.x1 - x, z - b.z0, x - b.x0];
+    let edge = 0;
+    for (let i = 1; i < 4; i++) if (d[i] < d[edge]) edge = i;
+    return { edge, off: d[edge] };
+  }
+  return null;
+}
+
+test('street clutter: poles with wire runs, signs, dumpsters and café tables — placement, clearances, colliders, determinism', () => {
+  const g = city();
+  const c = g.city;
+  const poles = c.props.filter((p) => p.kind === 'pole');
+  const signs = c.props.filter((p) => p.kind === 'roadsign');
+  const dumpsters = c.props.filter((p) => p.kind === 'dumpster');
+  const tables = c.props.filter((p) => p.kind === 'table');
+  console.log(`    summary: clutter — poles ${poles.length}, road signs ${signs.length}, dumpsters ${dumpsters.length}, café tables ${tables.length}`);
+  expect(poles.length >= 200 && poles.length <= 900, `200-900 utility poles (got ${poles.length})`);
+  expect(signs.length >= 60 && signs.length <= 400, `60-400 road signs (got ${signs.length})`);
+  expect(dumpsters.length >= 100 && dumpsters.length <= 900, `100-900 dumpsters (got ${dumpsters.length})`);
+  expect(tables.length >= 20 && tables.length <= 400, `20-400 café tables (got ${tables.length})`);
+  const circles = c.staticColliders.filter((k) => k.shape.kind === 'circle' && k.tag !== 'water' && k.tag !== 'boundary');
+  const aabbs = c.staticColliders.filter((k) => k.tag === 'prop' && k.shape.kind === 'aabb');
+  const hasCircle = (x: number, z: number): boolean => circles.some((k) => { const s = k.shape as { cx: number; cz: number; r: number }; return Math.abs(s.cx - x) < 1e-6 && Math.abs(s.cz - z) < 1e-6; });
+  const hasAabb = (x: number, z: number): boolean => aabbs.some((k) => k.shape.kind === 'aabb' && x > k.shape.minX && x < k.shape.maxX && z > k.shape.minZ && z < k.shape.maxZ);
+  /** Clearance to the nearest *other* collider surface (its own collider sits at distance -r). */
+  const nearestOther = (x: number, z: number): number => {
+    let best = Infinity;
+    for (const k of circles) { const s = k.shape as { cx: number; cz: number; r: number }; const d = Math.hypot(s.cx - x, s.cz - z) - s.r; if (d > 1e-6 && d < best) best = d; }
+    return best;
+  };
+  const halfW = LANE_W / 2;
+  const kerbCars = (c.parked ?? []).filter((p) => p.at === 'kerb');
+  const carClear = (x: number, z: number, r: number): boolean => kerbCars.every((p) => {
+    const hw = SPECS[p.spec].width / 2, hl = SPECS[p.spec].length / 2;
+    const cs = Math.abs(Math.cos(p.yaw)), sn = Math.abs(Math.sin(p.yaw));
+    const ex = hw * cs + hl * sn, ez = hw * sn + hl * cs;
+    return Math.hypot(Math.max(p.x - ex - x, 0, x - (p.x + ex)), Math.max(p.z - ez - z, 0, z - (p.z + ez))) >= r;
+  });
+  const spots = c.parkedSpots;
+  const spotClear = (x: number, z: number, r: number): boolean => spots.every((s) => Math.hypot(s.x - x, s.z - z) >= r - 1e-6);
+
+  // Poles: on the kerb line of a suburb building block, in runs that stop short of both corners.
+  for (const p of poles) {
+    const f = faceOffset(c, p.x, p.z);
+    expect(f !== null, `pole at (${p.x.toFixed(1)}, ${p.z.toFixed(1)}) stands on a block face`);
+    approx(f!.off, POLE.off, 1e-6, 'pole on the kerb line');
+    expect(f!.along >= POLE.first - 1e-6 && f!.along <= BLOCK - POLE.endClear + 1e-6, `pole clear of the block corners (along ${f!.along.toFixed(1)})`);
+    const blk = c.blocks.find((b) => p.x >= b.x0 - 3 && p.x <= b.x1 + 3 && p.z >= b.z0 - 3 && p.z <= b.z1 + 3)!;
+    expect(districtOf(blk.col, blk.row) === 'suburb' && blk.kind === 'buildings', 'poles only on suburb building blocks');
+    expect(!onRoad(g.roads, p.x, p.z, halfW), 'pole off the road');
+    expect(nearestOther(p.x, p.z) >= POLE.clear - 1e-6, `pole keeps ${POLE.clear} m from the nearest collider`);
+    expect(hasCircle(p.x, p.z), 'pole has a circle collider');
+    expect(carClear(p.x, p.z, POLE.r), 'no kerbside car overlaps a pole');
+    expect(spotClear(p.x, p.z, CLUTTER_SPOT_CLEAR), 'pole keeps clear of the gameplay parking spots');
+  }
+  // Wire runs: a pole always has a neighbour on its own edge line, and a run never jumps an intersection.
+  let spans = 0;
+  for (const a of poles) {
+    for (const b of poles) {
+      if (a === b || Math.abs(a.yaw - b.yaw) > 1e-3) continue;
+      const alongX = Math.abs(Math.sin(a.yaw)) < 0.5;
+      if (Math.abs(alongX ? a.z - b.z : a.x - b.x) > 0.05) continue;
+      const d = Math.hypot(a.x - b.x, a.z - b.z);
+      if (d >= 12 && d <= 42) spans++;
+    }
+  }
+  expect(spans > poles.length, `poles form wire runs (${spans / 2} spans for ${poles.length} poles)`);
+
+  // Road signs: on the pavement at an intersection approach, plate across the street.
+  for (const p of signs) {
+    const f = faceOffset(c, p.x, p.z);
+    expect(f !== null, 'road sign stands on a block face');
+    approx(f!.off, ROADSIGN.off, 1e-6, 'road sign on the kerb line');
+    expect(!onRoad(g.roads, p.x, p.z, halfW), 'road sign off the road');
+    expect(nearestOther(p.x, p.z) >= ROADSIGN.clear - 1e-6, 'road sign keeps its clearance');
+    expect(hasCircle(p.x, p.z), 'road sign has a circle collider');
+    expect(carClear(p.x, p.z, ROADSIGN.r), 'no kerbside car overlaps a road sign');
+    expect(spotClear(p.x, p.z, CLUTTER_SPOT_CLEAR), 'road sign keeps clear of the gameplay parking spots');
+  }
+
+  // Dumpsters: inside a block, in the alley band, never inside a building, with a box collider.
+  for (const p of dumpsters) {
+    const f = insetOffset(c, p.x, p.z);
+    expect(f !== null, `dumpster at (${p.x.toFixed(1)}, ${p.z.toFixed(1)}) is inside a block`);
+    expect(f!.off <= DUMPSTER.depth + 1e-6, 'dumpster in the alley band, not deep inside the block');
+    expect(!onRoad(g.roads, p.x, p.z, halfW), 'dumpster off the road');
+    for (const b of c.buildings) expect(Math.abs(b.x - p.x) > b.w / 2 || Math.abs(b.z - p.z) > b.d / 2, 'dumpster never inside a building');
+    expect(nearestOther(p.x, p.z) >= DUMPSTER.clear - 1e-6, 'dumpster keeps its clearance');
+    expect(hasAabb(p.x, p.z), 'dumpster has an AABB collider');
+    expect(spotClear(p.x, p.z, CLUTTER_SPOT_CLEAR), 'dumpster keeps clear of the gameplay parking spots');
+  }
+
+  // Café tables: in the arcade strip between the block edge and the shopfronts.
+  for (const p of tables) {
+    const f = insetOffset(c, p.x, p.z);
+    expect(f !== null, 'café table is inside a block');
+    approx(f!.off, CAFE.inset, 1e-6, 'café table in the arcade strip');
+    expect(!onRoad(g.roads, p.x, p.z, halfW), 'café table off the road');
+    for (const b of c.buildings) expect(Math.abs(b.x - p.x) > b.w / 2 || Math.abs(b.z - p.z) > b.d / 2, 'café table never inside a building');
+    expect(nearestOther(p.x, p.z) >= CAFE.clear - 1e-6, 'café table keeps its clearance');
+    expect(hasCircle(p.x, p.z), 'café table has a circle collider');
+    expect(spotClear(p.x, p.z, CLUTTER_SPOT_CLEAR), 'café table keeps clear of the gameplay parking spots');
+  }
+
+  // Crossings: nothing stands on a sidewalk crossing line between two corner nodes.
+  const clutter = [...poles, ...signs, ...dumpsters, ...tables];
+  for (const n of g.sidewalks.nodes) {
+    for (const ci of n.crossings) {
+      if (ci < n.id) continue;
+      const m = g.sidewalks.nodes[ci];
+      for (const p of clutter) {
+        const dx = m.x - n.x, dz = m.z - n.z, len2 = dx * dx + dz * dz;
+        const t = Math.max(0, Math.min(1, ((p.x - n.x) * dx + (p.z - n.z) * dz) / len2));
+        const d = Math.hypot(n.x + dx * t - p.x, n.z + dz * t - p.z);
+        expect(d >= 1.2, `clutter (${p.kind}) keeps 1.2 m off the crossing ${n.id}-${ci}`);
+      }
+    }
+  }
+
+  const b2 = generateCity(1907).city;
+  expect(JSON.stringify(b2.props.filter((p) => p.kind === 'pole' || p.kind === 'roadsign' || p.kind === 'dumpster' || p.kind === 'table')) === JSON.stringify(clutter), 'street clutter deterministic for the seed');
+});
