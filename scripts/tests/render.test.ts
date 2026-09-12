@@ -4,10 +4,12 @@ import { DayNightSystem, DAY_TUNING } from '../../src/game/systems/DayNightSyste
 import { ARCADE, BAND, CELL_KIND, CELL_STYLES, FacadeCellList, GeoBuilder, Outline, appendBuilding, appendBuildingDetail, appendStreetLevel, bandHeight, buildingGeometry, buildingTint, footprint, hasCrown, landmarkGeometries, massingOf } from '../../src/game/render/BuildingGeometry';
 import { MARK_UV, PLINTH_BAYS, PLINTH_TILE_W, ROOF_SEAM_U, ROOF_STRIP_PX, SHOP_BAYS, SHOP_BAY_W, SHOP_DOOR_W, SHOP_FASCIA_Y, SHOP_ROWS, SHOP_TILE_W, WINDOW_CELL, WINDOW_TILE_H, WINDOW_TILE_PX_H } from '../../src/game/render/TextureFactory';
 import { FACADE_RANGE, FacadeDetailRenderer } from '../../src/game/render/FacadeDetailRenderer';
-import { MeshStandardMaterial, Scene } from 'three';
+import { MeshStandardMaterial, Scene, ShaderChunk } from 'three';
 import type { BufferGeometry } from 'three';
 import { Random } from '../../src/game/core/Random';
 import { SKY_KEYS } from '../../src/game/render/SkySystem';
+import { ContactShadows, SHADOW_TUNING } from '../../src/game/render/ContactShadows';
+import { BUDGET } from '../../src/game/core/Budget';
 import { Vehicle } from '../../src/game/entities/Vehicle';
 import { SPECS } from '../../src/game/entities/VehicleSpecs';
 import type { Building, Landmark } from '../../src/game/city/CityData';
@@ -400,4 +402,71 @@ test('SkySystem: SKY_KEYS ascend in hour, carry fill/ground/fogDensity and hit t
   const night = SKY_KEYS.find((s) => s.hour === 22);
   expect(noon !== undefined && night !== undefined && noon.fogDensity < night.fogDensity, 'night fog denser than noon');
   expect(noon !== undefined && noon.sunI > 0 && noon.ambI > 0 && noon.sunI * 1.3 > noon.ambI * 0.5 * 2, 'key stronger than fill at noon');
+});
+
+test('SkySystem: the shadow chunk is patched for both a soft penumbra and the box-edge fade', () => {
+  // Importing SkySystem runs both shader-chunk patches at module load, before any material compiles. They are string
+  // replacements against three's own source, so a three upgrade can silently drop either one: the sun would go back
+  // to a 1-texel stencil edge (patchShadowPenumbra) or grow a stair-stepped box border across the tarmac
+  // (patchShadowEdgeFade), and nothing but a screenshot would say so. Assert both landed.
+  const chunk = ShaderChunk.shadowmap_pars_fragment;
+  expect(chunk.includes('blockerFar'), 'penumbra patch applied: the blocker-distance probe is in the chunk');
+  expect(chunk.includes('softRadius'), 'penumbra patch applied: the disk radius is driven by it');
+  const taps = chunk.split('vogelDiskSample( ').filter((p) => /^\d+, 7,/.test(p)).length;
+  expect(taps === 7, `the directional PCF disk takes 7 taps, not three's 5 (got ${taps})`);
+  expect(!chunk.includes('vogelDiskSample( 0, 5, phi ) * radius'), 'the stock 5-tap disk is gone');
+  // The taps are summed and scaled by one constant, and getting that constant out of step with the tap count scales
+  // the shadow term of EVERY lit fragment in the city by taps/constant - a uniform dimming of all direct light that
+  // no screenshot reads as a bug, only as "a bit flat". (It happened: 7 taps were divided by 9 for one round.)
+  const weight = /\)\s*\*\s*([0-9.]+);/.exec(chunk.slice(chunk.indexOf('softRadius')));
+  expect(!!weight, 'the tap sum carries a scale');
+  expect(Math.abs(taps * Number(weight?.[1]) - 1) < 1e-4, `taps x scale = 1 (got ${taps} x ${weight?.[1]})`);
+  expect(chunk.includes('edgeT'), 'edge fade patch still applied (round 8 shadow-box border)');
+});
+
+test('BuildingGeometry: the roof cornice carries its own shadow line (a vertex ramp down the fillet)', () => {
+  // The cornice profile has existed since round 5; what it lacked was any tonal difference between the fillet that
+  // sits under the crown slab's oversail and the slab itself, so a roofline read as a painted pale stripe. The fillet
+  // is now ramped dark toward its head and the soffit is darker again, all in vertex colour - no extra quads.
+  const gb = new GeoBuilder();
+  const ol = new Outline();
+  ol.set(0, 0, 10, 10);
+  gb.corniceOutline(ol, 12, 0.15, 0.3, 0.35, 0.35, 0xffffff);
+  const g = gb.build();
+  const col = g.getAttribute('color');
+  const pos = g.getAttribute('position');
+  // The profile runs yb = 11.35 (fillet foot) -> ym = 11.7 (fillet head, soffit, slab foot) -> 12 (slab top). Only
+  // the fillet's foot sits on yb, so its shade there is unambiguous; ym carries the fillet head, the soffit and the
+  // slab, so the darkest value there is what the roof edge shows as its shadow line.
+  let hi = 0, lo = 1, footShade = 0, headShade = 1;
+  for (let i = 0; i < col.count; i++) {
+    const r = col.getX(i);
+    hi = Math.max(hi, r);
+    lo = Math.min(lo, r);
+    // The fillet is emitted first: one quad per outline edge, 4 vertices each, foot vertices before head vertices.
+    if (i < 4 * ol.n) {
+      if (Math.abs(pos.getY(i) - 11.35) < 1e-3) footShade = Math.max(footShade, r);
+      else headShade = Math.min(headShade, r);
+    }
+  }
+  expect(lo < 0.6, `the soffit under the oversail is deep in shadow (min ${lo.toFixed(2)})`);
+  expect(hi > 0.9, `the crown slab keeps the wall tone (max ${hi.toFixed(2)})`);
+  expect(footShade > 0.85, `the fillet's foot still sees the sky (${footShade.toFixed(2)})`);
+  expect(footShade - headShade > 0.25, `a real shadow line under the oversail (foot ${footShade.toFixed(2)}, head ${headShade.toFixed(2)})`);
+});
+
+test('contact shadow slices: the shared blob mesh covers every renderer that reserves one', () => {
+  // The blob field hands out ONE contiguous slice per renderer at construction and silently clamps whatever is left
+  // (reservedRoom), so the last renderer to build is the one that quietly loses blobs. The slices are, in Engine's
+  // construction order: VehicleRenderer 96, PedRenderer MAX_PEDS, PlayerRenderer 1 and PropRenderer's parked cars
+  // (CityRendererProps' CAR_SHADOWS.cap, 44 — sized so the pick is a range cut, never a rank cut).
+  const scene = new Scene();
+  const want: [string, number][] = [['vehicles', 96], ['peds', BUDGET.MAX_PEDS], ['player', 1], ['parked cars', 44]];
+  let total = 0;
+  for (const [name, n] of want) {
+    const slice = new ContactShadows(scene, n);
+    expect(slice.capacity === n, `${name} got all ${n} blob slots (got ${slice.capacity})`);
+    total += n;
+  }
+  expect(SHADOW_TUNING.capacity >= total, `blob capacity ${SHADOW_TUNING.capacity} covers the ${total} reserved slots`);
 });

@@ -10,6 +10,7 @@ import { HEDGE, LOT_BAYS, lotLayout } from '../../src/game/city/CityLots';
 import { CAFE, CLUTTER_SPOT_CLEAR, DUMPSTER, POLE, ROADSIGN, TREE_CLEAR } from '../../src/game/city/CityProps';
 import type { Lot, ParkedCar } from '../../src/game/city/CityData';
 import { SPECS } from '../../src/game/entities/VehicleSpecs';
+import { parkedMidGeometry, parkedNearGeometry, parkedShellGeometry } from '../../src/game/render/VehicleRenderer';
 import type { LanePos } from '../../src/game/city/RoadGraph';
 import { MINIMAP_BLIP_CAPACITY, MinimapRenderer, createMinimapSnapshot } from '../../src/game/minimap/MinimapRenderer';
 
@@ -679,4 +680,43 @@ test('street clutter: poles with wire runs, signs, dumpsters and cafÃ© tables â€
 
   const b2 = generateCity(1907).city;
   expect(JSON.stringify(b2.props.filter((p) => p.kind === 'pole' || p.kind === 'roadsign' || p.kind === 'dumpster' || p.kind === 'table')) === JSON.stringify(clutter), 'street clutter deterministic for the seed');
+});
+
+test('parked car shells: the LOD ladder is cheaper at every rung and keeps one silhouette', () => {
+  // The static parked cars of the lots and kerbs are drawn at three fidelities (CityRendererProps' near / mid / coarse
+  // bands, and the same three shells serve the moving vehicles past VEHICLE_RENDER.bodyFullDist). The band boundaries
+  // are 8, 32 and 70 m of open street, so what must NOT change across them is the SILHOUETTE: roofline height, overall
+  // width and length, and the fact that the wheels reach the ground. Only the detail inside it may drop out.
+  //
+  // The triangle ceilings are the budget guard. A walked dusk frame holds ~20 cars; the ladder is what keeps that
+  // inside the 720 k hard cap (round 8 measured 766 k in one, with the full body drawn out to 75 m).
+  const box = (g: { attributes: { position: { count: number; getX(i: number): number; getY(i: number): number; getZ(i: number): number } }; index: { count: number } | null }): { tris: number; w: number; h: number; l: number; floor: number } => {
+    const p = g.attributes.position;
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+    for (let i = 0; i < p.count; i++) {
+      x0 = Math.min(x0, p.getX(i)); x1 = Math.max(x1, p.getX(i));
+      y0 = Math.min(y0, p.getY(i)); y1 = Math.max(y1, p.getY(i));
+      z0 = Math.min(z0, p.getZ(i)); z1 = Math.max(z1, p.getZ(i));
+    }
+    return { tris: (g.index ? g.index.count : p.count) / 3, w: x1 - x0, h: y1, l: z1 - z0, floor: y0 };
+  };
+  for (const key of ['sedan', 'sport', 'van'] as const) {
+    const near = box(parkedNearGeometry(SPECS[key]));
+    const mid = box(parkedMidGeometry(SPECS[key]));
+    const coarse = box(parkedShellGeometry(SPECS[key]));
+    expect(near.tris > mid.tris && mid.tris > coarse.tris, `${key}: each rung is cheaper (${near.tris} > ${mid.tris} > ${coarse.tris})`);
+    expect(mid.tris <= 1100, `${key}: mid shell within budget (${mid.tris})`);
+    expect(coarse.tris <= 700, `${key}: coarse shell within budget (${coarse.tris})`);
+    for (const [name, b] of [['mid', mid], ['coarse', coarse]] as const) {
+      approx(b.h, near.h, 0.02, `${key}/${name}: same roofline height`);
+      // 9 cm on width: the near shell alone carries the door mirrors, which stand ~4 cm proud of the flank each side.
+      approx(b.w, near.w, 0.09, `${key}/${name}: same width`);
+      // 12 cm on length, not 3: the near shell alone carries the exhaust tube and the rear bumper's rubbing strip,
+      // which poke a few centimetres past the loft the three shells share. Everything else is the same loft.
+      approx(b.l, near.l, 0.12, `${key}/${name}: same length`);
+      // Every rung's wheels reach the floor within a facet: which angle a 10- or 12-sided lathe happens to sample at
+      // the bottom of the tyre is worth up to r * (1 - cos(pi / seg)), i.e. ~1.8 cm, and nothing else may hang lower.
+      expect(b.floor >= -1e-4 && b.floor < 0.03, `${key}/${name}: wheels reach the ground (floor ${b.floor.toFixed(3)})`);
+    }
+  }
 });

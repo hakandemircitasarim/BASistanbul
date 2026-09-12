@@ -8,15 +8,29 @@ import { clamp } from '../core/math';
 import { BLOCK, CURB_H, GRID_COLS, GRID_ROWS, PITCH, ROAD_W, SIDEWALK_W } from '../city/CityConfig';
 
 export const SHADOW_TUNING = {
-  /** Slots: every vehicle + every ped + the player (+ spare). */
-  capacity: BUDGET.MAX_VEHICLES + BUDGET.MAX_PEDS + 8,
+  /**
+   * Slots: every vehicle + every ped + the parked-car slice (CAR_SHADOWS.cap, 44) + the player + spare. The slices are
+   * reserved once at construction and clamped to what is left, so this must cover all of them or the last renderer to
+   * build silently gets fewer blobs than it asks for.
+   */
+  capacity: BUDGET.MAX_VEHICLES + BUDGET.MAX_PEDS + 48,
   texSize: 64,
-  /** Radius (0..1) of the fully opaque core; the rest fades to nothing at the rim. */
-  core: 0.34,
+  /**
+   * Radius (0..1) of the fully opaque core; the rest fades to nothing at the rim. 0.5, not the old 0.34: a ped blob is
+   * a 0.6 m ellipse, so a third of that put the whole opaque core UNDER the shoes and only the outer fade showed -
+   * the pavement a hand's width from a standing figure measured within 3 % of clear road, i.e. nothing. Half the
+   * radius still lands well inside a car's own footprint, so the vehicle blobs only firm up.
+   */
+  core: 0.5,
   /** Real cast shadows overlap the blobs by day; at night the moon shadow is faint, so the blob keeps cars grounded. */
   dayOpacity: 0.3,
   nightOpacity: 0.3,
-  color: 0x120b1c,
+  /**
+   * Neutral near-black, not the old 0x120b1c. That violet is darker than asphalt in luma but BLUER than it, so under
+   * a figure on a grey road the blob read as a blue smear painted on the tarmac rather than as shade; the split-tone
+   * grade then pushed the same pixels further toward blue.
+   */
+  color: 0x0f0f12,
 } as const;
 
 /**

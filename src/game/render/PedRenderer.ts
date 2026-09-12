@@ -12,12 +12,39 @@ import { BUDGET } from '../core/Budget';
 import { clamp, damp, smoothstep } from '../core/math';
 import {
   PROFILE, RIM_FRAGMENT, armRings, bakeAO, block, fillAttr, fuse, hairCap, hand, headParts, legRings, makeRimUniforms,
-  neckRings, nightFromHour, paintFn, ringAt, setRimNight, shoe, surface, torsoRings, tube, type Ring, type RimUniforms,
+  makeGroundShadow, neckRings, nightFromHour, paintFn, paintShoe, ringAt, setRimNight, shoe, surface, torsoRings, tube,
+  updateGroundShadow, type Ring, type RimUniforms,
 } from './PlayerRenderer';
 
 export const PED_RENDER = {
-  cullDist: 120, scale: 0.97, swingWalk: 0.55, swingFlee: 1.0, lyingLift: 0.22, armSwing: 0.75,
-  shadowR: 0.46, shadowLift: 0.03, bob: 0.028, sway: 0.045,
+  /**
+   * Crowd draw range. A ped is 1882 triangles and pays them TWICE (colour + shadow pass), so 40 of them are ~150 k -
+   * the single largest line item in a dusk frame, and the walked dusk frames were sitting within 1 k of the 720 k
+   * ceiling once the crowd reached its spawner target. The cut is at 96 m, where a 1.75 m figure is ~13 px tall at
+   * 720 p, and past it the instance is dropped from the list ENTIRELY (see sync): a zero-scale instance, which is what
+   * the old 120 m cull left behind, still submits all of its triangles in both passes.
+   *
+   * The last `cullFade` metres ease the ped down to `cullFloor` of its height first, so the figure settles rather than
+   * blinking off. It deliberately does NOT fade to zero: a person shrinking to nothing reads as a dwarf walking away,
+   * which is a worse artefact than the pop it replaces. At 0.55 of 13 px the remaining step is a few pixels.
+   */
+  cullDist: 96, cullFade: 6, cullFloor: 0.55, scale: 0.97, swingWalk: 0.55, swingFlee: 1.0, lyingLift: 0.22, armSwing: 0.75,
+  /**
+   * Blob half-width. Larger than the figure (a 1.2 m ellipse under a 1.75 m ped) because the shared blob texture is
+   * opaque only inside SHADOW_TUNING.core = 34 % of its radius and fades to nothing at the rim: at the old 0.46 the
+   * whole opaque core hid under the ped's own footprint, and the pavement pixels under a standing figure measured
+   * unchanged. At 0.6 the core is a 40 cm puddle that shows around the shoes.
+   */
+  shadowR: 0.6, shadowLift: 0.03, bob: 0.028, sway: 0.045,
+  /**
+   * Contact blob geometry. It used to be a circle centred on the ped, the same size whatever the hour: it pointed
+   * nowhere, so it read as a detached disc lying beside the feet rather than as a shadow. Now it is an ellipse aligned
+   * with the direction the scene's own shadow light casts (see PlayerRenderer.GroundShadow, so it agrees with the
+   * shadow map and follows the swap to moon shadows), `shadowNarrow` x shadowR across that direction and up to
+   * `shadowStretchMax` x shadowR along it as the light drops, pushed out by the difference so its near end stays
+   * under the shoes and the far end runs away from the light. `shadowElevFloor` caps how long a very low sun makes it.
+   */
+  shadowNarrow: 1.0, shadowStretchMax: 2.4, shadowElevFloor: 0.26,
   /** Height and width multipliers per ped span 1 +- spread/2 (fixed by the id). */
   heightSpread: 0.2, widthSpread: 0.2,
   /** Joint folds (radians): the knee folds while the leg swings forward, the elbow rests soft and deepens on the reach. */
@@ -26,14 +53,17 @@ export const PED_RENDER = {
   lean: 0.05, leanStride: 0.03, headFollow: 0.5, glance: 0.22,
   /** Damping of the cosmetic kerb height under a ped (rad/s), the player's own rate (PlayerRenderer.groundY). */
   groundDamp: 14,
-  radial: 10, headSegs: 12, headRings: 8, hairRows: 5,
+  // Head tessellation of the crowd. 10 x 6 (from 12 x 8): the extra rings of the collar, hem and belt profile have to
+  // be paid for somewhere, and a 22 cm skull at the 10-40 m a ped is seen from does not resolve 96 quads. The player
+  // keeps 14 x 10.
+  radial: 10, headSegs: 10, headRings: 6, hairRows: 5,
 };
 
 /** Variant bits: which of the four looks (ped.id % 4) show a part. */
 const V_PLAIN = 1, V_HAT = 2, V_TAIL = 4, V_BALD = 8, V_ALL = 15;
 /** Vertex-colour multipliers layered under the per-instance colour (absCol = 0); absolute colours use absCol = 1. */
 const TINT_HAIR = 0.3, TINT_BROW = 0.26;
-const HAT = 0x24304e, BAG = 0x5a3a24, SHOE = 0x1f1c1c, EYE = 0x1a1410;
+const HAT = 0x24304e, BAG = 0x5a3a24, SHOE = 0x1f1c1c, SOLE = 0x4d4a4a, EYE = 0x1a1410;
 
 function tint(g: THREE.BufferGeometry, k: number, mask: number): THREE.BufferGeometry {
   paintFn(g, (_x, _y, _z, out) => out.setRGB(k, k, k));
@@ -73,7 +103,7 @@ function bodyGeometry(): THREE.BufferGeometry {
   const beltLo = P.beltLo * s, beltHi = P.beltHi * s, collar = P.collarY * s;
   const torso = tube(rings, R.radial, true, true);
   paintFn(torso, (_x, y, _z, out) => {
-    if (y < beltLo) out.setRGB(0.42, 0.4, 0.44);
+    if (y < beltLo) out.setRGB(0.46, 0.44, 0.47);
     else if (y < beltHi + 0.002) out.setRGB(0.16, 0.15, 0.17);
     else if (y < collar) { const k = 0.64 + 0.36 * smoothstep(beltHi, 1.24 * s, y); out.setRGB(k, k, k); }
     else out.setRGB(0.78, 0.76, 0.8);
@@ -143,7 +173,12 @@ function legGeometry(side: number): THREE.BufferGeometry {
   // Six-sided shoe: the crowd is the one part of the scene that pays its triangles 26 times over (and twice again in
   // the shadow pass), and at the distance a ped is ever seen the facet count of a 25 cm shoe is not resolvable — the
   // heel height is what reads. The player keeps ten sides.
-  const g = fuse([leg, solid(shoe(s, 6, -side * 0.020), SHOE, V_ALL)]);
+  // The sole plate is painted lighter than the upper (paintShoe), so a crowd's feet read as shoes from 20 m; the
+  // `solid` path would flood the whole shoe one colour, so the shoe brings its own colours and only the flags are set.
+  const foot = paintShoe(shoe(s, 6, -side * 0.020), s, SHOE, SOLE);
+  fillAttr(foot, 'absCol', 1);
+  fillAttr(foot, 'partMask', V_ALL);
+  const g = fuse([leg, foot]);
   g.translate(side * P.hipX * s, 0, 0);
   bakeAO(g, s);
   g.translate(-side * P.hipX * s, -P.hipY * s, 0);
@@ -231,6 +266,8 @@ export class PedRenderer {
    */
   private readonly groundY = new Float32Array(BUDGET.MAX_PEDS);
   private readonly groundOwner = new Int32Array(BUDGET.MAX_PEDS).fill(-1);
+  /** Ground direction and length of the contact blobs, from the scene's own shadow light (see GroundShadow). */
+  private readonly groundShadow = makeGroundShadow();
 
   constructor(scene: THREE.Scene) {
     this.scene = scene;
@@ -333,19 +370,30 @@ export class PedRenderer {
     const neckL = (P.neckY - P.hipY) * s;
     let n = 0;
     setRimNight(this.rim, nightFromHour(world.time.hour));
+    updateGroundShadow(this.groundShadow, this.scene, R.shadowNarrow, R.shadowStretchMax, R.shadowElevFloor);
     this.shadows.begin();
     for (let i = 0; i < list.length && n < cap; i++) {
       const p = list[i];
-      p.renderIndex = n;
       lerpTransform(this.interp, p.prev, p.curr, alpha);
       const t = this.interp;
       const dx = t.x - camX, dz = t.z - camZ;
-      const visible = dx * dx + dz * dz < R.cullDist * R.cullDist;
+      const d2 = dx * dx + dz * dz;
+      const visible = d2 < R.cullDist * R.cullDist;
+      // Past cullDist the ped is DROPPED from the instance list rather than scaled to 0.001. An InstancedMesh is
+      // frustum-culled as one object, so a zero-scale instance still submits its 1882 triangles in both the colour and
+      // the shadow pass - the crowd is the largest single line item in the frame, so those degenerate draws were real
+      // budget. Its damper slot is released too, so the ped snaps to the true ground when it comes back in range
+      // instead of damping up from a stale height.
+      if (!visible) { p.renderIndex = -1; this.groundOwner[p.id % cap] = -1; continue; }
+      p.renderIndex = n;
       // Per-ped build: taller or shorter, broader or slighter, and one of four looks, all fixed by the id.
       const tall = 1 + ((((p.id * 7919) % 13) / 12) - 0.5) * R.heightSpread;
       const wide = 1 + ((((p.id * 104729) % 17) / 16) - 0.5) * R.widthSpread;
       const variant = p.id % 4;
-      const sc = visible ? Math.max(0.001, clamp(p.spawnFade, 0, 1)) : 0;
+      // Distance ease over the last cullFade metres, folded into the same scale the spawn fade uses (so the contact
+      // blob below shrinks with it).
+      const far = smoothstep(R.cullDist - R.cullFade, R.cullDist, Math.sqrt(d2));
+      const sc = Math.max(0.001, clamp(p.spawnFade, 0, 1) * (1 - (1 - R.cullFloor) * far));
       const lying = p.state === 'HIT' || p.state === 'DEAD';
       const fall = clamp(p.tumble - 1, 0, 1);
       const pitch = lying ? -(Math.PI / 2) * fall : 0;
@@ -394,9 +442,17 @@ export class PedRenderer {
       this.bendArmL.setX(n, -(R.elbowRest + R.elbowReach * Math.max(0, swing)));
       this.bendArmR.setX(n, -(R.elbowRest + R.elbowReach * Math.max(0, -swing)));
       if (sc > 0.01) {
-        const r = lying ? R.shadowR * 1.7 : R.shadowR;
-        const rz = lying ? R.shadowR * 0.75 : R.shadowR;
-        this.shadows.add(t.x, gy + R.shadowLift, t.z, r * wide, rz * wide, t.yaw, sc);
+        if (lying) {
+          // A body on the ground is its own silhouette: keep the blob under it, aligned with the ped, not with the sun.
+          this.shadows.add(t.x, gy + R.shadowLift, t.z, R.shadowR * 1.7 * wide, R.shadowR * 0.75 * wide, t.yaw, sc);
+        } else {
+          const gs = this.groundShadow;
+          const rx = R.shadowR * R.shadowNarrow * wide;
+          const rz = R.shadowR * gs.stretch * wide;
+          const push = rz - rx;
+          this.shadows.add(t.x + gs.dirX * push, gy + R.shadowLift, t.z + gs.dirZ * push, rx, rz,
+            Math.atan2(gs.dirX, gs.dirZ), sc);
+        }
       }
       n++;
     }

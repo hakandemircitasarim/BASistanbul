@@ -108,6 +108,26 @@ function grey(l: number): string {
   return rgba(v, v, v, 1);
 }
 
+/**
+ * How far each mip level of a ground map is pulled back toward its darkest and its lightest parent texel (see
+ * mipChain). 0 is a plain box filter; at 0.34 a thin joint keeps roughly a third of the contrast a box filter takes
+ * off it per level, which is enough to stay visible to mip 6 without the aggregate grain turning into static.
+ */
+const MIP_DETAIL = 0.34;
+/**
+ * Anisotropy asked for the ground maps: the same 8 the rest of the city uses, and deliberately NOT higher.
+ *
+ * The pavement is the one family sampled at 80:1 ratios (a 128 px/m tile seen from 1.6 m of eye height), so 16 looked
+ * like the obvious cure for detail thinning out with distance. Measured, it is not: the joint contrast per screen row
+ * is identical at 8 and at 16 out to 30 m (within 0.05 of a grey level), because what the far pavement runs out of is
+ * mip CONTENT, which mipChain below fixes, not sampling taps. It cost 15 fps of the 40 the software-GL harness has at
+ * the worst-case frame. Left at 8.
+ */
+const GROUND_ANISO = 8;
+
+/** Ground albedo families that carry a derived relief / roughness map (see groundNormal, groundRough). */
+type GroundMap = 'sidewalk' | 'plaza' | 'road' | 'lotAsphalt' | 'crosswalk';
+
 /** Mixes toward white (k > 0) for texture-side highlights. */
 function tint(c: number, k: number): string {
   const r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
@@ -119,6 +139,8 @@ export class TextureFactory {
   private readonly cache = new Map<string, THREE.Texture>();
   /** Scratch canvases reused between textures (noise fields). Never uploaded, so they cost no GPU memory. */
   private readonly scratch = new Map<string, HTMLCanvasElement>();
+  /** Full-tile scratch canvases for noiseWash, one per size, released with the factory. */
+  private readonly washPool = new Map<string, { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D }>();
   private atlasRects: Map<string, AtlasRect> | null = null;
 
   private canvas(w: number, h: number): { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D } {
@@ -129,6 +151,73 @@ export class TextureFactory {
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) throw new Error('2D canvas unavailable');
     return { canvas, ctx };
+  }
+
+  /**
+   * Detail-preserving mip chain for the ground maps, down to 1 x 1.
+   *
+   * A box filter is the wrong reducer for a surface whose whole story is thin dark lines (slab joints, kerb chamfer,
+   * lane paint edges, gutter, tyre bands): a 3 px joint on a 1024 px tile is gone by mip 4, and with anisotropic
+   * filtering the fragment LOD crosses mip 4 at a fixed distance from the camera - which is the hard boundary about
+   * 15-20 m out, beyond which the pavement went flat grey and which swept along the kerb as the camera moved. Making
+   * the texture degrade gracefully instead of falling off a cliff removes the boundary; no box size or fade does.
+   *
+   * Each level therefore takes the 2 x 2 mean AND pulls it back toward whichever of the four parents is furthest from
+   * that mean (MIP_DETAIL of the way), separately for the darker and the lighter side. A thin dark line keeps ~7 % of
+   * its contrast at mip 4 where a box filter leaves 0.2 %, while a field with no structure in it (aggregate grain,
+   * a smooth gradient) is left as the mean, so nothing is sharpened into static.
+   */
+  private mipChain(src: HTMLCanvasElement): HTMLCanvasElement[] {
+    const chain: HTMLCanvasElement[] = [src];
+    let w = src.width, h = src.height;
+    const base = this.canvas(w, h);
+    base.ctx.drawImage(src, 0, 0);
+    let prevData = base.ctx.getImageData(0, 0, w, h).data;
+    while (w > 1 || h > 1) {
+      const pw = w, ph = h;
+      w = Math.max(1, w >> 1);
+      h = Math.max(1, h >> 1);
+      const next = this.canvas(w, h);
+      const img = next.ctx.createImageData(w, h);
+      const d = img.data;
+      for (let y = 0; y < h; y++) {
+        const y0 = Math.min(ph - 1, y * 2), y1 = Math.min(ph - 1, y * 2 + 1);
+        for (let x = 0; x < w; x++) {
+          const x0 = Math.min(pw - 1, x * 2), x1 = Math.min(pw - 1, x * 2 + 1);
+          const p = [(y0 * pw + x0) * 4, (y0 * pw + x1) * 4, (y1 * pw + x0) * 4, (y1 * pw + x1) * 4];
+          // Luminance decides which parent is the outlier, so a coloured line is pulled back as one colour.
+          let lo = 0, hi = 0, loL = 1e9, hiL = -1e9;
+          for (let i = 0; i < 4; i++) {
+            const L = prevData[p[i]] * 0.299 + prevData[p[i] + 1] * 0.587 + prevData[p[i] + 2] * 0.114;
+            if (L < loL) { loL = L; lo = p[i]; }
+            if (L > hiL) { hiL = L; hi = p[i]; }
+          }
+          const o = (y * w + x) * 4;
+          for (let ch = 0; ch < 4; ch++) {
+            const mean = (prevData[p[0] + ch] + prevData[p[1] + ch] + prevData[p[2] + ch] + prevData[p[3] + ch]) * 0.25;
+            const pull = (prevData[lo + ch] - mean) * MIP_DETAIL + (prevData[hi + ch] - mean) * MIP_DETAIL;
+            d[o + ch] = ch === 3 ? mean : mean + pull;
+          }
+        }
+      }
+      next.ctx.putImageData(img, 0, 0);
+      chain.push(next.canvas);
+      prevData = d;
+    }
+    return chain;
+  }
+
+  /**
+   * A ground albedo with the detail-preserving mip chain above and the full anisotropy the hardware allows: the two
+   * things that decide whether a paved surface still reads as paving at 25 m or as one flat value.
+   */
+  private finishGround(key: string, canvas: HTMLCanvasElement, srgb = true): THREE.CanvasTexture {
+    const t = this.finish(key, canvas, srgb);
+    t.mipmaps = this.mipChain(canvas);
+    t.generateMipmaps = false;
+    t.anisotropy = GROUND_ANISO;
+    t.needsUpdate = true;
+    return t;
   }
 
   private finish(key: string, canvas: HTMLCanvasElement, srgb: boolean, repeat = true, clampV = false): THREE.CanvasTexture {
@@ -189,12 +278,13 @@ export class TextureFactory {
 
   /**
    * Tiling greyscale value noise on a scratch canvas: `octaves` lattices starting at `lattice` cells across `size`
-   * px, each octave double the frequency and half the amplitude, remapped so the field averages mid grey and its
-   * extremes sit at 0.5 * (1 +- contrast). Drawn back over a flat colour field with globalCompositeOperation
-   * 'multiply' it is the difference between painted render and a single RGB fill - and because it lives on a scratch
-   * canvas that is never handed to THREE, it costs no texture memory at all.
+   * px, each octave double the frequency and half the amplitude, remapped to `centre` +- contrast. The default
+   * centre of 1 puts the field's mean at white, which is what a 'multiply' wash wants (valueWash): mid tones pass
+   * through unchanged and the field can only darken. Pass centre 0.5 with contrast 0.5 for a field centred on mid
+   * grey, which is what a SIGNED wash wants (noiseWash) - at the default centre a signed wash reads half its field
+   * clamped flat at white. Either way the canvas is scratch and never handed to THREE, so it costs no texture memory.
    */
-  private valueNoise(key: string, size: number, lattice: number, octaves: number, contrast: number, seed: number): HTMLCanvasElement {
+  private valueNoise(key: string, size: number, lattice: number, octaves: number, contrast: number, seed: number, centre = 1): HTMLCanvasElement {
     const hit = this.scratch.get(key);
     if (hit) return hit;
     const { canvas, ctx } = this.canvas(size, size);
@@ -226,7 +316,7 @@ export class TextureFactory {
     }
     for (let i = 0; i < acc.length; i++) {
       const t = acc[i] / norm;
-      const v = Math.max(0, Math.min(255, Math.round(255 * (1 - contrast + 2 * contrast * t))));
+      const v = Math.max(0, Math.min(255, Math.round(255 * (centre - contrast + 2 * contrast * t))));
       d[i * 4] = v; d[i * 4 + 1] = v; d[i * 4 + 2] = v; d[i * 4 + 3] = 255;
     }
     ctx.putImageData(img, 0, 0);
@@ -240,6 +330,50 @@ export class TextureFactory {
     ctx.globalCompositeOperation = 'multiply';
     for (let y = 0; y < h; y += span) for (let x = 0; x < w; x += span) ctx.drawImage(noise, x, y, span, span);
     ctx.restore();
+  }
+
+  /**
+   * Adds a SIGNED tiling value-noise field to a canvas: mid grey leaves a texel alone, darker darkens it, lighter
+   * lightens it, by up to `amp` of full range. The multiply wash (valueWash) can only ever darken - its field is
+   * clamped above mid grey - so two of them stacked on the bitumen shifted the whole plate down a couple of per cent
+   * and left no visible aggregate at all. This is the operator a stone-in-bitumen surface actually needs.
+   */
+  private noiseWash(ctx: CanvasRenderingContext2D, W: number, H: number, noise: HTMLCanvasElement, span: number, amp: number,
+                    noise2?: HTMLCanvasElement, span2 = 0, amp2 = 0): void {
+    const nd = this.washField(W, H, noise, span);
+    const nd2 = noise2 ? this.washField(W, H, noise2, span2) : null;
+    const img = ctx.getImageData(0, 0, W, H);
+    const d = img.data;
+    const k = amp * 255 / 128, k2 = amp2 * 255 / 128;
+    if (nd2) {
+      for (let i = 0; i < d.length; i += 4) {
+        const n = (nd[i] - 128) * k + (nd2[i] - 128) * k2;
+        d[i] += n; d[i + 1] += n; d[i + 2] += n;
+      }
+    } else {
+      for (let i = 0; i < d.length; i += 4) {
+        const n = (nd[i] - 128) * k;
+        d[i] += n; d[i + 1] += n; d[i + 2] += n;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+
+  /**
+   * Rasterises one tiling noise field over W x H on the POOLED wash canvas and hands back its pixels. Pooled because
+   * these are the biggest canvases the factory makes (4 MB at the 1024 px ground tiles) and it wants six of them for
+   * the asphalt alone: a fresh one per call was ~64 MB of transient surface allocated during boot.
+   * The returned array is a copy, so the same canvas serves the second field of a pair.
+   */
+  private washField(W: number, H: number, noise: HTMLCanvasElement, span: number): Uint8ClampedArray {
+    const key = `wash:${W}x${H}`;
+    let pool = this.washPool.get(key);
+    if (!pool) {
+      pool = this.canvas(W, H);
+      this.washPool.set(key, pool);
+    }
+    for (let y = 0; y < H; y += span) for (let x = 0; x < W; x += span) pool.ctx.drawImage(noise, x, y, span, span);
+    return pool.ctx.getImageData(0, 0, W, H).data;
   }
 
   private noise(ctx: CanvasRenderingContext2D, w: number, h: number, rng: Random, count: number, size: number, alpha: number, light: boolean): void {
@@ -387,12 +521,17 @@ export class TextureFactory {
       const [x, y, w, h] = rects[i];
       const perim = 2 * (w + h);
       const edgeN = Math.round(perim / (11 * scale));
+      // Chips never take more than a fifth of the marking's narrow side. A 0.15 m centre line is 11 px wide, and a
+      // chip of the old fixed 0.5-1.3 px radius (2.6 px at 1024) opened a quarter of the line to the bitumen under
+      // it: at a grazing angle that is the row of serrated dark notches along the yellow lines. Thinning the paint
+      // (alpha 0.3-0.62, not 0.5-1) rather than punching it through keeps the wear as wear.
+      const rMax = Math.min(1.3 * scale, 0.2 * Math.min(w, h));
       for (let k = 0; k < edgeN; k++) {
         const t = rng.range(0, perim);
         let ex: number, ey: number;
         if (t < w) { ex = x + t; ey = y; } else if (t < w + h) { ex = x + w; ey = y + (t - w); } else if (t < 2 * w + h) { ex = x + (t - w - h); ey = y + h; } else { ex = x; ey = y + (t - 2 * w - h); }
-        const r = rng.range(0.5, 1.3) * scale;
-        ctx.fillStyle = rgba(0, 0, 0, rng.range(0.5, 1));
+        const r = rng.range(0.4, 1) * rMax;
+        ctx.fillStyle = rgba(0, 0, 0, rng.range(0.3, 0.62));
         ctx.beginPath();
         ctx.ellipse(ex, ey, r, r * rng.range(0.5, 1.5), rng.range(0, Math.PI), 0, Math.PI * 2);
         ctx.fill();
@@ -594,6 +733,19 @@ export class TextureFactory {
     // stops the wall above the shopfront band from reading as one flat RGB fill at 12 m. The 256 px field is a
     // scratch canvas (no texture memory); the matching relief still comes from Materials.detailNormal.
     this.valueWash(m.ctx, W, H, this.valueNoise('plaster', 256, 4, 3, 0.18, 907), W);
+    // ...and the grain itself, as two SIGNED noise fields on the wall colour, per style. The multiply wash above can
+    // only darken, and its finest lattice is a metre across, which at 12 m is exactly the "soft low-frequency mottle
+    // that reads as a blurred wash" a wall must not be. These two run 3.2 m down to 0.8 m (the patchiness of a
+    // rendered wall, one bucket of render to the next) and 0.6 m down to 0.15 m (float marks and stucco grit, 10 px
+    // at this tile's 64 px/m so the 1-2-1 soften at the end of this function leaves them alone). Per style, because
+    // a board-marked concrete panel, cut stone and a hand-floated stucco are three different surfaces: the curtain
+    // walls get almost none, since theirs is glass and polished spandrel.
+    const GRAIN: Record<BuildingStyle, [number, number]> = {
+      residential: [0.075, 0.058], concrete: [0.062, 0.042], artdeco: [0.05, 0.034], glass: [0.02, 0.014], neon: [0.026, 0.018],
+    };
+    const [gBroad, gFine] = GRAIN[style];
+    this.noiseWash(m.ctx, W, mapH, this.valueNoise('plasterA', 256, 5, 3, 0.5, 4409, 0.5), W, gBroad,
+      this.valueNoise('plasterB', 256, 13, 3, 0.5, 7717, 0.5), W / 2, gFine);
     e.ctx.fillStyle = '#000';
     e.ctx.fillRect(0, 0, W, H);
     r.ctx.fillStyle = rgh(0.92);
@@ -700,6 +852,26 @@ export class TextureFactory {
         m.ctx.fillRect(cx - rw / 2, sy, rw, rl);
       }
     };
+    /**
+     * Floor-line shadow and drip band, painted at the bottom edge of a window row - which is exactly where the built
+     * floor slab stands (SLAB_OUT, 0.25 m proud on residential / art deco / suburb concrete street faces), because
+     * the facade relief and this tile share one row grid. Two things at once: the hard line is the slab's own shadow
+     * on the wall under it, which the shadow map cannot draw (a 0.16 m normal bias over a 0.25 m oversail eats it),
+     * and the wash below it is the dirt the slab sheds. Skipped on the ground row, where the shopfront band covers it.
+     */
+    const slabLine = (y: number): void => {
+      m.ctx.fillStyle = rgba(30, 27, 22, 0.3);
+      m.ctx.fillRect(0, y, W, 4);
+      const drip = m.ctx.createLinearGradient(0, y + 4, 0, y + rh * 0.3);
+      drip.addColorStop(0, rgba(48, 43, 35, 0.24));
+      drip.addColorStop(0.35, rgba(52, 47, 38, 0.08));
+      drip.addColorStop(1, rgba(56, 50, 42, 0));
+      m.ctx.fillStyle = drip;
+      m.ctx.fillRect(0, y + 4, W, rh * 0.3);
+    };
+    if (style === 'residential' || style === 'artdeco' || style === 'concrete') {
+      for (let row = 0; row < rows - 1; row++) slabLine(top + (row + 1) * rh);
+    }
     // One variant per cell of the tile, dealt from a shuffled deck, so no two cells of a tile show the same thing
     // behind the glass: a blind at its own height, curtains, a dark or a lit room, an open sash, a shutter.
     const deck: number[] = [];
@@ -710,12 +882,18 @@ export class TextureFactory {
     // Plinth grime: the foot of a wall is splash-dirty and traffic-grey. Painted before the cells so the glazing stays
     // clean, and only over the tile's ground row - bandRows only ever lands that row on the ground, so it can never
     // show up as a dirt band across an upper floor.
-    const plinth = m.ctx.createLinearGradient(0, H, 0, H - rh * 0.75);
-    plinth.addColorStop(0, rgba(56, 50, 42, 0.3));
-    plinth.addColorStop(0.45, rgba(56, 50, 42, 0.1));
+    const plinth = m.ctx.createLinearGradient(0, H, 0, H - rh);
+    plinth.addColorStop(0, rgba(52, 46, 38, 0.46));
+    plinth.addColorStop(0.12, rgba(52, 46, 38, 0.3));
+    plinth.addColorStop(0.45, rgba(54, 48, 40, 0.12));
     plinth.addColorStop(1, rgba(56, 50, 42, 0));
     m.ctx.fillStyle = plinth;
-    m.ctx.fillRect(0, H - rh * 0.75, W, rh * 0.75);
+    m.ctx.fillRect(0, H - rh, W, rh);
+    // The splash line itself: the 0.25 m where the pavement meets the wall is grey with tyre spray and mop water,
+    // and it is the darkest thing on any elevation. A wall whose foot is the same value as its third floor is the
+    // clearest sign that nothing has ever rained on it.
+    m.ctx.fillStyle = rgba(44, 40, 34, 0.22);
+    m.ctx.fillRect(0, H - 18, W, 18);
     // Panes are not all one slate: a cool north light, a warm reflected one, a neutral, and three noticeably paler
     // sheets (an older single glazing, a net curtain behind the whole pane, a room painted white). Dealt per cell.
     const PANE_TINTS = ['#5c728c', '#5a6d80', '#6b7484', '#55708e', '#66707e', '#7d8a9c', '#8b94a0', '#6f8399'];
@@ -847,17 +1025,42 @@ export class TextureFactory {
           m.ctx.fillStyle = rgba(238, 236, 228, 0.5);
           m.ctx.fillRect(((ch >>> 20) & 1) === 0 ? gx : gx + gw - nw, gy, nw, gh);
         }
-        // Sky IN the glass, not just a highlight on it: the curtain wall's trick (a cool sky wash at the head that
-        // falls to a dark street reflection at the foot) applied to the punched styles as well. Without it a
-        // residential pane is an opaque navy quad under a noon sky, which is the one thing real glazing never is.
-        const skyA = style === 'glass' ? 0.15 : 0.3;
-        const grad = m.ctx.createLinearGradient(0, gy, 0, gy + gh);
-        grad.addColorStop(0, rgba(208, 234, 250, skyA));
-        grad.addColorStop(0.42, rgba(198, 226, 246, skyA * 0.28));
-        grad.addColorStop(0.58, rgba(46, 58, 72, 0.02));
-        grad.addColorStop(1, rgba(26, 36, 48, 0.17));
-        m.ctx.fillStyle = grad;
-        m.ctx.fillRect(gx, gy, gw, gh);
+        // Sky IN the glass, as a SHAPE rather than a wash. The old pane carried a soft vertical sky-to-slate
+        // gradient, which is what a painted cloud looks like, not what glass looks like: a real pane reflects the
+        // hard edge between the sky and whatever stands opposite it, and at 12 m that edge is the only cue that
+        // says glass. So each pane gets a straight-edged reflection wedge across its head (the sky), a bright
+        // 2 px catch along the very top of it, and a short dark street reflection at its foot. The wedge's slope,
+        // its depth and which corner it leans out of come off the cell hash, so a floor of eight panes shows eight
+        // reflections and never one repeated gradient.
+        const refl = (ch >>> 24) & 255;
+        const flip = (refl & 1) === 1;
+        const hi = gh * (0.3 + 0.24 * (((refl >>> 1) & 3) / 3));
+        const lean = gw * (0.35 + 0.5 * (((refl >>> 3) & 3) / 3));
+        const skyA = style === 'glass' ? 0.3 : 0.42;
+        m.ctx.save();
+        m.ctx.beginPath();
+        m.ctx.rect(gx, gy, gw, gh);
+        m.ctx.clip();
+        m.ctx.fillStyle = rgba(206, 232, 248, skyA);
+        m.ctx.beginPath();
+        m.ctx.moveTo(flip ? gx : gx + gw, gy);
+        m.ctx.lineTo(flip ? gx + gw : gx, gy);
+        m.ctx.lineTo(flip ? gx + gw : gx, gy + hi * 0.35);
+        m.ctx.lineTo(flip ? gx + lean : gx + gw - lean, gy + hi);
+        m.ctx.lineTo(flip ? gx : gx + gw, gy + hi);
+        m.ctx.closePath();
+        m.ctx.fill();
+        // The catch along the head: a thin hard highlight where the pane meets its frame.
+        m.ctx.fillStyle = rgba(236, 248, 255, skyA * 0.85);
+        m.ctx.fillRect(gx, gy, gw, 3);
+        m.ctx.restore();
+        // Street reflection at the foot: short, dark, and hard-topped for the same reason.
+        const foot = m.ctx.createLinearGradient(0, gy + gh - gh * 0.3, 0, gy + gh);
+        foot.addColorStop(0, rgba(24, 33, 44, 0.04));
+        foot.addColorStop(0.45, rgba(24, 33, 44, 0.14));
+        foot.addColorStop(1, rgba(20, 28, 38, 0.26));
+        m.ctx.fillStyle = foot;
+        m.ctx.fillRect(gx, gy + gh - gh * 0.3, gw, gh * 0.3);
         // Glazing is glass whatever sits behind it, and far smoother than the render around it: that split (0.15 on
         // the pane against 0.92 on the wall) is what makes a window catch the sky at all. The .r channel marks the
         // pane so Materials can lift the sky probe on it and keep the plaster grain off it.
@@ -2197,17 +2400,28 @@ export class TextureFactory {
     ctx.fillStyle = '#2e2c29';
     ctx.fillRect(0, 0, S, S);
     this.mottle(ctx, S, S, rng, 26, 90 * k, 240 * k, 0.045, 0, 0, true);
-    // Coarse patch field: a tiling value-noise wash whose coarsest cell is half the tile (7 m on the road) and whose
-    // finest is under 2 m, multiplied into the bitumen. Large-scale tonal variation ONLY - fine grain and aggregate
-    // specks on tarmac read as video static from a moving car, which is why round 6 took them out; but a surface
-    // that has been dug up, patched and re-laid in different decades is the one thing a flat blue-grey plate is not.
-    this.valueWash(ctx, S, S, this.valueNoise('bitumen', 256, 2, 3, 0.2, 613), S);
     if (r) {
       r.fillStyle = grey(1);
       r.fillRect(0, 0, S, S);
       // Polished wheel paths and oily patches are a touch smoother than fresh aggregate.
       this.mottle(r, S, S, rng, 30, 40 * k, 120 * k, 0.05, 0, 0, false);
     }
+  }
+
+  /**
+   * Aggregate on an asphalt tile: two SIGNED value-noise fields added to the bitumen, both deliberately low contrast.
+   * The coarse one's largest cell is a third of the tile (4.7 m on the road) and its finest 1.2 m - the surface that
+   * has been dug up, patched and re-laid in different decades, and what stops a long street reading as one plate.
+   * The fine one runs 1.3 m down to 0.16 m, the chipping size a driver sees at 3 m: a wearing course is a bed of
+   * stones in bitumen. Deliberate tonal patches, NOT speckle - the finest octave is 12 texels across at the road's
+   * 73 px/m, so it reads as tone at arm's length and averages out by 8 m instead of crawling. The lattice counts are
+   * 3 and 11 so neither divides the tile and no weave lines up.
+   *
+   * Called AFTER the tile's de-dither blur (see road()): a 3 x 3 pass would take most of the fine octave with it.
+   */
+  private aggregate(ctx: CanvasRenderingContext2D, S: number): void {
+    this.noiseWash(ctx, S, S, this.valueNoise('bitumenA', 256, 3, 3, 0.5, 613, 0.5), S, 0.13,
+      this.valueNoise('bitumenB', 256, 11, 4, 0.5, 2207, 0.5), S, 0.11);
   }
 
   /**
@@ -2244,9 +2458,68 @@ export class TextureFactory {
   }
 
   /**
+   * Lighter polished band where a tyre tracks, drawn as a soft-edged gradient `w` metres wide centred on `cu` metres
+   * from the tile's left edge. Rubber and grit burnish the chippings flat in the wheel path, which is why a real
+   * carriageway is PALER where it is driven and dark in between - the old tile had these as darker bands, which is
+   * the one thing wheel paths never are.
+   */
+  private tyreBand(ctx: CanvasRenderingContext2D, S: number, px: number, cu: number, w: number, alpha: number): void {
+    const x0 = cu * px - (w / 2) * px, x1 = cu * px + (w / 2) * px;
+    const g = ctx.createLinearGradient(x0, 0, x1, 0);
+    g.addColorStop(0, rgba(236, 233, 222, 0));
+    g.addColorStop(0.3, rgba(236, 233, 222, alpha));
+    g.addColorStop(0.7, rgba(236, 233, 222, alpha));
+    g.addColorStop(1, rgba(236, 233, 222, 0));
+    ctx.fillStyle = g;
+    ctx.fillRect(x0, 0, x1 - x0, S);
+  }
+
+  /**
+   * Reinstatement patches and paving seams on an asphalt tile: `n` irregular quads of slightly off bitumen (a trench
+   * refilled, a pothole cut out and re-laid) with a soft edge line, plus longitudinal construction joints at the
+   * given u fractions.
+   *
+   * The patches deliberately do NOT span the tile. Round 8 drew one service trench across the full width with a hard
+   * 3 px black line along each of its edges, and at a grazing angle those two lines were the hard tone seam running
+   * the full width of the frame every 14 m - read as a mesh boundary between lane quads, which it never was. A patch
+   * that stops short of both kerbs reads as a patch; one that crosses the frame reads as a bug.
+   */
+  private asphaltPatches(ctx: CanvasRenderingContext2D, S: number, px: number, rng: Random, n: number, seams: number[]): void {
+    for (let i = 0; i < n; i++) {
+      const w = rng.range(1.6, 4.2) * px, h = rng.range(1.1, 2.6) * px;
+      const x = rng.range(0.6 * px, S - w - 0.6 * px), y = rng.range(0, S - h);
+      const dark = rng.chance(0.55);
+      // The fill: a shade off the surrounding bitumen either way, never more than a few per cent.
+      ctx.fillStyle = dark ? rgba(18, 19, 22, rng.range(0.16, 0.28)) : rgba(126, 124, 117, rng.range(0.1, 0.17));
+      ctx.beginPath();
+      // Irregular quad: a rectangle with each corner pulled in or out by up to 0.25 m, the way a saw cut wanders.
+      const j = (): number => rng.range(-0.25, 0.25) * px;
+      ctx.moveTo(x + j(), y + j());
+      ctx.lineTo(x + w + j(), y + j());
+      ctx.lineTo(x + w + j(), y + h + j());
+      ctx.lineTo(x + j(), y + h + j());
+      ctx.closePath();
+      ctx.fill();
+      // Its seam: one thin line at the contrast of the fill - visible at 3 m, a tone edge by 20.
+      ctx.strokeStyle = rgba(10, 10, 12, 0.3);
+      ctx.lineWidth = Math.max(1, 0.035 * px);
+      ctx.stroke();
+    }
+    // Longitudinal paving joints: a wearing course is laid a lane at a time and the joints run ALONG the street, so
+    // they read as construction and never as a bar across the frame.
+    for (const u of seams) {
+      ctx.fillStyle = rgba(14, 14, 16, 0.18);
+      ctx.fillRect(u * S - 0.02 * px, 0, 0.045 * px, S);
+      ctx.fillStyle = rgba(190, 188, 182, 0.05);
+      ctx.fillRect(u * S + 0.025 * px, 0, 0.03 * px, S);
+    }
+  }
+
+  /**
    * Asphalt tile (ROAD_TILE_M x ROAD_TILE_M m, 1024 px = 73 px/m): dashed white lane separators at +-3.5 m, double
-   * yellow centre line worn at their edges, faint darker wheel paths, a manhole in the inner lane and a kerb-side
-   * drain - shapes, no cracks or patches. u = across, v = along. Also builds the road roughness map (road:rgh).
+   * yellow centre line worn at their edges, two lighter tyre-polish bands per lane, a darkening gradient and a gutter
+   * line into each kerb, a handful of reinstatement patches and paving seams, a manhole in the inner lane and a
+   * kerb-side drain. u = across, v = along. Also builds the road roughness map (road:rgh).
    */
   road(): THREE.CanvasTexture {
     const key = 'road';
@@ -2259,28 +2532,40 @@ export class TextureFactory {
     this.asphalt(ctx, r, S, rng);
     const px = S / ROAD_TILE_M;
     const cx = S / 2;
-    // Cross-section of a used carriageway, as two wide gradients across u and nothing finer: the gutters hold grit
-    // and shade, the two running lanes are scuffed pale by tyres, and the crown under the centre line - which
-    // nothing drives on - stays dark. Symmetric, so the tile still meets itself at the kerb line.
+    // Cross-section of a used carriageway. u = 0 and u = 1 are the kerb lines (the tile is exactly the 14 m of
+    // asphalt), so the profile is symmetric and the tile still meets itself across the street.
     const across = (stops: [number, number][], light: boolean): void => {
       const g = ctx.createLinearGradient(0, 0, S, 0);
       for (const [t, a] of stops) g.addColorStop(t, light ? rgba(228, 226, 214, a) : rgba(0, 0, 0, a));
       ctx.fillStyle = g;
       ctx.fillRect(0, 0, S, S);
     };
-    across([[0, 0.17], [0.11, 0.05], [0.3, 0], [0.44, 0.035], [0.56, 0.035], [0.7, 0], [0.89, 0.05], [1, 0.17]], false);
-    across([[0, 0], [0.13, 0], [0.26, 0.075], [0.36, 0.05], [0.47, 0], [0.53, 0], [0.64, 0.05], [0.74, 0.075], [0.87, 0], [1, 0]], true);
-    // One transverse reinstatement across the whole width: a service trench refilled a shade off the surrounding
-    // bitumen, with a hard seam line along each of its edges. Spans u, so the tile still wraps sideways.
-    const ty = rng.range(0.12, 0.62) * S, th = rng.range(0.9, 1.7) * px;
-    ctx.fillStyle = rgba(38, 40, 44, 0.32);
-    ctx.fillRect(0, ty, S, th);
-    ctx.fillStyle = rgba(10, 10, 12, 0.5);
-    ctx.fillRect(0, ty - 1.5 * k, S, 3 * k);
-    ctx.fillRect(0, ty + th - 1.5 * k, S, 3 * k);
-    // Darker wheel paths, 1 m wide and soft: the one bit of wear a road needs to read as driven along.
-    ctx.fillStyle = rgba(0, 0, 0, 0.07);
-    for (const off of [-5.4, -1.9, 1.9, 5.4]) ctx.fillRect(cx + off * px - 0.5 * px, 0, 1.0 * px, S);
+    // Kerb shade: the last 0.6 m into each kerb (u 0..0.043) is where the road is never swept, and it is by far the
+    // strongest tonal event a street has across its width. Steep on purpose - a broad, gentle fall reads as vignette.
+    across([[0, 0.3], [0.017, 0.2], [0.043, 0.075], [0.12, 0.02], [0.3, 0], [0.46, 0.05], [0.54, 0.05], [0.7, 0],
+      [0.88, 0.02], [0.957, 0.075], [0.983, 0.2], [1, 0.3]], false);
+    // Gutter line: the channel the water runs in, 0.13 m of grit-dark bitumen 0.22 m off each kerb.
+    for (const side of [0.22, ROAD_TILE_M - 0.35]) {
+      ctx.fillStyle = rgba(16, 16, 18, 0.3);
+      ctx.fillRect(side * px, 0, 0.13 * px, S);
+      ctx.fillStyle = rgba(150, 148, 140, 0.05);
+      ctx.fillRect((side + 0.13) * px, 0, 0.06 * px, S);
+    }
+    // Two polished tyre bands per lane (lane centres at +-1.75 and +-5.25 m, track gauge 1.56 m), and nothing pale
+    // over the crown or the gutters: that alternation is what makes a carriageway read as driven along.
+    for (const cu of [0.95, 2.53, 4.47, 6.05, 7.95, 9.53, 11.47, 13.05]) this.tyreBand(ctx, S, px, cu, 0.62, 0.075);
+    // Reinstatements and the joints between paving runs; the joints sit just outside the lane lines.
+    this.asphaltPatches(ctx, S, px, rng, 4, [0.253, 0.747]);
+    across([[0, 0], [0.13, 0], [0.26, 0.03], [0.47, 0], [0.53, 0], [0.74, 0.03], [0.87, 0], [1, 0]], true);
+    // De-dither the bitumen before the crisp parts go on. Skia dithers every gradient fill against the destination
+    // pixel grid with the same ordered matrix, so the ~250 radial and linear fills that make up an asphalt tile
+    // (mottle, the cross-section, the tyre bands, the gutters) ADD their dither coherently: the result was a regular
+    // diamond lattice about 5/255 deep at one texel pitch, which is the "regular dot lattice" that was the only
+    // breakup a 6 m close-up of the road had. One wrapping 3 x 3 pass removes it; everything that has to stay sharp -
+    // the manhole, the drain, the lane paint - is drawn after this line. (The pavement and plaza tiles have always
+    // blurred at exactly this point in their own recipe, which is why neither of them shows the lattice.)
+    this.blur3(ctx, S, S);
+    this.aggregate(ctx, S);
     // Manhole in the inner lane, drain against one kerb.
     this.manhole(ctx, r, rng, cx + (rng.chance(0.5) ? 1 : -1) * rng.range(1.6, 2.4) * px, rng.range(0.2, 0.8) * S, 0.34 * px);
     const dSide = rng.chance(0.5) ? 0.35 * px : S - 0.35 * px - 0.36 * px;
@@ -2297,7 +2582,50 @@ export class TextureFactory {
       return rects;
     });
     this.finishRoughHalf(key + ':rgh', r.canvas);
-    return this.finish(key, canvas, true);
+    return this.finishGround(key, canvas);
+  }
+
+  /**
+   * Off-street parking asphalt (ROAD_TILE_M tile so the lot floors keep the road's UVs and its 73 px/m grain, but
+   * NO carriageway paint): the same bitumen, aggregate and reinstatements, one soft pale band per aisle where cars
+   * turn in, a shallow fall to a gully in the middle of the tile and a darker apron round its edge.
+   *
+   * The lots used to share the road tile outright, which printed a double yellow centre line and two dashed lane
+   * separators across every car park in the city - the loudest single artefact in any lot frame.
+   */
+  lotAsphalt(): THREE.CanvasTexture {
+    const key = 'lotAsphalt';
+    const c = this.cache.get(key) as THREE.CanvasTexture | undefined;
+    if (c) return c;
+    const S = 1024, k = S / 512;
+    const { canvas, ctx } = this.canvas(S, S);
+    const r = this.canvas(S, S).ctx;
+    const rng = new Random(97);
+    this.asphalt(ctx, r, S, rng);
+    const px = S / ROAD_TILE_M;
+    // Aisle polish: a lot is driven up and down its aisles, so the pale bands run along v at the 9 m spot pitch
+    // (CityProps) rather than on lane centres, and they are broader and fainter than a road's tyre tracks.
+    for (const cu of [3.3, 10.7]) this.tyreBand(ctx, S, px, cu, 2.6, 0.045);
+    // Fall to a gully: a broad dish across the tile with a grit-dark channel down the middle of it.
+    const dish = ctx.createLinearGradient(0, 0, S, 0);
+    dish.addColorStop(0, rgba(0, 0, 0, 0));
+    dish.addColorStop(0.5, rgba(0, 0, 0, 0.09));
+    dish.addColorStop(1, rgba(0, 0, 0, 0));
+    ctx.fillStyle = dish;
+    ctx.fillRect(0, 0, S, S);
+    ctx.fillStyle = rgba(16, 16, 18, 0.22);
+    ctx.fillRect(S / 2 - 0.09 * px, 0, 0.18 * px, S);
+    this.asphaltPatches(ctx, S, px, rng, 6, [0.18, 0.82]);
+    this.blur3(ctx, S, S);
+    this.aggregate(ctx, S);
+    // A tarmac lot is laid in strips by a paver the width of a bay run: one transverse lap joint, soft, in the middle
+    // of the tile - the one horizontal event, and at a fifth of the contrast the road's old trench line had.
+    ctx.fillStyle = rgba(14, 14, 16, 0.12);
+    ctx.fillRect(0, rng.range(0.35, 0.6) * S, S, 0.05 * px);
+    this.drain(ctx, r, S / 2 - 0.18 * px, rng.range(0.2, 0.8) * S, 0.36 * px, 0.62 * px, k);
+    this.manhole(ctx, r, rng, rng.range(1.5, 5) * px, rng.range(0.1, 0.9) * S, 0.3 * px);
+    this.finishRoughHalf(key + ':rgh', r.canvas);
+    return this.finishGround(key, canvas);
   }
 
   /** Intersection tile (1024 px): clean asphalt with crisp zebra crossings and stop bars along all four edges, worn only at their edges, and a manhole. */
@@ -2310,6 +2638,28 @@ export class TextureFactory {
     const rng = new Random(23);
     this.asphalt(ctx, null, S, rng);
     const px = S / ROAD_TILE_M;
+    // The same 0.6 m kerb shade and gutter line the carriageway carries, on all four edges of the box: the tile meets
+    // a road tile along each of them, and without it the junction stood a quarter-tone lighter than the street with a
+    // straight edge across the full width of the frame.
+    for (let i = 0; i < 4; i++) {
+      const edge = ctx.createLinearGradient(0, 0, 0, S);
+      edge.addColorStop(0, rgba(0, 0, 0, 0.3));
+      edge.addColorStop(0.017, rgba(0, 0, 0, 0.2));
+      edge.addColorStop(0.043, rgba(0, 0, 0, 0.075));
+      edge.addColorStop(0.12, rgba(0, 0, 0, 0.02));
+      edge.addColorStop(0.35, rgba(0, 0, 0, 0));
+      edge.addColorStop(1, rgba(0, 0, 0, 0));
+      ctx.save();
+      ctx.translate(S / 2, S / 2);
+      ctx.rotate((i * Math.PI) / 2);
+      ctx.translate(-S / 2, -S / 2);
+      ctx.fillStyle = edge;
+      ctx.fillRect(0, 0, S, S);
+      ctx.restore();
+    }
+    this.asphaltPatches(ctx, S, px, rng, 3, []);
+    this.blur3(ctx, S, S);
+    this.aggregate(ctx, S);
     this.manhole(ctx, null, rng, S / 2 + rng.range(-1.5, 1.5) * px, S / 2 + rng.range(-1.5, 1.5) * px, 0.34 * px);
     const band = 2.4 * px, m = 0.6 * px, stripe = 0.6 * px, gap = 0.5 * px;
     this.paintLayer(ctx, null, S, rng, (p) => {
@@ -2328,7 +2678,7 @@ export class TextureFactory {
       for (const b of bars) { p.fillRect(b[0], b[1], b[2], b[3]); rects.push(b); }
       return rects;
     });
-    return this.finish(key, canvas, true);
+    return this.finishGround(key, canvas);
   }
 
   /**
@@ -2377,7 +2727,53 @@ export class TextureFactory {
     ctx.fillRect(half + 3, half + 3, half - 6, half - 6);
     this.bleedAlpha(ctx, S, S, 12);
     const t = this.finish(key, canvas, true, false);
+    // Per-CELL mip chain. The atlas is a 2 x 2 grid and a decal quad maps exactly one cell, so every level the GPU
+    // builds by a plain box filter over the whole image folds the neighbouring cells into this one's edges: by mip 3
+    // an arrow's stem carries a slice of the bar cell's alpha, and at a grazing angle - where the LOD along the decal
+    // runs three or four levels ahead of the LOD across it - that partial alpha crossed the 0.35 alpha test in and
+    // out along the edge, which is the row of serrated dark notches 6-10 m in front of the camera. Reducing each cell
+    // inside its own bounds, and re-steepening the alpha about the test so the silhouette stays a step rather than a
+    // wide ramp, leaves the arrows clean at every angle.
+    t.mipmaps = this.cellMipChain(canvas, 2, 2);
+    t.generateMipmaps = false;
+    t.anisotropy = GROUND_ANISO;
+    t.needsUpdate = true;
     return t;
+  }
+
+  /**
+   * Mip chain of a `cols` x `rows` alpha atlas in which each cell is reduced independently (no bleed across the cell
+   * borders) and the alpha is re-steepened about 0.5 at every level, so an alpha-tested decal keeps a hard silhouette
+   * instead of a ramp that dithers along the edge.
+   */
+  private cellMipChain(src: HTMLCanvasElement, cols: number, rows: number): HTMLCanvasElement[] {
+    const chain: HTMLCanvasElement[] = [src];
+    let prev = src;
+    let pw = src.width, ph = src.height;
+    while (pw > 1 || ph > 1) {
+      const w = Math.max(1, pw >> 1), h = Math.max(1, ph >> 1);
+      // Below a 1 px cell there is nothing left to isolate, so the last levels simply halve the whole image.
+      const cs = w >= cols && h >= rows ? cols : 1, rs = w >= cols && h >= rows ? rows : 1;
+      const cwP = pw / cs, chP = ph / rs, cwN = w / cs, chN = h / rs;
+      const next = this.canvas(w, h);
+      // Each cell is drawn from its own source rectangle, so the sampler never reaches outside it.
+      for (let cy = 0; cy < rs; cy++) {
+        for (let cx = 0; cx < cs; cx++) {
+          next.ctx.drawImage(prev, cx * cwP, cy * chP, cwP, chP, cx * cwN, cy * chN, cwN, chN);
+        }
+      }
+      const img = next.ctx.getImageData(0, 0, w, h);
+      const d = img.data;
+      for (let i = 3; i < d.length; i += 4) {
+        const a = d[i] / 255;
+        d[i] = Math.max(0, Math.min(255, Math.round(255 * (0.5 + (a - 0.5) * 1.7))));
+      }
+      next.ctx.putImageData(img, 0, 0);
+      chain.push(next.canvas);
+      prev = next.canvas;
+      pw = w; ph = h;
+    }
+    return chain;
   }
 
   /**
@@ -2510,7 +2906,7 @@ export class TextureFactory {
     r.fillStyle = grey(0.9);
     r.fillRect(0, S - kb, S, kb);
     this.finishRoughHalf(key + ':rgh', r.canvas);
-    return this.finish(key, canvas, true);
+    return this.finishGround(key, canvas);
   }
 
   sand(): THREE.CanvasTexture {
@@ -2796,7 +3192,7 @@ export class TextureFactory {
       ctx.fillStyle = g;
       ctx.fillRect(x - r, y - r, r * 2, r * 2);
     }
-    return this.finish(key, canvas, true);
+    return this.finishGround(key, canvas);
   }
 
   /**
@@ -3043,27 +3439,80 @@ export class TextureFactory {
     return this.groundRough('road', 0.62, 1);
   }
 
-  /** Tangent-space relief derived from a ground albedo: slab joints, the kerb chamfer, cracks, lane-paint edges. */
-  groundNormal(name: 'sidewalk' | 'plaza' | 'road', strength: number): THREE.CanvasTexture {
+  /** Roughness for the parking asphalt, painted by lotAsphalt() the same way road() paints its own. */
+  lotRough(): THREE.CanvasTexture {
+    return this.groundRough('lotAsphalt', 0.62, 1);
+  }
+
+  /**
+   * Tangent-space relief derived from a ground albedo: slab joints, the kerb chamfer, cracks, lane-paint edges.
+   * `half` derives it from a half-resolution copy (1 MB against 4 for a 1024 tile) - right for a surface whose relief
+   * is all low frequency, wrong for one whose story is 3 px joints and paint edges.
+   */
+  groundNormal(name: GroundMap, strength: number, half = false): THREE.CanvasTexture {
     const key = name + ':nrm';
     const hit = this.cache.get(key) as THREE.CanvasTexture | undefined;
     if (hit) return hit;
-    const src = this[name]().image as HTMLCanvasElement | undefined;
+    let src = this[name]().image as HTMLCanvasElement | undefined;
     if (!src || !src.width) return this.finish(key, this.canvas(4, 4).canvas, false);
-    return this.normalFromLuminance(key, src, strength);
+    if (half) {
+      const small = this.canvas(src.width / 2, src.height / 2);
+      small.ctx.drawImage(src, 0, 0, src.width / 2, src.height / 2);
+      src = small.canvas;
+    }
+    const t = this.normalFromLuminance(key, src, strength);
+    t.anisotropy = GROUND_ANISO;
+    return t;
   }
 
   /**
    * Ground roughness map. road() and sidewalk() paint theirs directly while drawing (so paint and iron come out
    * smoother than aggregate, not the other way round); the plaza's is still derived from luminance, remapped into lo..hi.
    */
-  groundRough(name: 'sidewalk' | 'plaza' | 'road', lo: number, hi: number): THREE.CanvasTexture {
+  groundRough(name: GroundMap, lo: number, hi: number): THREE.CanvasTexture {
     const key = name + ':rgh';
     const src = this[name]().image as HTMLCanvasElement | undefined;
     const hit = this.cache.get(key) as THREE.CanvasTexture | undefined;
-    if (hit) return hit;
+    if (hit) { hit.anisotropy = GROUND_ANISO; return hit; }
     if (!src || !src.width) return this.finish(key, this.canvas(4, 4).canvas, false);
-    return this.roughFromLuminance(key, src, lo, hi);
+    const t = this.roughFromLuminance(key, src, lo, hi);
+    t.anisotropy = GROUND_ANISO;
+    return t;
+  }
+
+  /**
+   * Macro tone field for the paved ground (Materials.macroVariation), replacing the cloud texture the ground used to
+   * borrow. Tiling value noise QUANTISED into six flat steps: the surfaces it multiplies are 40-50 % of every frame
+   * and what they need is the Art-of-Rally read - big deliberate patches of tone with a definite edge between them,
+   * one laid at a time - not a soft cloud wash, which at 45 m per repeat is exactly the "one flat value with a
+   * vignette" the road had. 256 px, no colour, one channel used: 0.35 MB with its mips.
+   */
+  groundPatch(): THREE.CanvasTexture {
+    const key = 'groundPatch';
+    const c = this.cache.get(key) as THREE.CanvasTexture | undefined;
+    if (c) return c;
+    const S = 256;
+    const { canvas, ctx } = this.canvas(S, S);
+    // Centred field (contrast 0.5 about 0.5), because `Materials.macroVariation` applies it SIGNED: at the default
+    // centre of 1 the mapping is 510*t, so 43 % of the field clipped flat at white, the mean sat at 0.87 instead of
+    // 0.5 (every paved surface lifted ~12 %) and half the intended plates - the dark half - never existed.
+    ctx.drawImage(this.valueNoise('macroPatch', S, 3, 3, 0.5, 5501, 0.5), 0, 0);
+    const img = ctx.getImageData(0, 0, S, S);
+    const d = img.data;
+    const STEPS = 6;
+    for (let i = 0; i < d.length; i += 4) {
+      // Quantise, then keep an eighth of the original slope so a patch boundary is a soft 2-3 texel step (~0.5 m on
+      // the road) rather than a staircase the mip chain would alias.
+      const t = d[i] / 255;
+      const q = Math.round(t * (STEPS - 1)) / (STEPS - 1);
+      const v = Math.round(255 * (q * 0.875 + t * 0.125));
+      d[i] = v; d[i + 1] = v; d[i + 2] = v;
+    }
+    ctx.putImageData(img, 0, 0);
+    this.blur3(ctx, S, S);
+    const t = this.finish(key, canvas, false);
+    t.anisotropy = GROUND_ANISO;
+    return t;
   }
 
   /** Soft radial white glow (sprites, light pools, particles, neon bloom). */
@@ -3153,6 +3602,8 @@ export class TextureFactory {
   dispose(): void {
     this.cache.forEach((t) => t.dispose());
     this.cache.clear();
+    this.scratch.clear();
+    this.washPool.clear();
     this.atlasRects = null;
   }
 }

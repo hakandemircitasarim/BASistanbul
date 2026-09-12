@@ -29,10 +29,28 @@ import type { Ring } from './PlayerRenderer';
 
 export const VEHICLE_RENDER = {
   cullDist: 260, clearance: 0.30, wheelRadius: 0.36, wheelWidth: 0.24, lightsPerVehicle: 6, wheelsPerVehicle: 4,
-  /** Past this the lathed wheels (~320 triangles each) are a few pixels inside a dark arch; they are simply not written. */
-  wheelDist: 110,
-  /** Beyond this distance a vehicle is drawn as its parked-shell LOD (baked wheel discs, no shadow-map pass). */
-  bodyLodDist: 75,
+  /**
+   * Body fidelity ladder, by camera distance. The full loft is ~2.7-3.4k triangles and casts a shadow, and the lathed
+   * wheels are 560 each: twenty-one of those inside the old 75 m band was 167k triangles, a quarter of the whole frame,
+   * for cars that are 30 px wide. So:
+   * - `bodyFullDist` (30 m): the full merged body, lathed wheels that spin and steer, sun shadow.
+   * - `bodyMidDist` (70 m): `parkedMidGeometry` — the same silhouette with arch fenders, greenhouse pillars, lamp
+   *   cells and baked shouldered tyres, ~950 triangles and no separate wheels, but it DOES cast: at a low sun a car
+   *   at 30 m throws a 6-10 m shadow across the carriageway, so cutting the shadow at `bodyFullDist` switched that
+   *   whole shape on and off every time a car crossed the band. Measured +11.5 k shadow-pass triangles and +4 draws
+   *   for a dozen mid cars — an eighth of what the same cars cost the shadow pass at the old 75 m full-loft band.
+   * - beyond: the coarse parked shell, ~460 triangles, no shadow (the contact blob grounds it; a 70 m car's own
+   *   shadow-map footprint is a blur a few texels across).
+   * The baked wheels of the mid shell are rotationally symmetric discs, so nothing gives away that they do not spin.
+   */
+  bodyFullDist: 30,
+  bodyMidDist: 70,
+  /**
+   * Past this no lathed wheels are written: beyond `bodyFullDist` the shell carries baked wheels of its own, and a
+   * 560-triangle lathe (x4, and never mind that only its silhouette survives at 30 m) on top of them is pure waste.
+   * Kept separate from `bodyFullDist` so the wheels can be pulled in first if the budget ever needs it again.
+   */
+  wheelDist: 30,
   /**
    * Player headlights: physically-decaying spots (decay 2). 45 cd puts a readable pool on the road 5-10 m ahead and
    * falls to a few percent on a facade 25 m away; the old 90 cd / decay 1.2 pair whited out every shopfront it faced.
@@ -79,6 +97,19 @@ const BUMPER_STRIP = 0x111315;
 const LENS_MIX = -1;
 /** paintMix value that marks a matte part: no paint, rough, no metal, no clearcoat (wheel wells, soot, baked wheel discs). */
 const MATTE_MIX = -2;
+/**
+ * paintMix value that marks GLASS: no paint tint, no Fresnel rim, and in the shader a near-mirror roughness with the
+ * metalness dropped to 0, so the clearcoat lobe puts the sky probe's horizon band on the screens and side windows.
+ * Without it the glass cells were just a dark navy region of a 0.35-rough painted body — the "opaque navy block" every
+ * critic has read on a parked car's greenhouse.
+ */
+const GLASS_MIX = -3;
+/**
+ * Baked sky reflection of the glass: a cool pale blue-grey at the belt line falling to GLASS_DEEP under the roof, in
+ * two stops with a soft knee rather than a linear wash. Glass in a stylised car reads from exactly this: a bright band
+ * low down where it mirrors the sky and street, dark up top where it mirrors the roof lining.
+ */
+const GLASS_SKY = 0x4a6280;
 
 /** A box deformed into a frustum: independent z / half-width / y for the (bottom, top) x (back, front) corners. */
 interface PrismDef {
@@ -337,7 +368,7 @@ const SEAL_W = 0.03;
 interface Tone { col: number; paint: number }
 const T = {
   paint: { col: PAINT, paint: 1 }, dark: { col: PAINT_DARK, paint: 1 }, shade: { col: PAINT_SHADE, paint: 1 },
-  glass: { col: GLASS, paint: 0.15 }, seal: { col: SEAL, paint: 0 }, bezel: { col: BEZEL, paint: 0 }, black: { col: BLACK, paint: 0 }, grey: { col: DARK, paint: 0 },
+  glass: { col: GLASS, paint: GLASS_MIX }, seal: { col: SEAL, paint: 0 }, bezel: { col: BEZEL, paint: 0 }, black: { col: BLACK, paint: 0 }, grey: { col: DARK, paint: 0 },
   tail: { col: TAIL, paint: 0 }, tailLens: { col: TAIL_LENS, paint: LENS_MIX }, lamp: { col: LAMP, paint: 0 }, lampLens: { col: LAMP_LENS, paint: LENS_MIX },
 } as const satisfies Record<string, Tone>;
 
@@ -520,11 +551,16 @@ function toneFor(seg: SegTone, band: Band | null): Tone {
   }
 }
 
-/** Glass darkens over its top 35 % (a tint band under the roof), like a sun strip: 1 at the belt, 0.45 at the roof. */
-function glassShade(y: number, yBelt: number, roofY: number): number {
+const glassA = new THREE.Color(GLASS_SKY), glassB = new THREE.Color(GLASS_DEEP), glassOut = new THREE.Color();
+/**
+ * Glass colour at height `y`: the baked sky band. GLASS_SKY from the belt line up through the first 12 % of the
+ * glass, then a smooth knee to GLASS_DEEP under the roof, so the bright band owns the lower part of every window —
+ * which is what a car's glass does: it mirrors the road and the sky ahead, and the dark part is the headlining.
+ */
+function glassTone(y: number, yBelt: number, roofY: number, out: THREE.Color): THREE.Color {
   const t = clamp((y - yBelt) / Math.max(0.05, roofY - yBelt), 0, 1);
-  const f = clamp((t - 0.62) / 0.38, 0, 1);
-  return 1 - 0.55 * f * f * (3 - 2 * f);
+  const f = clamp((t - 0.12) / 0.72, 0, 1);
+  return out.copy(glassA).lerp(glassB, f * f * (3 - 2 * f));
 }
 
 /**
@@ -559,9 +595,9 @@ function loft(stations: Station[], lay: RingLayout): THREE.BufferGeometry {
     const band = cellBand(lay, j);
     let tone: Tone = toneFor(seg, band);
     if (band === 'flank' && seg.lens && (seg.lens.at === 1) === far) tone = seg.lens.tone;
-    authorColor.setHex(tone.col);
-    const shadeK = tone === T.glass ? glassShade(ringPt.y, stations[gi].yBelt, roofY) : 1;
-    colors[k * 3] = authorColor.r * shadeK; colors[k * 3 + 1] = authorColor.g * shadeK; colors[k * 3 + 2] = authorColor.b * shadeK;
+    if (tone === T.glass) glassTone(ringPt.y, stations[gi].yBelt, roofY, glassOut);
+    else glassOut.copy(authorColor.setHex(tone.col));
+    colors[k * 3] = glassOut.r; colors[k * 3 + 1] = glassOut.g; colors[k * 3 + 2] = glassOut.b;
     paints[k] = tone.paint;
   }
   g.setAttribute('color', new THREE.BufferAttribute(colors, 3));
@@ -1085,6 +1121,13 @@ export function bodyGeometry(s: VehicleSpec): THREE.BufferGeometry {
 const LOD_RIM = 0x848a92;
 /** Tyre black of the near parked shell's baked wheels (the lathed wheel's TYRE, matte like the rest of the shell). */
 const TYRE_BLACK = 0x1a1b1e;
+/**
+ * Tyre tone of the BAKED wheels of the two coarse shells. Deliberately lighter than TYRE_BLACK: those shells have no
+ * arch cut, so the only thing a wheel can be is the shape that pokes out below the rocker — and at 0x1a it sat inside
+ * the car's own contact shadow at exactly the same value, which is why a kerb-parked car at 25-35 m read as a body
+ * sliding on its belly. A dark graphite still reads as rubber and clears the shadow under the sill.
+ */
+const TYRE_LOD = 0x32353a;
 
 /**
  * Cheap shell for the static parked cars of the lots: the same loft at the coarse ring through the `lod` stations only
@@ -1127,10 +1170,12 @@ function bakedWheels(out: THREE.BufferGeometry[], s: VehicleSpec, profile: Vehic
   const hw = s.width * 0.5 - w * 0.5 + WHEEL_INSET, hb = s.wheelbase * 0.5;
   for (let k = 0; k < 4; k++) {
     const x = (k % 2 === 0 ? -1 : 1) * hw, z = k < 2 ? hb : -hb;
-    if (kind === 'mid') {
-      // Mid tyre: three bands, shouldered at both sidewalls (the tread pulls in to a bead), so the silhouette is a
-      // tyre and the sidewall catches its own tone instead of the single flat cylinder wall of the coarse disc. A flat
-      // alloy face plugs each bead: at 20-32 m a bright dish inside a dark tyre is the whole read of a wheel.
+    if (kind === 'mid' || kind === 'flat') {
+      // Mid / coarse tyre: three bands, shouldered at both sidewalls (the tread pulls in to a bead), so the silhouette
+      // is a tyre and the sidewall catches its own tone instead of the single flat cylinder wall the coarse shell used
+      // to get. A flat alloy face plugs each bead: at 20 m and beyond a dish inside a dark tyre is the whole read of a
+      // wheel. The coarse shell shares the profile (32 more triangles a wheel than its old plain cylinder) because its
+      // wheels are the ONLY wheel shape it has - no arch cut, nothing else to suggest one.
       const tyre = tube([
         { y: -w * 0.5, rx: r * 0.62, rz: r * 0.62 }, { y: -w * 0.3, rx: r, rz: r },
         { y: w * 0.3, rx: r, rz: r }, { y: w * 0.5, rx: r * 0.62, rz: r * 0.62 },
@@ -1138,22 +1183,16 @@ function bakedWheels(out: THREE.BufferGeometry[], s: VehicleSpec, profile: Vehic
       tyre.rotateZ(Math.PI / 2);
       tyre.translate(x, r, z);
       // Sidewall a touch lighter than the tread: a tyre seen side-on is not one black mass.
-      out.push(shade(decorate(tyre, TYRE_BLACK, MATTE_MIX), (px) => (Math.abs(px - x) > w * 0.28 ? 1.45 : 1)));
+      out.push(shade(decorate(tyre, kind === 'mid' ? TYRE_BLACK : TYRE_LOD, MATTE_MIX), (px) => (Math.abs(px - x) > w * 0.28 ? 1.45 : 1)));
       for (let e = -1; e <= 1; e += 2) {
         // Set well inside the bead and kept dark: an alloy is a recessed dish in shadow, not a hubcap. At 0.63 r and
         // near its own albedo the disc read as a white plate filling the tyre, which is worse than no rim at all.
         const face = new THREE.CircleGeometry(r * 0.55, seg);
         face.rotateY(e > 0 ? Math.PI / 2 : -Math.PI / 2);
         face.translate(x + e * (w * 0.5 - 0.01), r, z);
-        out.push(shade(decorate(face, LOD_RIM, MATTE_MIX), (_px, py, pz) => (Math.hypot(py - r, pz - z) < r * 0.22 ? 0.78 : 0.42)));
+        const lit = kind === 'mid' ? 0.78 : 0.95, dish = kind === 'mid' ? 0.42 : 0.6;
+        out.push(shade(decorate(face, LOD_RIM, MATTE_MIX), (_px, py, pz) => (Math.hypot(py - r, pz - z) < r * 0.22 ? lit : dish)));
       }
-      continue;
-    }
-    if (kind === 'flat') {
-      const disc = new THREE.CylinderGeometry(r, r, w, seg, 1, false);
-      disc.rotateZ(Math.PI / 2); // axle y -> x
-      disc.translate(x, r, z);
-      out.push(shade(decorate(disc, LOD_RIM, MATTE_MIX), (px, py, pz) => (Math.abs(Math.abs(px - x) - w * 0.5) < 1e-4 && Math.hypot(py - r, pz - z) < r * 0.5 ? 1 : 0.2)));
       continue;
     }
     // Tyre: rings along the axle (authored about y, rotated onto x with the rest). The tread pulls in hard at both
@@ -1335,6 +1374,7 @@ export function makeVehiclePaintMaterial(lensGlow = false): THREE.MeshPhysicalMa
         'varying float vPaint;',
         'varying float vLens;',
         'varying float vMatte;',
+        'varying float vGlass;',
       ].join('\n'))
       // three >= r155 declares vColor as vec4 (see color_pars_vertex), so write through .rgb. The paint comes from the
       // instance colour (vehicle InstancedMeshes) or the batch colour (the parked-shell BatchedMesh of the props).
@@ -1345,7 +1385,8 @@ export function makeVehiclePaintMaterial(lensGlow = false): THREE.MeshPhysicalMa
         '#endif',
         'vPaint = clamp( paintMix, 0.0, 1.0 );',
         lensGlow ? 'vLens = step( paintMix, -0.5 ) * step( -1.5, paintMix ) * instanceGlow;' : 'vLens = 0.0;',
-        'vMatte = step( paintMix, -1.5 );',
+        'vGlass = step( paintMix, -2.5 );',
+        'vMatte = step( paintMix, -1.5 ) * ( 1.0 - vGlass );',
         '#ifdef USE_INSTANCING_COLOR',
         '  vColor.rgb *= mix( vec3( 1.0 ), instanceColor.rgb, vPaint );',
         '#endif',
@@ -1354,11 +1395,16 @@ export function makeVehiclePaintMaterial(lensGlow = false): THREE.MeshPhysicalMa
         '#endif',
       ].join('\n'));
     shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', '#include <common>\nuniform float uLensGlow;\nuniform float uRim;\nvarying float vPaint;\nvarying float vLens;\nvarying float vMatte;')
+      .replace('#include <common>', '#include <common>\nuniform float uLensGlow;\nuniform float uRim;\nvarying float vPaint;\nvarying float vLens;\nvarying float vMatte;\nvarying float vGlass;')
       // Matte parts (MATTE_MIX): rough, non-metal, no clearcoat, so a wheel well or a baked wheel disc never flashes the sky.
-      .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = mix( roughnessFactor, 0.92, vMatte );')
-      .replace('#include <metalnessmap_fragment>', '#include <metalnessmap_fragment>\nmetalnessFactor = mix( metalnessFactor, 0.08, vMatte );')
-      .replace('#include <lights_physical_fragment>', THREE.ShaderChunk.lights_physical_fragment.replace('material.clearcoat = clearcoat;', 'material.clearcoat = clearcoat * ( 1.0 - vMatte );'))
+      .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = mix( mix( roughnessFactor, 0.92, vMatte ), 0.11, vGlass );')
+      // Glass: a dielectric mirror (metalness 0), so the clearcoat lobe and the probe carry it rather than the paint's
+      // metal tint, which turned the sky reflection the body colour.
+      .replace('#include <metalnessmap_fragment>', '#include <metalnessmap_fragment>\nmetalnessFactor = mix( mix( metalnessFactor, 0.08, vMatte ), 0.0, vGlass );')
+      // Glass is its own surface: the paint's hard clearcoat lobe on top of it doubled the sky reflection and washed a
+      // dark tinted window out to the same value as a pale body. Half the clearcoat, and the glazing keeps a sharp
+      // highlight while its own dark albedo and the baked sky band carry the rest.
+      .replace('#include <lights_physical_fragment>', THREE.ShaderChunk.lights_physical_fragment.replace('material.clearcoat = clearcoat;', 'material.clearcoat = clearcoat * ( 1.0 - vMatte ) * ( 1.0 - 0.55 * vGlass );'))
       // Lit lens cells: emissive in their own (lens) colour.
       .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += vColor.rgb * vLens * uLensGlow;')
       // Fresnel rim on the paint only: view-angle brightening toward the silhouette, tinted a little toward white.
@@ -1371,7 +1417,7 @@ export function makeVehiclePaintMaterial(lensGlow = false): THREE.MeshPhysicalMa
         '#include <opaque_fragment>',
       ].join('\n'));
   };
-  m.customProgramCacheKey = () => (lensGlow ? 'vehiclePaintMixGlow2' : 'vehiclePaintMix2');
+  m.customProgramCacheKey = () => (lensGlow ? 'vehiclePaintMixGlow3' : 'vehiclePaintMix3');
   return m;
 }
 
@@ -1380,7 +1426,10 @@ export function makeVehiclePaintMaterial(lensGlow = false): THREE.MeshPhysicalMa
 export class VehicleRenderer {
   private readonly scene: THREE.Scene;
   private readonly bodies: Record<VehicleKey, THREE.InstancedMesh>;
-  /** Far LOD per spec: the parked shell (~450 tris, wheels baked in) instead of the ~2k-tri body; no shadow casting. */
+  /** Mid LOD per spec: the mid parked shell (~950 tris, arch fenders and baked tyres); no shadow casting. */
+  private readonly midBodies: Record<VehicleKey, THREE.InstancedMesh>;
+  private readonly midCounts: Record<VehicleKey, number> = { sedan: 0, sport: 0, van: 0, police: 0, taxi: 0 };
+  /** Far LOD per spec: the coarse parked shell (~460 tris, wheels baked in); no shadow casting. */
   private readonly lodBodies: Record<VehicleKey, THREE.InstancedMesh>;
   private readonly lodCounts: Record<VehicleKey, number> = { sedan: 0, sport: 0, van: 0, police: 0, taxi: 0 };
   private readonly profiles: Record<VehicleKey, VehicleProfile>;
@@ -1410,6 +1459,7 @@ export class VehicleRenderer {
     const cap = BUDGET.MAX_VEHICLES;
     this.bodyMat = makeVehiclePaintMaterial(true);
     this.bodies = {} as Record<VehicleKey, THREE.InstancedMesh>;
+    this.midBodies = {} as Record<VehicleKey, THREE.InstancedMesh>;
     this.lodBodies = {} as Record<VehicleKey, THREE.InstancedMesh>;
     this.profiles = {} as Record<VehicleKey, VehicleProfile>;
     for (let i = 0; i < KEYS.length; i++) {
@@ -1429,17 +1479,21 @@ export class VehicleRenderer {
     }
     for (let i = 0; i < KEYS.length; i++) {
       const key = KEYS[i];
-      const lod = new THREE.InstancedMesh(this.withGlow(parkedShellGeometry(SPECS[key]), cap), this.bodyMat, cap);
-      lod.name = `veh:lod:${key}`;
-      lod.count = 0;
-      lod.frustumCulled = false;
-      lod.castShadow = false;
-      lod.receiveShadow = true;
-      lod.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-      this.color.setRGB(1, 1, 1);
-      for (let k = 0; k < cap; k++) lod.setColorAt(k, this.color);
-      this.lodBodies[key] = lod;
-      scene.add(lod);
+      for (let tier = 0; tier < 2; tier++) {
+        const geo = tier === 0 ? parkedMidGeometry(SPECS[key]) : parkedShellGeometry(SPECS[key]);
+        const lod = new THREE.InstancedMesh(this.withGlow(geo, cap), this.bodyMat, cap);
+        lod.name = tier === 0 ? `veh:mid:${key}` : `veh:lod:${key}`;
+        lod.count = 0;
+        lod.frustumCulled = false;
+        // Mid tier casts (see bodyMidDist); the far shell does not.
+        lod.castShadow = tier === 0;
+        lod.receiveShadow = true;
+        lod.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        this.color.setRGB(1, 1, 1);
+        for (let k = 0; k < cap; k++) lod.setColorAt(k, this.color);
+        if (tier === 0) this.midBodies[key] = lod; else this.lodBodies[key] = lod;
+        scene.add(lod);
+      }
     }
     this.wheels = new THREE.InstancedMesh(wheelGeometry(), this.wheelMat, cap * VEHICLE_RENDER.wheelsPerVehicle);
     this.wheels.name = 'veh:wheels';
@@ -1459,7 +1513,10 @@ export class VehicleRenderer {
     this.color.setRGB(0.2, 0.2, 0.2);
     for (let k = 0; k < cap * VEHICLE_RENDER.lightsPerVehicle; k++) this.lights.setColorAt(k, this.color);
     scene.add(this.lights);
-    this.shadows = new ContactShadows(scene, cap);
+    // 96 blob slots, not MAX_VEHICLES (128): the shared field is 232 slots and the crowd takes 96 of them, so the
+    // static parked cars of the lots (which had no contact shadow at all and floated on the pavement) can have 24.
+    // A frame has never held more than ~60 vehicles inside cullDist; the spawner's own budget totals 88.
+    this.shadows = new ContactShadows(scene, 96);
     this.spotL = this.makeSpot();
     this.spotR = this.makeSpot();
   }
@@ -1494,9 +1551,12 @@ export class VehicleRenderer {
     const list = world.vehicleList;
     const counts = this.counts;
     counts.sedan = 0; counts.sport = 0; counts.van = 0; counts.police = 0; counts.taxi = 0;
+    const midCounts = this.midCounts;
+    midCounts.sedan = 0; midCounts.sport = 0; midCounts.van = 0; midCounts.police = 0; midCounts.taxi = 0;
     const lodCounts = this.lodCounts;
     lodCounts.sedan = 0; lodCounts.sport = 0; lodCounts.van = 0; lodCounts.police = 0; lodCounts.taxi = 0;
-    const lodDist2 = R.bodyLodDist * R.bodyLodDist;
+    const fullDist2 = R.bodyFullDist * R.bodyFullDist;
+    const midDist2 = R.bodyMidDist * R.bodyMidDist;
     let wheelIdx = 0;
     let lightIdx = 0;
     const sirenPhase = Math.floor(time * R.sirenHz * 2) % 2;
@@ -1511,10 +1571,12 @@ export class VehicleRenderer {
       const dx = t.x - camX, dz = t.z - camZ;
       const d2 = dx * dx + dz * dz;
       const visible = d2 < R.cullDist * R.cullDist;
-      // Near cars get the full loft + lathed wheels and cast shadows; far ones the parked shell with baked wheel discs.
-      const near = d2 < lodDist2;
-      const mesh = near ? this.bodies[key] : this.lodBodies[key];
-      const idx = near ? counts[key]++ : lodCounts[key]++;
+      // Near cars get the full loft + lathed wheels and cast shadows; the middle band the mid shell, far ones the
+      // coarse parked shell — both with baked wheels and no shadow pass.
+      const near = d2 < fullDist2;
+      const mid = !near && d2 < midDist2;
+      const mesh = near ? this.bodies[key] : mid ? this.midBodies[key] : this.lodBodies[key];
+      const idx = near ? counts[key]++ : mid ? midCounts[key]++ : lodCounts[key]++;
       v.renderIndex = idx;
       const sc = visible ? Math.max(0.001, v.spawnFade) : 0;
       const yaw = t.yaw;
@@ -1547,6 +1609,10 @@ export class VehicleRenderer {
       mesh.count = counts[KEYS[i]];
       mesh.instanceMatrix.needsUpdate = true;
       if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+      const mid = this.midBodies[KEYS[i]];
+      mid.count = midCounts[KEYS[i]];
+      mid.instanceMatrix.needsUpdate = true;
+      if (mid.instanceColor) mid.instanceColor.needsUpdate = true;
       const lod = this.lodBodies[KEYS[i]];
       lod.count = lodCounts[KEYS[i]];
       lod.instanceMatrix.needsUpdate = true;
@@ -1680,10 +1746,11 @@ export class VehicleRenderer {
       mesh.dispose();
     }
     for (let i = 0; i < KEYS.length; i++) {
-      const lod = this.lodBodies[KEYS[i]];
-      this.scene.remove(lod);
-      lod.geometry.dispose();
-      lod.dispose();
+      for (const lod of [this.midBodies[KEYS[i]], this.lodBodies[KEYS[i]]]) {
+        this.scene.remove(lod);
+        lod.geometry.dispose();
+        lod.dispose();
+      }
     }
     this.scene.remove(this.wheels);
     this.wheels.geometry.dispose();

@@ -27,6 +27,7 @@ import { SPECS } from '../entities/VehicleSpecs';
 import { Random } from '../core/Random';
 import type { Materials } from './Materials';
 import { LEAF_TILE_M } from './PropTextures';
+import { ContactShadows } from './ContactShadows';
 import { surface, tube, type Ring } from './PlayerRenderer';
 import { makeVehiclePaintMaterial, parkedMidGeometry, parkedNearGeometry, parkedShellGeometry } from './VehicleRenderer';
 
@@ -42,6 +43,9 @@ const FURN = {
   // Every green here is the old hue at 75 % of its saturation: the lime crowns read as poster paint next to the
   // desaturated stone and asphalt of the rest of the city, and a stylised city wants its foliage a shade dustier.
   bark: 0x5c4634, barkDark: 0x3d2e22, crown: 0x4b6d3e, crownLit: 0x7a9459, crownDark: 0x2c4128,
+  // Sun-struck stop of the two-stop bark ramp: a trunk lit only by a vertical gradient reads as a plastic tube, so the
+  // ramp runs barkDark (root) -> bark (shaft) -> barkLit (under the crown, where the sky reaches it).
+  barkLit: 0x6d5335,
   // Hedges: a deeper, less lime green than the planter shrubs, lit along the clipped top and shaded at the foot.
   hedge: 0x3f633a, hedgeLit: 0x62874e, hedgeDark: 0x263e23,
   // Conifer: darker and bluer than the broad crowns, so a cypress reads as the shadow note in a row of them.
@@ -119,6 +123,19 @@ function leafMixAttr(g: THREE.BufferGeometry, mix: number): THREE.BufferGeometry
   g.setAttribute('leafMix', new THREE.BufferAttribute(a, 1));
   return g;
 }
+
+/**
+ * How much of the leaf albedo each kind of foliage takes.
+ *
+ * The crowns are down to a whisper. At full strength the map's ellipses are 20-30 cm blobs on a 1.3 m lobe, and three
+ * critics in a row read the result as mottled camouflage rather than leaves ("broccoli"): fine noise fights the
+ * deliberate faceting a stylised low-poly crown is made of. The crowns now get their structure from `shadeCrown`
+ * (flat tone bands per facet) instead, and keep just enough of the map (0.08) for its `leafMix > 0` side effects —
+ * the daylight translucency emissive and the night leaf glow, which are gated by the same attribute.
+ * Hedges keep a real but halved share: a clipped box has no facet structure of its own to read, and at the 1 m a
+ * planter is walked past a little leaf grain is the difference between a hedge and a green kerb.
+ */
+const LEAF_MIX = { crown: 0.08, hedge: 0.32, frond: 1, bark: 0 } as const;
 
 const R = (y: number, r: number, x = 0, z = 0): Ring => ({ y, rx: r, rz: r, x, z });
 
@@ -594,41 +611,6 @@ function crownLobe(r: number, detail: 0 | 1, phase: number, amp: number, squash:
   return g;
 }
 
-/**
- * Leaf fringe: a spray of two crossed cards (with back faces, so it never disappears edge-on) hanging off the crown
- * silhouette at (ox, oy, oz). Breaks the ball outline into something leafy without an alpha map.
- *
- * The normal has to stay up-and-out of a point under the card (k = 1), and that is a constraint from the ambient
- * occlusion pass, not from the shading: a crossed pair of doubled cards is four coincident thin planes, and GTAO
- * orients its hemisphere by the normal buffer, so any normal tilted back toward the card's own face reads the
- * partner card as an occluder at zero distance and crushes the pair to a flat BLACK hole in the crown (measured:
- * occlusion 226/255 at k = 1, 107 at k = 0.5, 6 at k = 0 — with the frame going to rgb(4,4,4) at the last two, where
- * no albedo can save it because the pass multiplies the composed pixel). Such a normal does take more sky than the
- * lobe beside it; what keeps the fringe from reading as the pale mint shards of round 7 is the crown's own value ramp
- * over the card in `treeGeometry`, which brings a sunlit card from 119/255 of green down to 69 against the lobe's 52.
- */
-function leafSpray(ox: number, oy: number, oz: number, w: number, h: number, yaw: number, tilt: number, hex: number): THREE.BufferGeometry {
-  const cards: THREE.BufferGeometry[] = [];
-  for (let c = 0; c < 2; c++) {
-    // A rhombus, not a quad: a rectangle hanging off a crown reads as exactly what it is.
-    const p = new THREE.BufferGeometry();
-    p.setAttribute('position', new THREE.BufferAttribute(new Float32Array([
-      0, -h * 0.5, 0, w * 0.5, 0, 0, 0, h * 0.5, 0,
-      0, -h * 0.5, 0, 0, h * 0.5, 0, -w * 0.5, 0, 0,
-    ]), 3));
-    p.computeVertexNormals();
-    p.rotateZ(tilt);
-    p.rotateY(yaw + c * Math.PI * 0.5);
-    p.translate(ox, oy, oz);
-    cards.push(p, flipFaces(p));
-  }
-  const g = fuse(cards);
-  // Both faces keep the same canopy normal, so a card never goes black edge-on the way a back face with a negated
-  // normal does, and the occlusion pass keeps reading the pair as open air rather than as a sealed pocket.
-  canopyNormals(g, oy - 2.2, 1);
-  return paint(g, hex);
-}
-
 /** Copy of a non-indexed geometry with every triangle's winding reversed (its normals are left pointing where they were). */
 function flipFaces(src: THREE.BufferGeometry): THREE.BufferGeometry {
   const g = src.clone();
@@ -690,22 +672,71 @@ function leafSurface(g: THREE.BufferGeometry, seed: number, jit = 0.06): THREE.B
   return src;
 }
 
-/** Crown shading shared by both tree species: lit toward the top of the mass, dark at the foot and on the undersides. */
-function shadeCrown(g: THREE.BufferGeometry, yLo: number, yHi: number, lit: number, darkSpan: number): void {
-  paint(g, FURN.crown);
-  blendTo(g, FURN.crownLit, (_x, y) => Math.max(0, Math.min(1, (y - yLo) / Math.max(0.2, yHi - yLo) - 0.25)) * lit);
-  // Squared over the bottom 30 % of the mass: the underside of a crown is nearly black, and a linear ramp over the
-  // whole lower half instead gave every lobe the same even wash.
-  blendTo(g, FURN.crownDark, (_x, y) => { const t = Math.max(0, Math.min(1, 1 - (y - yLo) / (darkSpan * 0.62))); return t * t * 0.92; });
-  // Interior band: whatever faces down or inward goes darker still, so the crown has a shaded belly instead of one
-  // flat top-lit gradient wrapped around a ball.
-  const nrm = g.attributes.normal, col = g.attributes.color;
-  scratchColor.setHex(FURN.crownDark);
-  for (let i = 0; i < nrm.count; i++) {
-    const t = Math.max(0, Math.min(1, (-nrm.getY(i) - 0.05) / 0.55)) * 0.55;
-    if (t <= 0) continue;
-    col.setXYZ(i, col.getX(i) + (scratchColor.r - col.getX(i)) * t, col.getY(i) + (scratchColor.g - col.getY(i)) * t, col.getZ(i) + (scratchColor.b - col.getZ(i)) * t);
+/**
+ * Two-stop bark ramp on a lathed trunk: barkDark at the root (soil contact), FURN.bark up the shaft, barkLit toward
+ * the top where the sky reaches it, plus a per-facet value jitter. A trunk shaded by nothing but its own facet normals
+ * reads as a smooth plastic tube — which is what the last critic saw — and the leaf map cannot help, because bark
+ * carries leafMix 0 on purpose. `rootH` is how far up the root darkening reaches, `topY` the top of the shaft.
+ */
+function barkRamp(g: THREE.BufferGeometry, rootH: number, topY: number): void {
+  // Flat facet normals. `tube` smooth-shades its rings, and a smooth cylindrical gradient is precisely what reads as a
+  // plastic tube: it hides the eight lathe columns the trunk is actually made of. Non-indexed geometry means
+  // computeVertexNormals gives one normal per face, so each column becomes its own flat strip of tone - the same
+  // deliberate faceting the crowns get from shadeCrown, and the shape the silhouette already has.
+  g.computeVertexNormals();
+  blendTo(g, FURN.barkLit, (_x, y) => Math.max(0, Math.min(1, (y - topY * 0.5) / Math.max(0.4, topY * 0.5))) * 0.48);
+  blendTo(g, FURN.barkDark, (_x, y) => { const t = Math.max(0, Math.min(1, 1 - y / rootH)); return t * t * 0.95; });
+  // Per-facet jitter: eight lathe columns of one flat brown is a tube; a few percent of value between them is bark.
+  const pos = g.attributes.position, col = g.attributes.color;
+  for (let t = 0; t + 2 < pos.count; t += 3) {
+    const k = 0.90 + 0.18 * (((t * 2654435761) >>> 8) % 97) / 96;
+    for (let c = 0; c < 3; c++) { const i = t + c; col.setXYZ(i, col.getX(i) * k, col.getY(i) * k, col.getZ(i) * k); }
   }
+}
+
+/** Crown tone bands, darkest first: underside, mass, top-lit. Flat colours, deliberately not a gradient. */
+const CROWN_BANDS = [FURN.crownDark, FURN.crown, FURN.crownLit] as const;
+const crownBase = new THREE.Color();
+const crownMass = new THREE.Color(FURN.crown);
+
+/**
+ * Crown shading: every FACET is flooded with one of three flat tones, picked from its own face normal and its height
+ * in the mass. Nothing is interpolated across a facet and nothing ramps smoothly over the lobe.
+ *
+ * This replaces the smooth top-lit / dark-bellied gradients of round 8. A low-poly crown's whole read comes from its
+ * facets, and a gradient wrapped over them hides exactly the edges that are supposed to be the shape — with a leaf
+ * noise map on top the result was the "broccoli" three critics reported. Three flat bands (up-facing = top-lit,
+ * sideways = the mass, down-facing = underside) plus leafSurface's per-facet value jitter make the same faceting read
+ * as a deliberate choice: the tone steps land ON the facet edges, which is how Art of Rally / Sable foliage works.
+ *
+ * `lit` scales how far the top band goes toward crownLit (per-lobe variation), `darkSpan` how much of the mass at the
+ * foot is pulled down a band.
+ */
+function shadeCrown(g: THREE.BufferGeometry, yLo: number, yHi: number, lit: number, darkSpan: number): void {
+  const pos = g.attributes.position;
+  const n = pos.count;
+  const col = new Float32Array(n * 3);
+  const span = Math.max(0.3, yHi - yLo);
+  const base = crownBase;
+  for (let t = 0; t + 2 < n; t += 3) {
+    // True facet normal (the stored normals are canopy-blended, so they cannot give a crisp band edge).
+    const ax = pos.getX(t), ay = pos.getY(t), az = pos.getZ(t);
+    sU.set(pos.getX(t + 1) - ax, pos.getY(t + 1) - ay, pos.getZ(t + 1) - az);
+    sV.set(pos.getX(t + 2) - ax, pos.getY(t + 2) - ay, pos.getZ(t + 2) - az);
+    sU.cross(sV);
+    const len = Math.max(1e-6, sU.length());
+    const ny = sU.y / len;
+    const cy = (ay + pos.getY(t + 1) + pos.getY(t + 2)) / 3;
+    // Height of the facet in the mass, 0 at the foot: the bottom of a crown sits in its own shade whichever way it faces.
+    const hRel = (cy - yLo) / span;
+    let band = ny >= 0.34 ? 2 : ny <= -0.14 ? 0 : 1;
+    if (band > 0 && hRel < 0.3 * Math.max(0.4, darkSpan / 1.7)) band--;
+    base.setHex(CROWN_BANDS[band]);
+    // The top band is only `lit` of the way to crownLit, so neighbouring lobes of one tree do not flood-fill identically.
+    if (band === 2) base.lerpColors(crownMass, base, Math.max(0.35, Math.min(1, lit * 1.55)));
+    for (let c = 0; c < 3; c++) { col[(t + c) * 3] = base.r; col[(t + c) * 3 + 1] = base.g; col[(t + c) * 3 + 2] = base.b; }
+  }
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
 }
 
 /**
@@ -718,7 +749,7 @@ function treeGeometry(seed: number): THREE.BufferGeometry {
   const rng = new Random(seed);
   const forkH = rng.range(1.9, 2.4), trunkH = forkH + rng.range(1.2, 1.7);
   const trunk = lathe([R(0, 0.3), R(0.14, 0.22), R(1.2, 0.17), R(forkH, 0.15)], 8, FURN.bark, false, false);
-  blendTo(trunk, FURN.barkDark, (_x, y) => (y < 0.5 ? 1 - y / 0.5 : 0) * 0.85);
+  barkRamp(trunk, 0.95, forkH);
   const parts: THREE.BufferGeometry[] = [trunk];
   // Fork: two or three limbs leaning out of the trunk top toward the big crown masses.
   const limbs = rng.int(2, 3), a0 = rng.range(0, Math.PI * 2);
@@ -728,6 +759,8 @@ function treeGeometry(seed: number): THREE.BufferGeometry {
     const lean = rng.range(0.45, 0.85), top = trunkH + rng.range(-0.15, 0.35);
     const tx = Math.cos(a) * lean, tz = Math.sin(a) * lean;
     const limb = lathe([R(forkH - 0.25, 0.13, tx * 0.1, tz * 0.1), R((forkH + top) / 2, 0.105, tx * 0.45, tz * 0.45), R(top, 0.075, tx, tz)], 6, FURN.bark);
+    // The limbs are the part of the bark the sky actually reaches, so they carry the ramp's lit stop.
+    blendTo(limb, FURN.barkLit, (_x, y) => Math.max(0, Math.min(1, (y - forkH) / Math.max(0.4, top - forkH))) * 0.7);
     parts.push(limb);
     limbTop.push([tx, tz, top]);
   }
@@ -737,11 +770,15 @@ function treeGeometry(seed: number): THREE.BufferGeometry {
     const [tx, tz, top] = limbTop[k];
     lobes.push([tx * 1.25, top + rng.range(0.5, 0.9), tz * 1.25, rng.range(1.15, 1.45), 1]);
   }
-  const small = rng.int(5, 7), b0 = rng.range(0, Math.PI * 2);
+  // Two more small lobes than round 8, and a pair of them hung low and wide: they take over the job the crossed leaf
+  // cards used to do (breaking the ball outline) without the cards' pathology — see the fringe note below.
+  const small = rng.int(7, 9), b0 = rng.range(0, Math.PI * 2);
   for (let k = 0; k < small; k++) {
     const a = b0 + (k / small) * Math.PI * 2 + rng.range(-0.35, 0.35);
-    const d = rng.range(0.9, 1.75);
-    lobes.push([Math.cos(a) * d, trunkH + rng.range(0.1, 1.35), Math.sin(a) * d, rng.range(0.62, 0.98), 0]);
+    const low = k % 3 === 2;
+    const d = low ? rng.range(1.5, 2.0) : rng.range(0.9, 1.75);
+    const y = low ? trunkH + rng.range(-0.35, 0.35) : trunkH + rng.range(0.1, 1.35);
+    lobes.push([Math.cos(a) * d, y, Math.sin(a) * d, low ? rng.range(0.5, 0.78) : rng.range(0.62, 0.98), 0]);
   }
   let yLo = Infinity, yHi = -Infinity;
   for (let i = 0; i < lobes.length; i++) { yLo = Math.min(yLo, lobes[i][1] - lobes[i][3]); yHi = Math.max(yHi, lobes[i][1] + lobes[i][3]); }
@@ -753,29 +790,14 @@ function treeGeometry(seed: number): THREE.BufferGeometry {
     shadeCrown(g, yLo, yHi, 0.62 + rng.range(-0.06, 0.06), 1.7);
     parts.push(g);
   }
-  // Fringe: cards hung on the crown's own silhouette, a couple of them drooping under it. The radius is measured per
-  // direction against the lobes actually facing that way — a card dropped at a fixed radius sinks into the mass on the
-  // wide side, and a buried card's canopy normal faces the sun while the lobe around it does not, which paints a bright
-  // chevron across the crown.
-  const fringe = rng.int(6, 8);
-  for (let k = 0; k < fringe; k++) {
-    const a = rng.range(0, Math.PI * 2);
-    let reach = 1.3;
-    for (let i = 0; i < lobes.length; i++) reach = Math.max(reach, Math.cos(a) * lobes[i][0] + Math.sin(a) * lobes[i][2] + lobes[i][3] * 0.92);
-    const d = reach * rng.range(0.96, 1.08);
-    const y = trunkH + rng.range(0.0, 1.5);
-    const card = leafSpray(Math.cos(a) * d, y, Math.sin(a) * d, rng.range(0.6, 0.95), rng.range(0.45, 0.7), a, rng.range(-0.6, 0.6), FURN.crown);
-    // Shaded by the crown's own ramp, not a flat lit tint: a card is a piece of the mass, so it carries the same
-    // top-lit / dark-bellied gradient as the lobes and never stands out as a lighter object against them. What is
-    // left over after that is not albedo and cannot be paid back with any: a card's normal has to point up and out
-    // (see leafSpray — the occlusion pass demands it), and an up-facing leaf normal under this rig mirrors the sky,
-    // so a sunlit card measures 69/255 of green against 52 for the lobe beside it and carries a faint cool cast.
-    // That reads as a leaf catching the sky, which is what it is; the pale mint shards of round 7 were 119.
-    shadeCrown(card, yLo, yHi, 0.5, 1.7);
-    parts.push(card);
-  }
+  // No leaf-card fringe. Round 8 hung 6-8 crossed rhombus cards on the silhouette; the occlusion pass forces their
+  // normal to point straight up and out (anything else collapses the coincident pair to a black hole), so under this
+  // rig a card takes far more sky than the lobe behind it and renders as a lighter, translucent-looking shard lying
+  // OVER the crown — read by the last critic as damage, and by the one before as pale mint shards. A normal that
+  // cannot be shaded like the mass cannot be part of the mass, so the cards are gone and two extra low lobes (which
+  // shade with everything else) do the outline-breaking instead. Also 130 triangles a tree cheaper.
   // parts[0] is the trunk and parts[1..limbs] the fork limbs: bark, which the leaf map must not touch.
-  for (let i = 0; i < parts.length; i++) leafMixAttr(parts[i], i <= limbs ? 0 : 1);
+  for (let i = 0; i < parts.length; i++) leafMixAttr(parts[i], i <= limbs ? LEAF_MIX.bark : LEAF_MIX.crown);
   return fuse(parts);
 }
 
@@ -835,8 +857,8 @@ function cypressGeometry(seed: number): THREE.BufferGeometry {
     col.setXYZ(i, col.getX(i) + (scratchColor.r - col.getX(i)) * t, col.getY(i) + (scratchColor.g - col.getY(i)) * t, col.getZ(i) + (scratchColor.b - col.getZ(i)) * t);
   }
   const trunk = lathe([R(0, 0.2), R(0.1, 0.16), R(bole + 0.3, 0.12)], 6, FURN.bark);
-  blendTo(trunk, FURN.barkDark, (_x, y) => (y < 0.45 ? 1 - y / 0.45 : 0) * 0.85);
-  return fuse([leafMixAttr(body, 1), leafMixAttr(trunk, 0)]);
+  barkRamp(trunk, 0.7, bole + 0.3);
+  return fuse([leafMixAttr(body, LEAF_MIX.crown), leafMixAttr(trunk, LEAF_MIX.bark)]);
 }
 
 /** Hedge profile, ground to ground over the clipped top: (u across in half-depths, v up in heights). */
@@ -915,7 +937,7 @@ function hedgeGeometry(seed: number): THREE.BufferGeometry {
   // A little per-vertex dapple so a long run does not read as one flat green.
   const col = g.attributes.color;
   for (let i = 0; i < col.count; i++) { const d = rng.range(0.95, 1.05); col.setXYZ(i, col.getX(i) * d, col.getY(i) * d, col.getZ(i) * d); }
-  return g;
+  return leafMixAttr(g, LEAF_MIX.hedge);
 }
 
 /**
@@ -948,7 +970,7 @@ function farPalmGeometry(seed: number): THREE.BufferGeometry {
     parts.push(bare(both));
   }
   // parts[0] is the bark trunk; everything after it is a frond.
-  for (let i = 0; i < parts.length; i++) leafMixAttr(parts[i], i === 0 ? 0 : 1);
+  for (let i = 0; i < parts.length; i++) leafMixAttr(parts[i], i === 0 ? LEAF_MIX.bark : LEAF_MIX.frond);
   return fuse(parts);
 }
 
@@ -1005,6 +1027,27 @@ const MID_CARS = { range: 32, cap: 16 } as const;
  * pick is allocation-free over at most `cap` instances (like `aimLampLights`, which runs per frame for this reason).
  */
 const CAR_TIER_MOVE = 1.5;
+
+/**
+ * Contact shadows for the static parked cars: the `cap` nearest of them get a blob in the shared ContactShadows field
+ * (the same instanced quad the vehicles, the crowd and the player write into, so this costs no extra draw call).
+ *
+ * They had none. A moving Vehicle gets one every frame; a parked prop is not a Vehicle, so past the distance where its
+ * own sun shadow is a couple of shadow-map texels — and at night, where the moon shadow is almost nothing — a kerbside
+ * car sat on the pavement with no darkening under it at all and floated. They are re-picked on the car tier's own
+ * 1.5 m cadence.
+ *
+ * `cap` is sized so it CANNOT bind: the densest 46 m neighbourhood in the generated city (a lot at 405, 542) holds 40
+ * parked cars, and 241 of the 2115 cars stand in a neighbourhood of more than 24. With the old cap of 24 the pick was
+ * a rank cut, so which cars were grounded changed every 1.5 m of camera motion — in a lot, where a whole row stands
+ * at the same distance, neighbouring bays at 15 m had some cars grounded and some floating, which is the exact
+ * artefact the blobs exist to remove. At 44 the cut is the range alone, so the set only changes at 46 m, where a blob
+ * is a few pixels. The cost is instance slots in one shared mesh (SHADOW_TUNING.capacity), not a draw call.
+ *
+ * Half-extents follow the vehicle profiles' own (hw * 1.55, hl * 1.14): a blob a little wider than the track and a
+ * little shorter than the body.
+ */
+const CAR_SHADOWS = { cap: 44, range: 46, w: 1.55, l: 1.14, lift: 0.045 } as const;
 
 /**
  * Real lamp light: a fixed pool of point lights created once and re-aimed at the nearest lamp heads every frame, so
@@ -1167,6 +1210,7 @@ export class PropRenderer {
   private carGeo = new Int32Array(0);
   private carCoarse = new Int32Array(0);
   private carCount = 0;
+  private readonly carShadows: ContactShadows;
   private nearMesh: THREE.BatchedMesh | null = null;
   private midMesh: THREE.BatchedMesh | null = null;
   private coarseMesh: THREE.BatchedMesh | null = null;
@@ -1180,7 +1224,7 @@ export class PropRenderer {
   private midPickedN = 0;
   private tierX = Infinity;
   private tierZ = Infinity;
-  private static readonly PICK_CAP = Math.max(NEAR_CARS.cap, MID_CARS.cap, LAMP_LIGHTS.count);
+  private static readonly PICK_CAP = Math.max(NEAR_CARS.cap, MID_CARS.cap, LAMP_LIGHTS.count, CAR_SHADOWS.cap);
   private readonly pickIdx = new Int32Array(PropRenderer.PICK_CAP);
   private readonly pickD2 = new Float32Array(PropRenderer.PICK_CAP);
   /** Catenary wire spans and the line mesh they are packed into by range. */
@@ -1192,6 +1236,7 @@ export class PropRenderer {
 
   constructor(scene: THREE.Scene, props: Prop[], materials: Materials, parked: ParkedCar[] = [], lotProps: LotProp[] = []) {
     this.materials = materials;
+    this.carShadows = new ContactShadows(scene, CAR_SHADOWS.cap);
     const counts: Record<Prop['kind'], number> = { palm: 0, lamp: 0, bench: 0, hydrant: 0, bin: 0, sign: 0, shelter: 0, bollard: 0, tree: 0, hedge: 0, pole: 0, roadsign: 0, dumpster: 0, table: 0 };
     for (let i = 0; i < props.length; i++) counts[props[i].kind]++;
     const lotCounts: Record<LotProp['kind'], number> = { island: 0, planter: 0, booth: 0 };
@@ -1581,6 +1626,27 @@ export class PropRenderer {
     for (let k = 0; k < this.midPickedN; k++) coarse.setVisibleAt(this.carCoarse[this.midPicked[k]], true);
     this.nearPickedN = this.fillCarTier(near, this.nearGeo, NEAR_CARS.cap, NEAR_CARS.range, camX, camZ, this.nearPicked, 0, this.nearPicked);
     this.midPickedN = this.fillCarTier(mid, this.midGeo, MID_CARS.cap, MID_CARS.range, camX, camZ, this.nearPicked, this.nearPickedN, this.midPicked);
+    this.repackCarShadows(camX, camZ);
+  }
+
+  /** Blobs under the `CAR_SHADOWS.cap` nearest static parked cars, re-picked with the fidelity bands. No allocation. */
+  private repackCarShadows(camX: number, camZ: number): void {
+    const r2 = CAR_SHADOWS.range * CAR_SHADOWS.range;
+    let picked = 0;
+    for (let i = 0; i < this.carCount; i++) {
+      const dx = this.carX[i] - camX, dz = this.carZ[i] - camZ;
+      const d2 = dx * dx + dz * dz;
+      if (d2 > r2) continue;
+      picked = PropRenderer.insertNearest(this.pickIdx, this.pickD2, picked, CAR_SHADOWS.cap, i, d2);
+    }
+    this.carShadows.begin();
+    for (let k = 0; k < picked; k++) {
+      const i = this.pickIdx[k];
+      const spec = SPECS[PARKED_SPECS[this.carGeo[i]]];
+      this.carShadows.add(this.carX[i], this.carY[i] + CAR_SHADOWS.lift, this.carZ[i],
+        spec.width * 0.5 * CAR_SHADOWS.w, spec.length * 0.5 * CAR_SHADOWS.l, this.carYaw[i], 1);
+    }
+    this.carShadows.end();
   }
 
   /** Copies the wire spans within range into the line mesh's buffer and sets its draw range. */
@@ -1645,6 +1711,7 @@ export class PropRenderer {
   get drawCount(): number { return this.meshes.length; }
 
   dispose(): void {
+    this.carShadows.dispose();
     for (let i = 0; i < this.meshes.length; i++) {
       const m = this.meshes[i];
       if (m.parent) m.parent.remove(m);

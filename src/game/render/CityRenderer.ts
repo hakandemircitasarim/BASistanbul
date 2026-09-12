@@ -168,13 +168,15 @@ export class CityRenderer {
   build(): void {
     this.buildBuildings();
     this.buildLandmarks();
-    // Roads, marks and sidewalks share builders with the parking lots (lot floors are asphalt, kerbs are kerb stone,
-    // bay lines are paint) so the lots cost no draw calls of their own.
-    const road = new GeoBuilder(), marks = new GeoBuilder(), walk = new GeoBuilder();
+    // Marks and sidewalks share builders with the parking lots (kerbs are kerb stone, bay lines are paint). The lot
+    // FLOORS are their own mesh: sharing the carriageway tile printed a double yellow centre line and two dashed lane
+    // separators across every car park in the city, which is one draw call's worth of the loudest artefact there is.
+    const road = new GeoBuilder(), marks = new GeoBuilder(), walk = new GeoBuilder(), lot = new GeoBuilder();
     this.buildRoads(road, marks);
     this.buildSidewalks(walk);
-    this.buildLots(road, walk, marks);
+    this.buildLots(lot, walk, marks);
     this.addGeo(road.build(), this.materials.road, false, true);
+    this.addGeo(lot.build(), this.materials.lotAsphalt, false, true);
     this.addGeo(walk.build(), this.materials.sidewalk, false, true);
     const markMesh = this.addGeo(marks.build(), this.materials.roadMark, false, true);
     markMesh.renderOrder = 1;
@@ -450,11 +452,12 @@ export class CityRenderer {
   }
 
   /**
-   * Off-street parking lots: an asphalt floor a hair above the block pavement (groundYAt keeps returning CURB_H),
+   * Off-street parking lots: an asphalt floor (its own `floors` mesh, on the paint-free lot tile) a hair above the
+   * block pavement (groundYAt keeps returning CURB_H),
    * a low kerb ring with a gate on the street side, one painted bay strip per parked-spot column and a continuous
    * wheel-stop kerb at the head of every strip.
    */
-  private buildLots(road: GeoBuilder, walk: GeoBuilder, marks: GeoBuilder): void {
+  private buildLots(floors: GeoBuilder, walk: GeoBuilder, marks: GeoBuilder): void {
     const lots = this.city.lots;
     if (!lots) return;
     const blocks = this.city.blocks;
@@ -463,8 +466,8 @@ export class CityRenderer {
     for (let i = 0; i < lots.length; i++) {
       const lot = lots[i];
       const x0 = lot.x - lot.w / 2, x1 = lot.x + lot.w / 2, z0 = lot.z - lot.d / 2, z1 = lot.z + lot.d / 2;
-      road.setColor(0xffffff);
-      flatQuad(road, x0, z0, x1, z1, fy, TILE_M.road);
+      floors.setColor(0xffffff);
+      flatQuad(floors, x0, z0, x1, z1, fy, TILE_M.road);
       // Gate on the nearest block edge (the street the lot opens onto).
       const blk = blocks[lot.blockRow * GRID_COLS + lot.blockCol];
       const dS = blk.z1 - z1, dN = z0 - blk.z0, dE = blk.x1 - x1, dW = x0 - blk.x0;

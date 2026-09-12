@@ -78,6 +78,13 @@ const BAND_ROWS = 4;
 const CHAMFER_MIN = 2.2, CHAMFER_VAR = 0.8;
 /** Floor slab projected at every floor line on residential / art deco / suburb concrete street faces. */
 const SLAB_OUT = 0.25, SLAB_H = 0.22;
+/**
+ * Roof-edge cornice shading (see cornice / corniceOutline). The fillet sits under the crown slab's oversail: its foot
+ * still sees the sky (CORNICE_LIT), its head is buried under the soffit (CORNICE_SHADE), and the soffit itself faces
+ * straight down (CORNICE_SOFFIT). Vertex colour, not geometry - the profile already exists, what it lacked was the
+ * shadow line that tells the eye it is 0.35 m proud of the wall rather than painted on it.
+ */
+const CORNICE_LIT = 0.98, CORNICE_SHADE = 0.6, CORNICE_SOFFIT = 0.52;
 /** Parapet: 1.0-1.2 m walls on the cornice with a coping slab on top. */
 const PARAPET_MIN = 1.0, PARAPET_VAR = 0.2, COPING_H = 0.12, COPING_OUT = 0.08;
 /** Baked occlusion at the head of a parapet, under the coping's oversail (see parapetWalls). */
@@ -412,7 +419,7 @@ export class GeoBuilder {
     this.quad(ax1, yb, az1, ax1, yb, az0, ax1, ym, az0, ax1, ym, az1, 1, 0, 0, u, v, u, v, u, v, u, v);
     this.quad(ax0, yb, az0, ax0, yb, az1, ax0, ym, az1, ax0, ym, az0, -1, 0, 0, u, v, u, v, u, v, u, v);
     // Soffit ring under the slab (faces down): from the fillet's outer edge to the slab's outer edge.
-    this.setColor(darken(color, 0.7));
+    this.setColor(darken(color, CORNICE_SOFFIT));
     this.quad(bx0, ym, az1, bx1, ym, az1, bx1, ym, bz1, bx0, ym, bz1, 0, -1, 0, u, v, u, v, u, v, u, v);
     this.quad(bx0, ym, bz0, bx1, ym, bz0, bx1, ym, az0, bx0, ym, az0, 0, -1, 0, u, v, u, v, u, v, u, v);
     this.quad(bx0, ym, az0, ax0, ym, az0, ax0, ym, az1, bx0, ym, az1, 0, -1, 0, u, v, u, v, u, v, u, v);
@@ -672,9 +679,12 @@ export class GeoBuilder {
     const u = 0.25, v = ROOF_V;
     const yb = top - h0 - h1, ym = top - h1;
     const A = ol.offset(out0, olC), B = ol.offset(out1, olD);
-    this.setColor(darken(color, 0.92));
-    this.polySides(A, yb, ym);
-    this.setColor(darken(color, 0.7));
+    // The fillet stands under the crown slab's oversail, so it is in shadow, and the shadow is deepest right under
+    // the soffit: ramped from CORNICE_LIT at its foot to CORNICE_SHADE at its head, which puts a real dark line along
+    // the roof edge for no extra quads. The shadow map cannot draw it at any bias worth using over a 0.2 m oversail,
+    // and without it the cornice read as a painted pale stripe with no depth at all.
+    this.polySides(A, yb, ym, darken(color, 0.92), CORNICE_LIT, CORNICE_SHADE);
+    this.setColor(darken(color, CORNICE_SOFFIT));
     for (let i = 0; i < ol.n; i++) {
       const j = (i + 1) % ol.n;
       this.quad(B.x[i], ym, B.z[i], A.x[i], ym, A.z[i], A.x[j], ym, A.z[j], B.x[j], ym, B.z[j], 0, -1, 0, u, v, u, v, u, v, u, v);

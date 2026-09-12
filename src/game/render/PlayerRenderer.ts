@@ -20,8 +20,22 @@ const SKIN = 0xe3b48f;
 const HAIR = 0x2a1d17;
 const EYE = 0x1a1410;
 const SHOE = 0x1b1b20;
-const SHADOW_R = 0.56;
+/** Rubber sole under the dark upper, and the belt buckle. */
+const SOLE = 0x4a4a52;
+const BUCKLE = 0xb9a05c;
+/**
+ * Contact blob half-width. Bigger than it looks it should be (a 1.4 m ellipse under a 1.8 m figure), because the shared
+ * blob texture is only opaque inside `SHADOW_TUNING.core` = 34 % of its radius and fades to nothing at the rim: at the
+ * geometrically "correct" 0.56 the whole opaque core hid under the figure's own footprint and the blob read as nothing
+ * at all (measured: no change in the pavement pixels under the player at noon). At 0.7 the core is a 48 cm puddle that
+ * shows around the shoes, which is what grounds the figure - especially at night, when there is no sun shadow at all.
+ */
+const SHADOW_R = 0.7;
 const SHADOW_LIFT = 0.03;
+/** Contact blob shape: `NARROW` of the old radius across the light direction, up to `STRETCH_MAX` along it. */
+const SHADOW_NARROW = 1.0;
+const SHADOW_STRETCH_MAX = 2.4;
+const SHADOW_ELEV_FLOOR = 0.26;
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Shared sculpting helpers (also used by PedRenderer). All builders return non-indexed geometry with position, normal
@@ -116,11 +130,15 @@ export function faceZ(x: number, y: number, cy: number, rx: number, ry: number, 
  * Hair cap wrapped over an ellipsoid: polar extent varies with azimuth (short over the brow = fringe, long at the nape)
  * and a lip ring tucks the edge in toward the skull so the fringe reads as a thick layer, not a paper edge.
  */
-export function hairCap(cy: number, rx: number, ry: number, rz: number, segs: number, rows: number, front: number, side: number, back: number, lip: number): THREE.BufferGeometry {
+export function hairCap(cy: number, rx: number, ry: number, rz: number, segs: number, rows: number, front: number, side: number, back: number, lip: number, scallop = 0): THREE.BufferGeometry {
   return surface(rows + (lip > 0 ? 1 : 0), segs, true, true, (i, j, out) => {
     const a = (j / segs) * Math.PI * 2;
     const f = (1 - Math.cos(a)) * 0.5;
-    const max = f < 0.5 ? front + (side - front) * (f * 2) : side + (back - side) * ((f - 0.5) * 2);
+    let max = f < 0.5 ? front + (side - front) * (f * 2) : side + (back - side) * ((f - 0.5) * 2);
+    // Scalloped edge: the hairline is not a drawn arc. Three locks over the brow (cos 3a, strongest at the front) and
+    // a lifted neckline at the nape (the negative lobe of the same term where f is high) turn the smooth cap the last
+    // critic called a helmet into a fringe with a parting and a hairline the neck comes out of.
+    if (scallop > 0) max *= 1 + scallop * (Math.cos(a * 3) * (1 - f * 0.55) - 0.35 * Math.max(0, f - 0.72) / 0.28);
     const isLip = i >= rows;
     const th = isLip ? max + lip : (max * i) / (rows - 1);
     const k = isLip ? 0.965 : 1;
@@ -159,11 +177,31 @@ export function shoe(s: number, radial: number, lean = 0): THREE.BufferGeometry 
     { z: 0.12, rx: 0.066, ry: 0.036 }, { z: 0.19, rx: 0.046, ry: 0.020 },
   ];
   const at = (c: { z: number; rx: number; ry: number }, a: number, q: number, out: THREE.Vector3): void => {
-    out.set(lean * s + c.rx * s * Math.sin(a) * q, c.ry * s * (1 - Math.cos(a) * q) * 0.98, (c.z + 0.02) * s);
+    // Sole plate: the cross-section is flared toward the bottom of the ellipse (SOLE_FLARE on cos a) and the bottom
+    // 1.4 cm is pushed down flat, so the foot ends in a plate 13-19 cm across against a 9 cm ankle instead of the
+    // rounded wedge narrower than the shin that the last critic measured. `shoeSole` paints that band lighter.
+    const c0 = Math.max(0, Math.cos(a));
+    const flare = 1 + SOLE_FLARE * c0 * c0;
+    const y = c.ry * s * (1 - Math.cos(a) * q) * 0.98;
+    out.set(lean * s + c.rx * s * Math.sin(a) * q * flare, Math.max(y, y * (1 - c0 * 0.55)), (c.z + 0.02) * s);
   };
   const side = surface(sec.length, radial, true, false, (i, j, out) => at(sec[i], ((j + 0.5) / radial) * Math.PI * 2, 1, out));
   const cap = (k: number, flip: boolean): THREE.BufferGeometry => surface(2, radial, true, flip, (i, j, out) => at(sec[k], ((j + 0.5) / radial) * Math.PI * 2, i === 0 ? 0 : 1, out));
   return fuseBare([side, cap(0, false), cap(sec.length - 1, true)]);
+}
+
+/** How far the shoe's cross-section flares at the sole line: a 34 % wider plate than the upper it carries. */
+const SOLE_FLARE = 0.34;
+/** Height (in figure units, before `s`) up to which a shoe vertex belongs to the rubber sole rather than the upper. */
+export const SOLE_H = 0.016;
+
+/**
+ * Shoe colours: a lighter rubber sole under a dark upper. The value break along the sole line is what makes the plate
+ * read as a sole at 2 m rather than as the bottom of one dark lump, and it grounds the figure: the lightest part of
+ * the shoe is the bit that touches the pavement.
+ */
+export function paintShoe(g: THREE.BufferGeometry, s: number, upper: number, sole: number): THREE.BufferGeometry {
+  return paintFn(g, (_x, y, _z, out) => out.setHex(y <= SOLE_H * s ? sole : upper));
 }
 
 /** Four-sided pyramid pointing along +z and tilted down by `tilt`: the nose. */
@@ -285,24 +323,40 @@ function scaled(rings: Ring[], s: number): Ring[] {
 
 export function torsoRings(s: number): Ring[] {
   return scaled([
-    { y: 0.74, rx: 0.165, rz: 0.115 },
-    { y: 0.80, rx: 0.18, rz: 0.125 },
-    { y: 0.858, rx: 0.19, rz: 0.13 },
-    { y: 0.862, rx: 0.198, rz: 0.138 },
-    { y: 0.90, rx: 0.198, rz: 0.138 },
-    { y: 0.904, rx: 0.188, rz: 0.128 },
-    { y: 0.98, rx: 0.185, rz: 0.125 },
-    { y: 1.08, rx: 0.195, rz: 0.132 },
+    // The two rings below the belt stay INSIDE the thigh tubes (legRings tops at 0.098 x 0.112 about x = +-0.124, i.e.
+    // a back surface at z = 0.112): at the old 0.115 / 0.125 the torso's own seat poked a hard-edged lighter panel out
+    // through the back of the trousers. The legs model the hips; the torso only has to reach them.
+    // The crotch tapers down BETWEEN the thighs to 0.66 and closes there, so its end cap and the value step at it are
+    // behind the legs from every angle the character is seen from instead of being a hard-edged panel on the seat.
+    { y: 0.66, rx: 0.112, rz: 0.074 },
+    { y: 0.71, rx: 0.136, rz: 0.088 },
+    { y: 0.74, rx: 0.150, rz: 0.098 },
+    { y: 0.80, rx: 0.172, rz: 0.108 },
+    { y: 0.858, rx: 0.19, rz: 0.124 },
+    // Belt: 1.5 cm proud of the trousers below it and the shirt above, so the waist line is a step in the SILHOUETTE
+    // and not just a dark band painted on a straight tube (round 8's belt was 8 mm and invisible past 3 m).
+    { y: 0.862, rx: 0.205, rz: 0.145 },
+    { y: 0.90, rx: 0.205, rz: 0.145 },
+    // Shirt hem, also proud: the shirt hangs OVER the belt and breaks the torso in two at the waist.
+    { y: 0.906, rx: 0.196, rz: 0.137 },
+    { y: 0.925, rx: 0.191, rz: 0.131 },
+    // Waist: 15 % narrower than the hip and 27 % narrower than the chest. At round 8's 0.185 against a 0.198 hip the
+    // lower torso was a straight column: no waist meant no figure, whatever the shading did.
+    { y: 1.00, rx: 0.168, rz: 0.112 },
+    { y: 1.09, rx: 0.192, rz: 0.130 },
     { y: 1.20, rx: 0.215, rz: 0.142, z: 0.006 },
     { y: 1.30, rx: 0.23, rz: 0.138 },
     { y: 1.385, rx: 0.25, rz: 0.13, z: -0.006 },
     { y: 1.425, rx: 0.212, rz: 0.114 },
-    { y: 1.442, rx: 0.135, rz: 0.093 },
-    // The collar closes 4 cm lower than it used to (1.476 instead of 1.50): the jaw sits at ~1.53, so the old shirt
+    { y: 1.442, rx: 0.132, rz: 0.092 },
+    // Collar: a short stand of two proud rings (0.118 over the 0.104 band above it) around the neck tube, so the
+    // shirt ends in a rim the head sits inside instead of closing smoothly onto the neck like a bottle.
+    { y: 1.447, rx: 0.118, rz: 0.100 },
+    { y: 1.470, rx: 0.113, rz: 0.096 },
+    { y: 1.474, rx: 0.092, rz: 0.079 },
+    // The collar closes 4 cm lower than it used to (1.49 instead of 1.50): the jaw sits at ~1.53, so the old shirt
     // left 3 cm of neck and the head read as bolted straight onto the shoulders. Six centimetres is a neck.
-    { y: 1.452, rx: 0.098, rz: 0.082 },
-    { y: 1.456, rx: 0.084, rz: 0.074 },
-    { y: 1.476, rx: 0.077, rz: 0.068 },
+    { y: 1.49, rx: 0.082, rz: 0.071 },
   ], s);
 }
 
@@ -336,12 +390,16 @@ export function armRings(s: number, side = 1): Ring[] {
  */
 export function hand(s: number, side: number, segs: number, rings: number): THREE.BufferGeometry {
   const wrist = 0.79 * s;
-  const palm = blob(0.028 * s, 0.062 * s, 0.04 * s, segs, rings);
-  palm.rotateY(side * 0.25);
-  palm.translate(-side * 0.004 * s, wrist - 0.05 * s, 0.004 * s);
-  const thumb = blob(0.012 * s, 0.026 * s, 0.014 * s, Math.max(4, segs - 2), Math.max(3, rings - 2));
-  thumb.rotateZ(-side * 0.6);
-  thumb.translate(-side * 0.032 * s, wrist - 0.03 * s, 0.026 * s);
+  // A hand hanging at the side is a flat paddle: thin across the body (x), wide front to back (z), and it must be
+  // WIDER than the wrist it hangs off or it reads as the rounded stub the critic saw. The wrist ring is 0.029 x 0.022,
+  // so the palm at 0.030 x 0.056 is a little thicker and two and a half times as deep - a mitten with a visible step
+  // at the cuff. The thumb bud stands out of the leading edge, which is what tells the eye which way the hand faces.
+  const palm = blob(0.030 * s, 0.068 * s, 0.056 * s, segs, rings);
+  palm.rotateY(side * 0.22);
+  palm.translate(-side * 0.004 * s, wrist - 0.052 * s, 0.008 * s);
+  const thumb = blob(0.015 * s, 0.030 * s, 0.017 * s, Math.max(4, segs - 2), Math.max(3, rings - 2));
+  thumb.rotateZ(-side * 0.55);
+  thumb.translate(-side * 0.030 * s, wrist - 0.030 * s, 0.036 * s);
   return fuseBare([palm, thumb]);
 }
 
@@ -443,7 +501,47 @@ export function headParts(s: number, segs: number, rings: number, hairRows: numb
     brow.translate(bx, by, faceZ(bx, by, cy, rx, ry, rz, jaw) - rz * 0.05);
     emit('brow', brow);
   }
-  emit('hair', hairCap(cy + ry * 0.02, rx * 1.075 + 0.003, ry * 1.09, rz * 1.075 + 0.003, segs, hairRows, 1.1, 1.7, 2.25, 0.14));
+  emit('hair', hairCap(cy + ry * 0.02, rx * 1.075 + 0.003, ry * 1.09, rz * 1.075 + 0.003, segs, hairRows, 1.16, 1.76, 2.06, 0.15, 0.17));
+}
+
+/**
+ * Ground direction and length of a character's contact blob, driven by the scene's own shadow-casting light.
+ *
+ * The blob used to be a circle centred under the figure: it pointed nowhere, so it read as a detached disc lying
+ * beside the feet rather than as a shadow, and it disagreed with every cast shadow in the frame. Reading the scene's
+ * DirectionalLight (rather than re-deriving the sun path here) keeps the blobs and the shadow map in agreement for
+ * free, and follows SkySystem's swap to moon shadows after dark.
+ */
+export interface GroundShadow {
+  /** Unit ground direction the light casts toward. */
+  dirX: number; dirZ: number;
+  /** Blob length along that direction as a multiple of its half-width. */
+  stretch: number;
+  light: THREE.DirectionalLight | null;
+}
+
+export function makeGroundShadow(): GroundShadow {
+  return { dirX: 0, dirZ: 1, stretch: 1, light: null };
+}
+
+/** Refreshes `g` from the scene's shadow light. Allocation-free after the first lookup; call once a frame. */
+export function updateGroundShadow(g: GroundShadow, scene: THREE.Scene, minStretch: number, maxStretch: number, elevFloor: number): void {
+  if (!g.light || !g.light.parent) {
+    let found: THREE.DirectionalLight | null = null;
+    scene.traverse((o) => {
+      if (!found && o instanceof THREE.DirectionalLight) found = o;
+    });
+    g.light = found;
+  }
+  const l = g.light;
+  if (!l) return;
+  // The direction the light travels, flattened onto the ground, and its elevation as a slope.
+  const dx = l.target.position.x - l.position.x, dz = l.target.position.z - l.position.z;
+  const dy = l.position.y - l.target.position.y;
+  const len = Math.hypot(dx, dz);
+  if (len > 1e-4) { g.dirX = dx / len; g.dirZ = dz / len; }
+  const elev = Math.max(elevFloor, dy / Math.max(1e-4, len));
+  g.stretch = clamp(1.0 / elev, minStretch, maxStretch);
 }
 
 /** Night factor from the clock alone (the renderer has no sun vector to hand): fades in around lights-on, out at lights-off. */
@@ -503,12 +601,17 @@ function playerGeometry(): THREE.BufferGeometry {
   const parts: THREE.BufferGeometry[] = [];
   // Torso: jeans below the belt, belt, shirt with a darker hem climbing to full colour at the chest, collar band.
   const torso = paintFn(tube(torsoRings(1), RADIAL, true, true), (_x, y, _z, out) => {
-    if (y < P.beltLo) out.setHex(JEANS).multiplyScalar(0.9 + 0.1 * smoothstep(P.crotchY, P.beltLo, y));
+    if (y < P.beltLo) out.setHex(JEANS).multiplyScalar(0.96 + 0.04 * smoothstep(P.crotchY, P.beltLo, y));
     else if (y < P.beltHi + 0.002) out.setHex(BELT);
     else if (y < P.collarY) out.setHex(SHIRT).multiplyScalar(0.64 + 0.36 * smoothstep(P.beltHi, 1.24, y));
     else out.setHex(COLLAR);
   });
   parts.push(skin(torso, SPINE, HIPS, 0.98, 0.84));
+  // Belt buckle: a brass plate on the centre line of the proud belt ring. Twelve triangles, and it is the one thing
+  // that says "belt" from the front rather than "a dark stripe".
+  const buckle = paint(block(0.062, 0.040, 0.016), BUCKLE);
+  buckle.translate(0, (P.beltLo + P.beltHi) * 0.5, 0.142);
+  parts.push(skin(buckle, HIPS, HIPS, 0, 0));
   parts.push(skin(paint(tube(neckRings(1), 8, false, false), SKIN), HEAD, SPINE, 1.57, 1.47));
   headParts(1, 14, 10, 7, (role, g) => {
     const hex = role === 'skin' ? SKIN : role === 'eye' ? EYE : HAIR;
@@ -528,7 +631,7 @@ function playerGeometry(): THREE.BufferGeometry {
     leg.translate(side * P.hipX, 0, 0);
     parts.push(skin(leg, side < 0 ? HIP_L : HIP_R, side < 0 ? KNEE_L : KNEE_R, 0.52, 0.42));
     // The shoe carries the shin's inward lean, so it stands under the ankle rather than beside it.
-    const foot = paint(shoe(1, 10, -side * 0.020), SHOE);
+    const foot = paintShoe(shoe(1, 10, -side * 0.020), 1, SHOE, SOLE);
     foot.translate(side * P.hipX, 0, 0);
     parts.push(skin(foot, side < 0 ? KNEE_L : KNEE_R, side < 0 ? KNEE_L : KNEE_R, 0, 0));
   }
@@ -540,6 +643,7 @@ export class PlayerRenderer {
   private readonly mesh: THREE.SkinnedMesh;
   private readonly bones: THREE.Bone[] = [];
   private readonly shadows: ContactShadows;
+  private readonly groundShadow = makeGroundShadow();
   private readonly rim = makeRimUniforms();
   // Low probe weight: the dark hair otherwise mirrors whatever neon the reflection probe caught (green at night).
   private readonly mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.8, metalness: 0.03, envMapIntensity: 0.22 });
@@ -626,8 +730,16 @@ export class PlayerRenderer {
     g.scale.set(sc, sc, sc);
     setRimNight(this.rim, nightFromHour(world.time.hour));
 
-    this.shadows.add(this.interp.x, groundYAt(this.interp.x, this.interp.z) + SHADOW_LIFT, this.interp.z,
-      SHADOW_R, p.alive ? SHADOW_R : SHADOW_R * 1.8, this.interp.yaw, sc);
+    // Contact blob: an ellipse laid along the direction the scene's own shadow light casts, its near end under the
+    // feet (see GroundShadow). A downed player keeps the old round-but-wider blob, which is its own silhouette.
+    updateGroundShadow(this.groundShadow, this.scene, SHADOW_NARROW, SHADOW_STRETCH_MAX, SHADOW_ELEV_FLOOR);
+    const gs = this.groundShadow;
+    const gyS = this.groundY + SHADOW_LIFT;
+    if (!p.alive) this.shadows.add(this.interp.x, gyS, this.interp.z, SHADOW_R, SHADOW_R * 1.8, this.interp.yaw, sc);
+    else {
+      const rx = SHADOW_R * SHADOW_NARROW, rz = SHADOW_R * gs.stretch, push = rz - rx;
+      this.shadows.add(this.interp.x + gs.dirX * push, gyS, this.interp.z + gs.dirZ * push, rx, rz, Math.atan2(gs.dirX, gs.dirZ), sc);
+    }
     this.shadows.end();
 
     if (!p.alive) {

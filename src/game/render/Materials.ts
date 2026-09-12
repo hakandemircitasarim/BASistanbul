@@ -97,6 +97,8 @@ export class Materials {
   /** Built facade detail (window frames, sills, balconies, AC units, downpipes): vertex colour x batch instance colour, painted-metal sheen. */
   readonly facade: THREE.MeshStandardMaterial;
   readonly road: THREE.MeshStandardMaterial;
+  /** Off-street parking asphalt: the road's surface without its lane paint (CityRenderer's lot floors). */
+  readonly lotAsphalt: THREE.MeshStandardMaterial;
   readonly crosswalk: THREE.MeshStandardMaterial;
   /** Painted lane arrows / stop bars laid on the asphalt (alpha-tested decals). */
   readonly roadMark: THREE.MeshStandardMaterial;
@@ -170,7 +172,23 @@ export class Materials {
       normalMap: tex.groundNormal('road', 3.0), normalScale: new THREE.Vector2(0.45, 0.45),
       metalness: SURF.road.metalness, envMapIntensity: SURF.road.env,
     });
-    this.crosswalk = new THREE.MeshStandardMaterial({ map: tex.crosswalk(), roughness: 0.85, metalness: SURF.road.metalness, envMapIntensity: SURF.road.env });
+    // The junction box gets the road's relief and roughness maps, not none: without them it answered light as a flat
+    // print beside a road that has a normal and a roughness map, and after dark the road dropped to 0.6 roughness
+    // while the junction stayed at 0.85 - a straight tone step across the full width of the frame at every kerb line.
+    // Its own aggregate differs from the road's, so the maps are the road's; at a junction the two are 1 texel apart.
+    this.crosswalk = new THREE.MeshStandardMaterial({
+      map: tex.crosswalk(), roughnessMap: tex.roadRough(), roughness: SURF.road.roughnessDay,
+      normalMap: tex.groundNormal('road', 3.0), normalScale: new THREE.Vector2(0.45, 0.45),
+      metalness: SURF.road.metalness, envMapIntensity: SURF.road.env,
+    });
+    // Off-street parking: the road's bitumen, aggregate and reinstatements without the carriageway paint.
+    this.lotAsphalt = new THREE.MeshStandardMaterial({
+      // Half-resolution relief: a lot has no lane paint and no joints, so its normal map carries nothing finer than
+      // a reinstatement edge - 1 MB instead of 4 for a surface nobody reads at the road's texel density.
+      map: tex.lotAsphalt(), roughnessMap: tex.lotRough(), roughness: SURF.road.roughnessDay,
+      normalMap: tex.groundNormal('lotAsphalt', 3.0, true), normalScale: new THREE.Vector2(0.45, 0.45),
+      metalness: SURF.road.metalness, envMapIntensity: SURF.road.env,
+    });
     this.roadMark = new THREE.MeshStandardMaterial({ roughness: 0.55, metalness: 0.05, envMapIntensity: SURF.road.env, map: tex.roadMarks(), transparent: true, alphaTest: 0.35, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -6 });
     // Ground families get relief + roughness maps so slab joints and the kerb chamfer catch low sun instead of
     // reading as a flat print. Values are deliberately grouped: dark warm asphalt, mid warm pavement, light facades.
@@ -179,7 +197,11 @@ export class Materials {
     this.sand = new THREE.MeshStandardMaterial({ map: tex.sand(), roughness: SURF.sand.roughness, metalness: 0, envMapIntensity: SURF.sand.env });
     this.grass = new THREE.MeshStandardMaterial({ map: tex.grass(), roughness: SURF.ground.roughness, metalness: 0, envMapIntensity: SURF.ground.env });
     this.plaza = new THREE.MeshStandardMaterial({ map: tex.plaza(), normalMap: tex.groundNormal('plaza', 2.5), normalScale: new THREE.Vector2(0.5, 0.5), roughnessMap: tex.groundRough('plaza', 0.75, 0.98), roughness: 0.86, metalness: 0.05, envMapIntensity: SURF.ground.env });
-    this.pavement = new THREE.MeshStandardMaterial({ map: tex.sidewalk(), normalMap: walkN, normalScale: new THREE.Vector2(0.6, 0.6), roughnessMap: walkR, color: 0xa39c90, roughness: SURF.ground.roughness, metalness: 0.05, envMapIntensity: SURF.ground.env });
+    // Identical to `sidewalk` in every shading term, only a different mesh: the block interior and the 3 m kerb strip
+    // meet along a straight line the whole length of every block, and a 5 % colour difference plus 0.05 of metalness
+    // between them drew that line as a tone step running away to the horizon beside the player - exactly the seam the
+    // shared 8 m slab grid exists to avoid.
+    this.pavement = new THREE.MeshStandardMaterial({ map: tex.sidewalk(), normalMap: walkN, normalScale: new THREE.Vector2(0.6, 0.6), roughnessMap: walkR, color: 0xaea89c, roughness: SURF.ground.roughness, metalness: SURF.ground.metalness, envMapIntensity: SURF.ground.env });
     this.dirt = new THREE.MeshStandardMaterial({ color: 0x5a4e3c, roughness: SURF.ground.roughness, metalness: 0, envMapIntensity: SURF.ground.env });
     const wt = tex.water();
     this.water = new THREE.MeshPhongMaterial({ map: wt, normalMap: tex.waterNormal(), color: 0x9fd8ff, specular: 0xffffff, shininess: 80, transparent: true, opacity: 0.92 });
@@ -243,15 +265,19 @@ export class Materials {
     // Vertical spill quad behind each lamp so the facade behind it catches light too, not just the pavement.
     this.lampSpillMat = new THREE.MeshBasicMaterial({ map: tex.radialGlow(), color: new THREE.Color(0xffd39a).multiplyScalar(HDR_BOOST), transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, fog: false, toneMapped: false });
     this.bloomTex = tex.radialGlow();
-    // Macro scale is expressed against each surface's own tile size, so all of them break up at roughly 45 m.
-    const macro = tex.clouds();
+    // Macro scale is expressed against each surface's own tile size, so all of them break up at roughly 45 m. The
+    // paved families take the quantised patch field (flat tonal plates with a definite edge - a street laid in
+    // sections); sand and grass keep the soft cloud wash, which is what a natural surface wants.
+    const macro = tex.clouds(), patch = tex.groundPatch();
     const macroFor = (tile: number): number => tile / 45;
-    this.macroVariation(this.road, macro, macroFor(TILE_M.road), 0.2);
-    this.macroVariation(this.sidewalk, macro, macroFor(TILE_M.sidewalk), 0.16);
+    this.macroVariation(this.road, patch, macroFor(TILE_M.road), 0.16);
+    this.macroVariation(this.crosswalk, patch, macroFor(TILE_M.road), 0.16);
+    this.macroVariation(this.lotAsphalt, patch, macroFor(TILE_M.road), 0.16);
+    this.macroVariation(this.sidewalk, patch, macroFor(TILE_M.sidewalk), 0.13);
     // The plaza gets the strongest macro of the paved surfaces: it is the one ground the player sees as an unbroken
     // 96 m field with nothing on it, so its 8 m tile repeat is the most visible in the city.
-    this.macroVariation(this.plaza, macro, macroFor(TILE_M.plaza), 0.26);
-    this.macroVariation(this.pavement, macro, macroFor(TILE_M.pavement), 0.16);
+    this.macroVariation(this.plaza, patch, macroFor(TILE_M.plaza), 0.2);
+    this.macroVariation(this.pavement, patch, macroFor(TILE_M.pavement), 0.13);
     this.macroVariation(this.sand, macro, macroFor(TILE_M.sand), 0.12);
     this.macroVariation(this.grass, macro, macroFor(TILE_M.grass), 0.22);
     this.setNight(0);
@@ -430,7 +456,8 @@ export class Materials {
     // Damp asphalt after dark: dropping the road's roughness lets the sky probe, the lamps and the neon smear along
     // the street the way a wet Vice City night does, without any reflection pass.
     this.road.roughness = SURF.road.roughnessDay + n * (SURF.road.roughnessNight - SURF.road.roughnessDay);
-    this.crosswalk.roughness = 0.8 - n * 0.22;
+    this.crosswalk.roughness = this.road.roughness;
+    this.lotAsphalt.roughness = this.road.roughness;
   }
 
   /** Scrolls the water albedo/normal UVs (opposite drifts give a moving specular) and the surf line. */
@@ -456,7 +483,7 @@ export class Materials {
   dispose(): void {
     for (let i = 0; i < STYLES.length; i++) this.building[STYLES[i]].dispose();
     this.plain.dispose(); this.glow.dispose(); this.shopfront.dispose(); this.plinth.dispose(); this.awning.dispose(); this.facade.dispose();
-    this.road.dispose(); this.crosswalk.dispose(); this.roadMark.dispose(); this.sidewalk.dispose(); this.sand.dispose();
+    this.road.dispose(); this.lotAsphalt.dispose(); this.crosswalk.dispose(); this.roadMark.dispose(); this.sidewalk.dispose(); this.sand.dispose();
     this.grass.dispose(); this.plaza.dispose(); this.pavement.dispose(); this.dirt.dispose(); this.water.dispose(); this.foam.dispose();
     this.foliage.map?.dispose(); // the leaf albedo is this material's own texture, not one of the factory's cached ones
     this.furniture.dispose(); this.palmTrunk.dispose(); this.palmFrond.dispose(); this.foliage.dispose(); this.lampPole.dispose(); this.bench.dispose(); this.hydrant.dispose();
