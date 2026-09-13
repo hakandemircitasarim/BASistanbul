@@ -23,28 +23,39 @@ Ayrıntılı sözleşmeler: `docs/GAME_DESIGN.md` (bölüm 0 = temel kurallar, 2
   747,5 bin ile tavanın üstündeydi. Tur 12 üç saat örnekledi ve **SABAHI KAÇIRDI**: 07:00 sıradan bir oyun saati ve
   19:00'dan 12,4 bin üçgen daha pahalı (alçak güneş + gölge kutusunun içindeki her şey aydınlık), yani sweep'e
   eklendi. Tur 13'ün KAPANIŞINDA on iki karenin hepsi yeniden ölçüldü (`scratchpad/pw/dv-worst.mjs <base>`, saat
-  sabit, nüfus doyana kadar bekleme: 40 yaya / 26-28 trafik), doğuş – 20 m – 40 m, üçgen bin / çizim:
-  **07:00 692,1/109 – 718,4/111 – 711,4/111**; öğlen 659,2/105 – 676,5/107 – 669,4/107;
-  19:00 690,6/109 – 706,0/111 – 705,6/111; 21:00 691,8/108 – 704,5/110 – 705,0/112.
-  **En kötü 718.374 üçgen / 111 çizim (07:00, 20 m kuzey); en çok çizim 112 (21:00, 40 m).**
-  Şafağın tepesi 07:00'dir, komşuları değil: 06:00 712,6 bin, 06:30 713,7 bin, 07:30 714,9 bin (hepsi 20 m kuzey).
+  sabit, nüfus doyana kadar bekleme: **on iki satırın on ikisi de 40 yaya / 26-28 trafik**), doğuş – 20 m – 40 m,
+  üçgen / çizim:
+  **07:00 624.646/106 – 658.351/109 – 665.212/113**; öğlen 595.302/102 – 612.935/105 – 623.156/109;
+  19:00 619.284/105 – 642.469/108 – 659.482/112; 21:00 575.080/100 – 580.697/102 – 594.198/106.
+  **En kötü 665.212 üçgen / 113 çizim (07:00, 40 m kuzey) — en çok çizim de aynı karede, 113.**
+  Uzun bekleyişli tek kare denetimi (`dv-one.mjs`, yalnız doyduktan sonra ölçer) aynı iki noktada 652.656/113 ve
+  655.219/109 okuyor: tepe değer aynı kareyi gösteriyor.
+  **Bağlayıcı KONUM artık 40 m kuzeydir, 20 m değil — dört saatin dördünde de.** Tur 13 doğuş yönünü (`CityProps.ts`
+  `playerSpawn`) PI/2'den PI/4'e çevirdi; `dv-worst.mjs` oyuncuyu ışınlar ama yön vermez, yani **her satır bu yönü
+  miras alır** ve yön değişikliği on iki karenin de neye baktığını değiştirdi. Yönü değiştiren tur tabloyu yeniden
+  ölçmek zorundadır; eski satırın "bağlayıcı konum 20 m'dir" cümlesi PI/2 yönüne aitti.
+  Şafağın tepesi yine 07:00'dir: 19:00 en kötü noktada 5,7 bin, öğlen 42,1 bin daha ucuz.
   Tabloyu 1280×720 dışında bir görüntü alanıyla ÖLÇME: bir tur-11 eleştirmeni aynı kareyi 640×360'ta 707.466 okudu
   ve tavana kalan payı 3,9 bin fazla gösterdi; LOD/paketleme kararları kare yüksekliğine bağlı.
-  **Bağlayıcı KONUM 20 m kuzeydir**, 40 m değil — dört saatin dördünde de; yalnız eski noktayı örnekleyen bir tur
-  yanlış kareyi ölçer. **Tavana kalan pay 1,6 bin üçgen** (tur 12'nin yazdığı 14,0 bin değil: o rakam yalnızca
-  {12, 19, 21}'i örnekleyen bir sweep'ten geliyordu) ve 8 çizim. Yani yeni kalıcı bir mesh pratikte YOKTUR; yaya LOD
-  kademesi gibi üçgen GERİ KAZANAN bir iş bu satırın önünde gelir. Tur 10'da orta kademe araç gövdesi
-  (`veh:mid:*`) yeniden gölge döküyor: ölçülen bedeli +11,5 bin üçgen ve +4 çizim (bandda bir düzine araçla; en kötü
-  +5, anahtar başına bir çizim). Yeni kalıcı mesh eklemeden önce bunu hesaba kat.
+  **Tavana kalan pay 54.788 üçgen ve 7 çizim.** Tur 13 kalabalığa gerçek bir LOD kademesi koyarak 718,4 binden
+  665,2 bine indi — yani "yeni kalıcı bir mesh pratikte YOKTUR" cümlesi ARTIK GEÇERLİ DEĞİL, emekli edildi; ama
+  **çizim payı üçgen payından dardır** (7 çizim), o yüzden yeni bir kalıcı *mesh* (yani yeni bir çizim çağrısı)
+  hâlâ üçgenden daha pahalı bir karardır. Tur 10'da orta kademe araç gövdesi (`veh:mid:*`) yeniden gölge döküyor:
+  ölçülen bedeli +11,5 bin üçgen ve +4 çizim (bandda bir düzine araçla; en kötü +5, anahtar başına bir çizim).
+  Yeni kalıcı mesh eklemeden önce bunu hesaba kat.
   **Saati ölçüm boyunca sabitle**: güneş `sunDir.y > -0.06` eşiğini ~19.05'te geçiyor ve geçtiği anda tüm gölge geçişi
   düşüyor (aynı nokta 742 bin yerine 457 bin okuyor), yani sabitlenmemiş ölçümler karşılaştırılamaz.
-  Nüfus da ölçümü kaydırır: kalabalık ve trafik yavaş doluyor, tavana (40 yaya / 28 trafik) oturmuş kare aynı noktada
-  ~658 bin okuyor. **Görsel bir tur kapanmadan önce on iki kareyi de yeniden ölçüp bu satırı güncelle.**
-  Karenin en büyük kalemi kalabalık (40 × 1.926 × 2 = 154,1 bin, yüzde 22 — yaya başına 1.926, eski satırın yazdığı
-  1.882 değil; sahnedeki altı `ped:part` örnekli mesh'i toplayarak ölçüldü): `PED_RENDER.cullDist` 96 m'dir, son
-  `cullFade` 6 m'de yaya `cullFloor` (0,55) boyuna iner ve menzil dışındaki yaya listeden tamamen ÇIKAR — sıfır ölçekli
-  örnek (eski 120 m kesmesinin bıraktığı şey) üçgenlerini iki geçişte birden göndermeye devam ediyordu.
-  Sıradaki ucuz kalem yayalara gerçek bir LOD kademesi.
+  Nüfus da ölçümü kaydırır: kalabalık ve trafik yavaş doluyor; doymamış bir kare aynı noktada on binlerce üçgen
+  düşük okur. **Görsel bir tur kapanmadan önce on iki kareyi de yeniden ölçüp bu satırı güncelle.**
+  Kalabalık artık karenin en büyük kalemi DEĞİL. En kötü karede canlı sayım (07:00, 40 m kuzey, doymuş):
+  **11 yakın × 1.990 × 2 geçiş + 16 uzak × 432 × 1 geçiş = 50.692 üçgen, karenin yüzde 7,8'i** (tur 12'nin yazdığı
+  "40 × 1.926 × 2 = 154,1 bin, yüzde 22" iki kez yanlıştı: 40 yayanın hepsi menzilde değil, ve artık iki kademe var).
+  `PED_RENDER.lodDist` 40 m (1,5 m histerezis): içeride altı parçalı yakın figür (1.990 üçgen, gölge döker),
+  dışarıda tek birleşik `ped:far` (432 üçgen, gölge DÖKMEZ — ölçülen bedeli 1280×720 karenin ~100 pikseli, bkz.
+  `PedRenderer` içindeki `far.castShadow` yorumu). `PED_RENDER.cullDist` 96 m'dir, son `cullFade` 6 m'de yaya
+  `cullFloor` (0,55) boyuna iner ve menzil dışındaki yaya listeden tamamen ÇIKAR.
+  Kalabalık hâlâ hiç frustum culling görmüyor (bütün yaya mesh'leri `frustumCulled = false`), yani kameranın
+  arkasındaki yayalar da üçgen gönderiyor: sıradaki ucuz kalem bu.
 - Sahnede kalıcı olarak 3 `THREE.PointLight` (lamba havuzu, `LAMP_LIGHTS`) + 2 far SpotLight durur. Gündüz yoğunlukları
   0'dır ama sahneden çıkarılmazlar (çıkarmak `NUM_POINT_LIGHTS`'ı değiştirip tüm malzemeleri yeniden derler), yani öğlen
   de her aydınlatılan parça onları hesaplar: havuz bilerek küçük tutulur.
@@ -87,8 +98,15 @@ Ayrıntılı sözleşmeler: `docs/GAME_DESIGN.md` (bölüm 0 = temel kurallar, 2
   12'nin FLOOR_H'a (3,5 m) oturttuğu silme bir kulenin bütün pencere sırasının alt üçte birini kesiyordu (rowH hiçbir
   zaman 3,5 değil: 2,94 / 3,43 / 3,92 / 6,86), yuvarlak 9 m'deki derzler de camdan geçiyordu. Süpürgelik yok: döşemenin
   zemin sırası (büyük dükkân camları) duvar dibinin 0,02 sıra üstünde başlıyor, yani güvenli bir yüksekliği yok. `WEBGL_multi_draw` gerekir.
-- Doku üretimi ana iş parçacığını bloke eder ve ilk kareden önce ödenir: sıfır argümanlı üreticilerin toplamı
-  headless harness'ta ~1,03 s (yol 242 ms, lotAsphalt 172, crosswalk 151, kaldırım 99), gezinmeden ilk kareye ~7,0 s.
+- Doku üretimi ana iş parçacığını bloke eder ve ilk kareden önce ödenir. **Tur 13 bu kalemi ölçülebilir biçimde
+  pahalılaştırdı ve tur içinde "gürültü" diye kaydedildi; gerçek rakam şu** (aynı makinede, aynı harness
+  `scratchpad/pw/rev-texgen.mjs`, aynı sunucu, 3 koşunun medyanı, sıfır argümanlı üreticilerin toplamı):
+  681b6e1'de **~1,07 s** (yol 254 ms), tur 13 kapanışında **~1,17 s** (yol **367 ms**). Yani toplam +%9, yalnız
+  `road()` +%44 — sebebi `chipClass`'ın iki sınıflı çakıl yatağı (~17,5 bin ince taş + ~4,1 bin iri taş, her biri üç
+  kez çizilir). Kapanışta eklenen `CHIP.lift` (üç asfalt karosuna birer `scaleLinear` LUT geçişi) ölçülebilir bir şey
+  eklemiyor: aynı ağaç lift'siz 1,15 s / yol 367 ms okudu. Makine yükü bu sayıyı kolayca ikiye katlar (bir tur-13
+  denetçisi meşgul makinede 1,19-1,23 s'e karşı 1,36-1,69 s okudu), bu yüzden **her zaman iki ağacı arka arkaya ölç**.
+  Gezinmeden ilk kareye ~7,0 s.
   `noiseWash` hedef tuvali havuzlanır (`washField`) ve eşli yıkamalar tek `getImageData`/`putImageData` paylaşır
   (~85 ms). Doku belleği tur 11'de **114,2 MB** GPU RGBA (mip zincirleriyle, `scratchpad/pw/texmem.mjs` ile ölçüldü)
   + zemin ailelerinin three tarafından tutulan **24 MB** CPU mip tuvali olarak ölçüldü (tur 10 `roadMarks`'ı 256'dan
@@ -120,14 +138,35 @@ Ayrıntılı sözleşmeler: `docs/GAME_DESIGN.md` (bölüm 0 = temel kurallar, 2
 ```sh
 npm run typecheck   # tsc, sıfır hata
 npm run lint        # 0 hata (1 shadcn uyarısı bilinen)
-npm test            # 74 birim + simülasyon testi, tarayıcı gerekmez
+npm test            # 75 birim + simülasyon testi, tarayıcı gerekmez
 npm run build
 npm run shot -- "http://127.0.0.1:8080/?autostart=1&hour=19" out.png   # headless ekran görüntüsü
 ```
 
 Görsel değişikliklerde ekran görüntüsü alıp **bakmadan** "bitti" denmez.
-Hata ayıklama URL'leri: `?autostart=1 &hour=19 &quality=low|high &seed=7 &stars=2 &nearcar=1 &debug=1`,
-render kum havuzu: `/rendertest?hour=19`.
+Hata ayıklama URL'leri: `?autostart=1 &hour=19 &quality=low|high &seed=7 &stars=2 &nearcar=1 &debug=1 &ao=0|1|2`,
+render kum havuzu: `/rendertest?hour=19&view=plaza|beach|spawn|neon|fx&cam=x,y,z&look=x,y,z&ao=0`.
+
+## Ölçüm disiplini (bu kurallar pahalıya öğrenildi — atlama)
+
+- **Bir render iddiasını ÖNCE ölç.** Tur 11, 12 ve 13'te üç ayrı "regresyon" yanlış çıktı ve üçü de aynı iki
+  sebepten geldi: çalışma zamanı düğmesiyle (runtime toggle) yapılan A/B, ve etkinin görünmediği bir kadraj.
+  A/B **kaynak düzenlemesi + tam sayfa yeniden yüklemesiyle** yapılır.
+- **Paralel ajanlar A/B'yi ÖZEL bir ağaç kopyasında yapar** (`git archive HEAD | tar -x` ile kendi dizinine, kendi
+  portunda kendi vite'ı). Tur 13'te ortak ağaçta ölçen iki ajan birbirinin `scene.environment = null` /
+  `castShadow = false` düzenlemelerini buldu, birini "geri aldı" ve bir yanlış sonuç üretti.
+- **`&ao=0` olmadan `/rendertest`'te ölçme.** Kum havuzu GTAO'yu varsayılan olarak AÇIK başlatır, oyun ise kapalı
+  koşar (`GameStore` `ao: false`) — yani `&ao=0`'sız her kum havuzu A/B'si sevk edilenden başka bir boru hattını
+  ölçer. (`?ao=1` artık gerçekten renderer'a ulaşıyor; tur 13'e kadar `Engine.init` `this.renderer`'ı atamadan önce
+  `applySettings` çağırdığı için sessizce hiçbir şey yapmıyordu. **Varsayılanı açma**: öğlen +590.676 üçgen / +75 çizim.)
+- **Üç harness tuzağı**, her biri bir ajana birer saate mal oldu:
+  1. Oyun tuvalinde `preserveDrawingBuffer` YOK: sayfa içinde `drawImage` ile piksel okumak siyah döndürür.
+     Ekran görüntüsü al, sonra PNG'yi ölç.
+  2. `loop.timeScale = 0` ile simülasyonu dondurup SONRA `world.time.hour`'u sabitlemek güneş VEKTÖRÜNÜ eski saatte
+     bırakır (`DayNightSystem.refresh` artık koşmaz), gökyüzü ise yeni saate gider. Saati önce sabitle, güneşin
+     oturması için bekle, sonra dondur.
+  3. Headless sayfa 1 fps'in ALTINDA çiziyor: bir `page.evaluate` son yazından beri bir kare çizildiğini garanti
+     etmez. Sahneye bir şey yerleştirdikten sonra okumadan önce ~1,5 s bekle.
 
 ## Dil
 

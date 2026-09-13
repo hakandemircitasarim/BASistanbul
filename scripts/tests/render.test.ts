@@ -10,6 +10,7 @@ import type { BufferGeometry } from 'three';
 import { Random } from '../../src/game/core/Random';
 import { SHADOW_PENUMBRA, SHADOW_RADIUS, SKY_KEYS } from '../../src/game/render/SkySystem';
 import { ContactShadows, SHADOW_TUNING, groundYAt } from '../../src/game/render/ContactShadows';
+import { CAR_SHADOWS, FURN_SHADOWS } from '../../src/game/render/CityRendererProps';
 import { BUDGET } from '../../src/game/core/Budget';
 import { BLOCK, CURB_H, PITCH, ROAD_W, SIDEWALK_W } from '../../src/game/city/CityConfig';
 import { VEHICLE_RENDER, shadowExtent } from '../../src/game/render/VehicleRenderer';
@@ -442,6 +443,10 @@ test('SkySystem: the shadow chunk is patched for both a soft penumbra and the bo
   // taps leaves an ordered, screen-stable crosshatch over every soft shadow edge in the frame - measured on the
   // promenade at 15:00, where it was the most conspicuous engine artefact in a 2560 x 1440 crop. The taps must read
   // the ramped angle, not `phi`, or the weave is straight back.
+  //   Round 13 note: the gate (SHADOW_DITHER.fromTexels 8) is set ABOVE the widest disk the game can produce
+  // (softRadius <= SHADOW_RADIUS = 6 texels), so at today's settings the rotation NEVER engages and the ramp is
+  // identically zero. This assertion is therefore not guarding a visible behaviour - it keeps the MECHANISM from
+  // being deleted, so that raising SHADOW_RADIUS past 8 brings the rotation back instead of bringing the weave back.
   expect(chunk.includes('float tapPhi = phi *'), 'the disk rotation is ramped with softRadius, not applied flat');
   expect(!/vogelDiskSample\( \d+, 7, phi \)/.test(chunk), 'no tap still uses the unramped screen-space rotation');
   // Round 13: the probe directions stay PINNED (spinning them by phi dithers the penumbra WIDTH, which is the same
@@ -522,10 +527,15 @@ test('BuildingGeometry: the roof cornice carries its own shadow line (a vertex r
 test('contact shadow slices: the shared blob mesh covers every renderer that reserves one', () => {
   // The blob field hands out ONE contiguous slice per renderer at construction and silently clamps whatever is left
   // (reservedRoom), so the last renderer to build is the one that quietly loses blobs. The slices are, in Engine's
-  // construction order: VehicleRenderer 96, PedRenderer MAX_PEDS, PlayerRenderer 1 and PropRenderer's parked cars
-  // (CityRendererProps' CAR_SHADOWS.cap, 44 — sized so the pick is a range cut, never a rank cut).
+  // construction order: VehicleRenderer 96, PedRenderer MAX_PEDS, PlayerRenderer 1, PropRenderer's parked cars
+  // (CAR_SHADOWS.cap, sized so the pick is a range cut, never a rank cut) and — LAST, therefore the one at risk —
+  // PropRenderer's street furniture (FURN_SHADOWS.cap). Both caps are read from the module, never repeated here: a
+  // test that hard-codes the number it is guarding cannot fail when someone raises the number.
   const scene = new Scene();
-  const want: [string, number][] = [['vehicles', 96], ['peds', BUDGET.MAX_PEDS], ['player', 1], ['parked cars', 44]];
+  const want: [string, number][] = [
+    ['vehicles', 96], ['peds', BUDGET.MAX_PEDS], ['player', 1],
+    ['parked cars', CAR_SHADOWS.cap], ['street furniture', FURN_SHADOWS.cap],
+  ];
   let total = 0;
   for (const [name, n] of want) {
     const slice = new ContactShadows(scene, n);

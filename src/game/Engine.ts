@@ -178,11 +178,15 @@ export class Engine {
     }
     const renderer = new Renderer(this.canvas, settings);
     if (this.options.noAdapt) renderer.adaptive = false;
+    // ORDER MATTERS, and it was wrong for three rounds: `this.renderer` has to be set BEFORE applySettings, because
+    // applyRenderSettings is guarded by `if (this.renderer)`. Assigned after, `?ao=1` and `?ao=2` wrote the store and
+    // reached nothing, so the shipped game ran with GTAO off while /rendertest defaults it ON — i.e. every sandbox
+    // A/B taken without `&ao=0` was measuring a different pipeline from the one that ships.
+    this.renderer = renderer;
     if (this.options.ao !== undefined) {
       renderer.aoDebug = this.options.ao === 2;
       this.applySettings({ ao: this.options.ao !== 0 });
     }
-    this.renderer = renderer;
     this.camera = new CameraController(renderer.camera, this.world, this.input, this.ctx.settings, this.events);
     this.ctx.camera = this.camera;
     // Let the loading screen paint before the synchronous city build (~100s of ms).
@@ -211,7 +215,9 @@ export class Engine {
     this.canvas.addEventListener('click', this.onClick);
     for (let i = 0; i < this.systems.length; i++) this.systems[i].init?.(this.ctx);
     this.dayNight.setHour(this.options.hour ?? START_HOUR);
-    this.applyRenderSettings(settings);
+    // From the STORE, not from the `settings` snapshot taken at the top of init: that local is stale by now (the
+    // `?ao=` branch above writes the store through applySettings), and replaying it here put the flag straight back.
+    this.applyRenderSettings(this.store.getState().settings);
     this.setPhase('menu');
     await new Promise<void>((resolve) => {
       this.firstFrameResolve = resolve;

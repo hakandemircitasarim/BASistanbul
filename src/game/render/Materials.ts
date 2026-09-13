@@ -75,7 +75,7 @@ const FACADE_GRAIN = { tile: [2.6, 4.6] as const, amount: 0.3, amountCurtain: 0.
  * lane paint at 0.55 via the map, stone and concrete 0.85-0.95, canvas 0.9) so light behaves differently on each.
  */
 const SURF = {
-  building: { roughness: 1, metalness: 0.04, env: 0.75, envGlass: 1.2 },
+  building: { roughness: 1, metalness: 0.04, env: 0.75 },
   plain: { roughness: 0.88, metalness: 0.05, env: 0.5 },
   road: { roughnessDay: 0.85, roughnessNight: 0.6, metalness: 0.03, env: 0.45 },
   ground: { roughness: 0.94, metalness: 0, env: 0.35 },
@@ -128,6 +128,31 @@ const SURF = {
  * no lift is a one-sided loss, which is what it cost the rooflines the first time round 11 tried it.
  */
 const GROUND_DAY_LIFT = 1.22;
+/**
+ * Night albedo cut on the BEACH SAND alone, ramped in over the same n > 0.9 window SkySystem hands the key to the
+ * moon on. It exists because the beach is the one surface in the game where a high albedo and a strong night key
+ * multiply into a level the sky cannot justify: at 21:00 in /rendertest's beach view the sand read 55.6/255 against
+ * a 35.0 sea and a 15.0 SKY — 3.7x the luminance of the dome that is supposedly lighting it, which no diffuse
+ * surface can be. Round 13 took the daylight half of this (the albedo itself, TextureFactory.sand's scaleLinear
+ * 0.55) and left the night half.
+ *
+ * WHY NOT THE MOON KEY, which is the real cause. Measured, source edit + reload on a private tree, five
+ * /rendertest views: SkySystem's `sun.intensity = 0.5 * L` halved to 0.25 * L takes the sand 55.60 -> 42.21 and the
+ * sea 34.98 -> 29.12 — but it also takes the whole 21:00 plaza frame 57.91 -> 49.30 (-8.61/255, -14.9 %) and the
+ * neon frame 70.70 -> 67.10. A third of the night city's light IS the moon key, and the round-13 reviewers passed
+ * that grade as intact to within 0.08/255. So the key stays and the cut lands on the one family that cannot carry it.
+ * (Both 19:00 controls were byte-identical in that A/B, spawn 73.88 and plaza 103.32 either way: the moon gate is
+ * n > 0.9 and 19:00 is n = 0.36, so nothing here can reach a dusk frame — which is also why this ramp uses the same
+ * window rather than n itself.)
+ *
+ * RESULT, same view and rects: sand 55.60 -> **40.09**, i.e. from 1.16x the sea (47.81, the rect with the moon path
+ * in it) and 3.7x the sky down to 0.84x the sea and 2.7x the sky — the beach stops being the brightest thing in a
+ * night frame. Nothing else in the frame moves: the amplified difference map is the sand and only the sand (sea
+ * 47.81 -> 47.84, sky 15.00 -> 14.97), the 19:00 beach is 85.37 -> 85.37 whole-frame and 50.92 -> 50.93 on the sand,
+ * and the 12:00 beach 161.08 -> 161.09 / 156.57 -> 156.58. Do not chase the remaining 2.7x: the sky rect is the
+ * ZENITH, the horizon band it is actually lit by is far brighter, and below ~35 the beach is a black hole.
+ */
+const SAND_NIGHT_DIM = 0.5;
 /** Base albedo tints of the ground families that have one, so GROUND_DAY_LIFT can scale them without drift. */
 const GROUND_TINT = { pave: 0xaea89c, dirt: 0x5a4e3c } as const;
 
@@ -258,8 +283,15 @@ export class Materials {
         // the glazing catches the sky and the render around it does not.
         // 0.45: the relief is a high-passed albedo, and at 0.75 the plaster mottle rippled like wet watercolour.
         normalMap: w.normal, normalScale: new THREE.Vector2(0.45, 0.45), roughnessMap: w.rough,
-        // The curtain wall bakes a sky-to-slate reflection into its albedo and leans harder on the sky probe over it.
-        roughness: SURF.building.roughness, metalness: SURF.building.metalness, envMapIntensity: style === 'glass' ? SURF.building.envGlass : SURF.building.env,
+        // `envMapIntensity` here is DEAD and is written only so the field is not undefined: three overwrites it with
+        // `scene.environmentIntensity` on every draw (see the probeScale block above), and since round 13 all five
+        // styles take their probe share from the shared `probeFacade` holder. There used to be a `SURF.building
+        // .envGlass` 1.2 behind a `style === 'glass'` ternary here, promising that the curtain wall "leans harder on
+        // the sky probe"; it had not been able to do anything for two rounds, and the round that built the one
+        // mechanism that COULD have carried it put all five styles on one holder instead. Deleted rather than left
+        // reading as live. What the curtain wall really gets is `facadeSurfacePatch(..., true)` on the line below:
+        // a per-pane `uPaneEnv` lift inside the shader, which is chained onto the same holder and is real.
+        roughness: SURF.building.roughness, metalness: SURF.building.metalness, envMapIntensity: SURF.building.env,
       });
       this.facadeSurfacePatch(this.building[style], tex.detailNormal(), style === 'glass' || style === 'neon');
     }
@@ -641,7 +673,10 @@ export class Materials {
     this.roadMark.color.setScalar(lift);
     this.plaza.color.setScalar(lift);
     this.grass.color.setScalar(lift);
-    this.sand.color.setScalar(lift);
+    // Sand is cut at full night on top of the lift (see SAND_NIGHT_DIM); `moonN` is 0 until SkySystem hands the key
+    // to the moon at n > 0.9, so every dusk frame is untouched.
+    const moonN = Math.max(0, (n - 0.9) * 10);
+    this.sand.color.setScalar(lift * (1 - SAND_NIGHT_DIM * moonN));
     this.sidewalk.color.setHex(GROUND_TINT.pave).multiplyScalar(lift);
     this.pavement.color.setHex(GROUND_TINT.pave).multiplyScalar(lift);
     this.dirt.color.setHex(GROUND_TINT.dirt).multiplyScalar(lift);

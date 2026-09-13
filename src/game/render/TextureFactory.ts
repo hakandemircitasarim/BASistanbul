@@ -128,11 +128,11 @@ const GROUND_ANISO = 8;
  * Exposed chippings on the asphalt tiles (see chipBed). Sizes are METRES, resolved against the tile's own px/m, so
  * the bed stays the same physical size whatever resolution the tile is drawn at.
  *
- * TWO SIZE CLASSES, because one cannot do both jobs. The `fine` class (4.0-7.8 cm, 3-6 texels at the road's 73 px/m)
- * is the surface a driver's eye lands on at two metres; it is gone by mip 2 and that is correct, because at 8 m a
- * 4 cm stone is a third of a screen pixel and anything still drawing it there is drawing static. The `coarse` class
- * (6.5-13 cm, 5-9.5 texels) is the one that has to SURVIVE the mip chain: mip 1 still holds two to five texels of it
- * and mip 2 one to two, so it is still a stone at 10 m where the fine bed has averaged to flat tone. That is the
+ * TWO SIZE CLASSES, because one cannot do both jobs. The `fine` class (3.8-7.2 cm, i.e. 2.8-5.3 texels at the road's
+ * 73 px/m) is the surface a driver's eye lands on at two metres; it is gone by mip 2 and that is correct, because at
+ * 8 m a 4 cm stone is a third of a screen pixel and anything still drawing it there is drawing static. The `coarse`
+ * class (5.5-10.5 cm, 4.0-7.7 texels) is the one that has to SURVIVE the mip chain: mip 1 still holds two to four
+ * texels of it and mip 2 one to two, so it is still a stone at 10 m where the fine bed has averaged to flat tone. That is the
  * whole reason round 10's single-class bed measured as an untextured plane at ten metres.
  *
  * THREE DEFINITE TONES, never a ramp: a pale stone, a mid stone and a dark one, each drawn flat. A continuous value
@@ -166,6 +166,8 @@ const CHIP = {
   },
   /** The tone deck. `shares` above splits the population pale / mid / rest-is-dark. */
   pale: [186, 179, 163], mid: [118, 114, 104], dark: [14, 13, 11],
+  /** Gain in LIGHT that puts the bed's net darkening back (see aggregate); tuned to the road canvas mean, not guessed. */
+  lift: 1.14,
 } as const;
 /** One size class of the asphalt chip bed (CHIP.fine / CHIP.coarse). Sizes and cluster radii are metres. */
 type ChipClass = {
@@ -2714,7 +2716,21 @@ export class TextureFactory {
     // and everything between is left alone. That is the "two or three deliberate flat tonal bands" the surface wants.
     this.noiseWash(ctx, S, S, this.valueNoise('bitumenA', 256, 3, 3, 0.5, 613, 0.5), S, 0.055,
       this.valueNoise('bitumenB', 256, 11, 4, 0.5, 2207, 0.5), S, 0.06, 1, 2);
-    if (chipOff >= 0) this.chipBed(ctx, S, chipOff);
+    if (chipOff >= 0) {
+      this.chipBed(ctx, S, chipOff);
+      // LEVEL COMPENSATION, and it is not optional. The three-tone deck above is net DARKENING: the dark stone
+      // (14/13/11 at alpha 0.15-0.35) takes more light out than the pale one (186/179/163 at 0.085-0.23) puts back on
+      // 46-level bitumen, and the deck also feeds the relief map, so a rougher road turns more of itself away from the
+      // sun. Shipped uncompensated, round 13 took the road's albedo canvas mean 56.61 -> 53.23 and the RENDERED near
+      // road (spawn view, 3-6 m, rect 700,600 380x110) 81.30 -> 71.84 at noon, 30.38 -> 26.81 at 19:00 and
+      // 28.19 -> 24.40 at 07:00 — a 12-13 % level cut at every hour that no measurement in the round asked for, on a
+      // surface that is already the darkest large area in the frame. Pavement in the same frames moved 0.07/255.
+      //   CHIP.lift puts the ALBEDO back where it was, in LIGHT (see scaleLinear), leaving the relief's own shading
+      // alone: the extra darkening a bumpier surface earns under a real sun is the point of the bed and is kept. It
+      // lands here, after the bed and before every crisp part (cracks, manhole, drain, lane paint), so no marking is
+      // touched; a uniform gain in light also cannot flatten what the bed just built.
+      this.scaleLinear(ctx, S, S, CHIP.lift);
+    }
   }
 
   /**
@@ -2728,8 +2744,8 @@ export class TextureFactory {
    * That is the difference between a material and speckle, and it is the same argument the flat tone bands elsewhere
    * in this file are made of - these are small flat plates of stone, not a grain field.
    *
-   * Scale is chosen against the mip chain, not against real chippings (which would be one texel): CHIP.min..max is
-   * 3-6 texels, so mip 1 still holds 1.5-3 of them and mip 2 about one, i.e. the bed reads as stone out to ~8 m,
+   * Scale is chosen against the mip chain, not against real chippings (which would be one texel): the two classes run
+   * 2.8-5.3 and 4.0-7.7 texels, so mip 1 still holds 2-4 of the coarse ones and mip 2 about one, i.e. it reads as stone out to ~8 m,
    * has become tone by ~20 m and is gone before it can crawl. Contrast is deliberately low (the pale stone lifts a
    * mid texel by ~8/255 at its strongest) because the ground normal map is a high-pass of THIS canvas: every chip is
    * also a bump, and at twice this contrast the road glittered under a low sun and the pale stones read as confetti
@@ -3399,8 +3415,10 @@ export class TextureFactory {
     // 36.9 sea, i.e. six times the luminance of the sky lighting it, which no diffuse surface can be. Measured at
     // source, 55 % of that came from the moon key (sand 93.2 -> 42.3 with SkySystem's night `sun.intensity` zeroed)
     // and 16 % from the night hemisphere lift (-> 78.7 with SkySystem's `+ nightFactor * 3.2` zeroed); an albedo
-    // this high simply multiplies every one of those terms. 0.62 of linear puts the beach at a 0.34 albedo, which
+    // this high simply multiplies every one of those terms. 0.55 of linear puts the beach at a 0.30 albedo, which
     // is dry quartz sand, and scales all three terms with it. Applied in LIGHT, not on the bytes (see scaleLinear).
+    // (0.55, not the 0.62 an earlier draft of this comment named: 0.62 would land at 0.34, and 0.55 is the constant
+    // every measurement in this block was taken with.)
     this.scaleLinear(ctx, S, S, 0.55);
     return this.finish(key, canvas, true);
   }

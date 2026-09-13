@@ -111,6 +111,15 @@ const SHADOW_TAPS = 7;
  *
  * The ramp is kept, not deleted: it is the mechanism that would bring the rotation back if SHADOW_RADIUS ever went
  * past 8 texels, where a 7-tap disk really would start to scallop.
+ *
+ * WHILE `fromTexels` > SHADOW_RADIUS THE RAMP IS IDENTICALLY ZERO AND `spanTexels` HAS NO EFFECT AT ALL. three's PCF
+ * branch computes `radius = shadowRadius * texelSize.x` (shadowmap_pars_fragment.glsl.js:132, and that IS the branch
+ * in use — Renderer.ts sets THREE.PCFShadowMap), `softRadius` never exceeds `radius`, and SHADOW_PENUMBRA's ladder
+ * sums to exactly 1, so `softRadius / texelSize.x <= SHADOW_RADIUS` = 6 < 8 and the clamp is 0 whatever spanTexels
+ * says. That is deliberate — the whole point is that the rotation never engages at today's disk — but it does mean
+ * `phi` is still evaluated per shadowed fragment to be multiplied by zero (the compiler cannot fold it: the clamp's
+ * argument is a runtime value). Anyone tuning `spanTexels` and seeing no pixel move is not looking at a broken
+ * measurement; raise SHADOW_RADIUS past `fromTexels` first, or the knob is dead.
  */
 const SHADOW_DITHER = { fromTexels: 8, spanTexels: 3 } as const;
 /**

@@ -579,9 +579,17 @@ export class PedRenderer {
     this.far.name = 'ped:far';
     this.far.count = 0;
     this.far.frustumCulled = false;
-    // The far tier is NOT a shadow caster. Past the tier line a ped's cast shadow is a handful of pixels at a
-    // contrast the round-13 shadow survey measured at 5-6/255 against an 8/255 visibility bar, and beyond the sun's
-    // 132 m shadow box (SKY_TUNING.shadowBox, half-extent 66 m about the player) it is not in the shadow map at all.
+    // The far tier is NOT a shadow caster, and this is MEASURED, not the "5-6/255 against an 8/255 bar" the round-13
+    // package claimed (a per-pixel depth, which is the wrong statistic and did not reproduce for its reviewer). The
+    // right statistic is AREA, and it was taken on the shipped chase camera with a source-edit A/B on a private tree
+    // (`castShadow = false` vs `true`, full page reload, `scratchpad/pw/fx-farped.mjs`): 16 peds staged in a
+    // 42-60 m block on OPEN SUNLIT lot asphalt at (965, 500), clock pinned, sim frozen, 1280x720. Turning the far
+    // tier's shadow ON changes **105 px of the frame at noon (0.47 % of the 320x70 rect the row stands in, 0.01 % of
+    // the frame) and 81 px at 07:00**, and under a 4x amplified diff they are 1-2 px dashes at the figures' feet.
+    // It costs +432 triangles per far ped and +1 draw: at the budget's worst frame (20 on the far tier) +8,640 tri.
+    //   Note for anyone re-opening this: 12 of those 20 stand INSIDE the sun's 132 m shadow box
+    // (SKY_TUNING.shadowBox, half-extent 66 m about the player), so this is NOT the box doing the culling — it is a
+    // deliberate cut, and the 100 pixels above are what it costs. Peds beyond 66 m are not in the shadow map at all.
     // Those triangles were the cheapest in the frame to give back: the whole crowd's shadow pass was 6 draw calls.
     this.far.castShadow = false;
     this.far.instanceMatrix.setUsage(THREE.DynamicDrawUsage);

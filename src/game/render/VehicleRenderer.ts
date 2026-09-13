@@ -1287,11 +1287,16 @@ function bakedWheels(out: THREE.BufferGeometry[], s: VehicleSpec, profile: Vehic
       // Sidewall a touch lighter than the tread: a tyre seen side-on is not one black mass.
       out.push(shade(decorate(tyre, kind === 'mid' ? TYRE_BLACK : TYRE_LOD, MATTE_MIX), (px) => (Math.abs(px - x) > w * 0.28 ? 1.45 : 1)));
       for (let e = -1; e <= 1; e += 2) {
-        // Set well inside the bead and kept dark: an alloy is a recessed dish in shadow, not a hubcap. At 0.63 r and
-        // near its own albedo the disc read as a white plate filling the tyre, which is worse than no rim at all.
-        const face = new THREE.CircleGeometry(r * 0.55, seg);
+        // Kept dark: an alloy is a recessed dish in shadow, not a hubcap. At near its own albedo the disc read as a
+        // white plate filling the tyre, which is worse than no rim at all — so the tone, not the radius, is the knob.
+        // The radius IS the bead's (0.62 r, the tube's own end ring) and the disc sits ON the bead plane, because a
+        // smaller disc parked behind the bead leaves an open annulus whose only wall is the tyre's inside: back-facing,
+        // culled, and therefore a ring-shaped hole through the wheel. Measured at 11 m on the shipped tree (mid tier,
+        // /rendertest cam 1033.5,1.1,650 look 1028.75,0.5,641.5, noon): neutering gl.enable(CULL_FACE) changed 5.84 %
+        // of an 80x70 rect on the wheel by a mean 21.8/255. Sealing it costs nothing — same fan, same `seg`.
+        const face = new THREE.CircleGeometry(r * 0.62, seg);
         face.rotateY(e > 0 ? Math.PI / 2 : -Math.PI / 2);
-        face.translate(x + e * (w * 0.5 - 0.01), r, z);
+        face.translate(x + e * w * 0.5, r, z);
         const lit = kind === 'mid' ? 0.78 : 0.95, dish = kind === 'mid' ? 0.42 : 0.6;
         out.push(shade(decorate(face, LOD_RIM, MATTE_MIX), (_px, py, pz) => (Math.hypot(py - r, pz - z) < r * 0.22 ? lit : dish)));
       }
@@ -1299,7 +1304,7 @@ function bakedWheels(out: THREE.BufferGeometry[], s: VehicleSpec, profile: Vehic
     }
     // Tyre: rings along the axle (authored about y, rotated onto x with the rest). The tread pulls in hard at both
     // sidewalls, so the outer face is a narrow bead ring rather than the flat black wall a plain cylinder shows. The
-    // bead seat lands on the rim barrel's own radius below, so the tyre seals on the rim instead of leaving an open
+    // bead seat lands on the alloy dish's own rim radius below, so the tyre seals on the rim instead of leaving an open
     // bore whose back faces read as a black hole around the alloy.
     const rimR = r * 0.55;
     const tyre = tube([
@@ -1318,8 +1323,7 @@ function bakedWheels(out: THREE.BufferGeometry[], s: VehicleSpec, profile: Vehic
       if (rad >= 0.74) return 1.0; // moulded sidewall crest
       return rad >= 0.62 ? 0.72 : 0.5; // sidewall down to the bead seat, deep in the rim's shadow
     }));
-    // Alloy: the LATHED wheel's arrangement — a barrel through the bead and a dish face set 5 cm inside it — instead
-    // of the flat plate this grade used to lay in the plane of the tyre.
+    // Alloy: a dished face sunk into the bead, instead of the flat plate this grade used to lay in the plane of the tyre.
     //
     // That plate was a two-ring lathe at EIGHT sides, capped on both faces. Measured in /rendertest abeam a lot car at
     // 3.1 m (camera 1028.75/0.45/644.6, 1280x720, noon): the wheel is 242 px across there and the plate filled 154 px
@@ -1327,19 +1331,40 @@ function bakedWheels(out: THREE.BufferGeometry[], s: VehicleSpec, profile: Vehic
     // the round-12 critique. It IS the near tier that draws it (prop:parkedNear holds that car; the 8 m hand-over is
     // doing its job), so the fix is the mesh, not the tier distance. Three things, none of them a new draw call:
     //  - `seg` 16 at the near grade, as the lathed wheel, so bead and rim are curves at arm's length;
-    //  - the dish is RECESSED and the rim barrel behind it is a real surface, so the alloy reads by its depth break
-    //    rather than by its outline, which no segment count can fix on a flat plate;
+    //  - the dish is RECESSED, so the alloy reads by its depth break rather than by its outline, which no segment
+    //    count can fix on a flat plate;
     //  - a five-lobe spoke fan in the vertex colours. A blade of geometry would be 7 x 2 x 16 triangles a wheel for a
     //    shape the size of a fingernail, and a lobe count that does not divide `seg` keeps the fan off the facet grid.
-    const barrel = new THREE.CylinderGeometry(rimR, rimR, w, seg, 1, true);
-    barrel.rotateZ(Math.PI / 2);
-    barrel.translate(x, r, z);
-    out.push(shade(decorate(barrel, LOD_RIM, MATTE_MIX), () => 0.42)); // deep in the bead's shadow
+    // TUR 13 KAPANIŞI — the recess must not be a POCKET. Round 13 shipped the dish as a flat disc parked DISH_DROP
+    // behind the bead, with an open-ended rim barrel through the bore. That leaves a cylindrical pocket whose only
+    // wall is the barrel's INSIDE, and vehicle paint is FrontSide (makeVehiclePaintMaterial sets no `side`), so the
+    // wall is culled and an oblique eye looks straight through the bore to the street behind the car. Measured in
+    // /rendertest at a lot car 1.8 m away, 29 deg off the axle (cam 1029.67,0.43,643.04 look 1028.75,0.36,641.5, noon,
+    // 1280x720, `scratchpad/r1-bore2.mjs`): re-rendering the same frame with gl.enable(CULL_FACE) neutered changed
+    // 15.58 % of a 240x360 rect on the wheel by a mean 61/255, and the crescent that lit up was the kerb and the road
+    // showing THROUGH the bore. Not subtle; it was only missed because the abeam A/B that signed the wheel off looks
+    // down the one axis where 0.05 * tan(theta) is zero.
+    //   The fix keeps the depth and loses the pocket: the same fan of `seg` triangles, its rim ring welded to the
+    // bead plane at rimR (the tyre's own end ring, same `seg` and the same sin/cos parameterisation, so the two
+    // polygons share their vertices) and only its CENTRE dropped DISH_DROP inboard. One closed outward-facing
+    // surface with nothing behind it, at the same triangle count. The barrel is then enclosed by the two dishes and
+    // can never be seen, so it goes with the pocket: -2 * seg triangles a wheel on top of the fix. Measured at the
+    // budget camera (/rendertest 07:00, cam 1029.85,2.25,615.85 look 1036,1.9,615): 493,082/79 -> 492,570/79, and the
+    // same cull A/B on the same 240x360 rect falls from 15.58 % to 0.02 % (19 px of 1-px silhouette edge).
+    const DISH_DROP = 0.05;
     for (let e = -1; e <= 1; e += 2) {
+      // Built as the fan it always was — a CircleGeometry welded to the bead plane — with only its CENTRE vertex
+      // pushed inboard. (THREE.ConeGeometry is the wrong primitive here: a cone whose apex points away from the eye
+      // shows the eye its INSIDE, which is the back face, so it culls to nothing. Same fan, reversed.)
       const face = new THREE.CircleGeometry(rimR, seg);
       face.rotateY(e > 0 ? Math.PI / 2 : -Math.PI / 2);
-      face.translate(x + e * (w * 0.5 - 0.05), r, z);
-      // The fan's centre vertex carries the hub tone and its rim ring the lobes, so every wedge is a spoke widening
+      face.translate(x + e * w * 0.5, r, z);
+      const fp = face.attributes.position as THREE.BufferAttribute;
+      for (let i = 0; i < fp.count; i++) {
+        if (Math.hypot(fp.getY(i) - r, fp.getZ(i) - z) < 1e-6) fp.setX(i, fp.getX(i) - e * DISH_DROP);
+      }
+      face.computeVertexNormals(); // smooth: the dish reads as a pressed bowl, not a faceted funnel
+      // The fan's apex carries the hub tone and its rim ring the lobes, so every wedge is a spoke widening
       // out of the hub rather than a painted line across a plate.
       out.push(shade(decorate(face, LOD_RIM, MATTE_MIX), (_px, py, pz) => {
         const rad = Math.hypot(py - r, pz - z) / rimR;

@@ -1051,7 +1051,7 @@ const CAR_TIER_MOVE = 1.5;
  * SHADOW_TUNING.penumbra of soft edge. Computed off the spec, not off the loft's own hw / hl, which sit inboard of
  * the tyres and short of the bumpers - blobs sized from those never got their dark part out from under the car.
  */
-const CAR_SHADOWS = {
+export const CAR_SHADOWS = {
   cap: 44, range: 46, lift: 0.045,
   /**
    * Where the blob starts fading out. It used to be nowhere: every picked car got `fade` 1 and the 46 m range cut the
@@ -1074,7 +1074,7 @@ const CAR_SHADOWS = {
  * silently clamped. 24 covers everything inside `range` on a dressed pavement; past that a missing pool is a few
  * pixels wide.
  */
-const FURN_SHADOWS = { cap: 24, range: 30, fadeFrom: 22, lift: 0.012 } as const;
+export const FURN_SHADOWS = { cap: 24, range: 30, fadeFrom: 22, lift: 0.012 } as const;
 
 /**
  * Footprint half-extents of one furniture geometry, measured from the vertices in the bottom `FOOT_BAND` of it rather
@@ -1374,7 +1374,14 @@ export class PropRenderer {
     const FG = { bench: 0, hydrant: 1, bin: 2, sign: 3, shelter: 4, bollard: 5, island: 6, planter: 7, pole: 8, roadsign: 9, dumpster: 10, table: 11 } as const;
     /** Kinds that get a contact blob: the things with a real footprint on the floor (see FURN_SHADOWS). Posts, poles,
      * signs, hydrants and bollards are excluded — a 10 cm stem under a 1 m pool reads as a stain, not as contact — and
-     * so is the bus shelter, whose floor is open and lit. */
+     * so is the bus shelter, whose floor is open and lit.
+     *
+     * This map is the ONLY list: `groundedN` below sizes the registry by summing `counts`/`lotCounts` over its own
+     * keys, so adding a kind here allocates its slots. It used to be two hand-written lists, and the failure between
+     * them was silent — an out-of-range write to a Float32Array is discarded by the language, so a kind added here and
+     * forgotten there simply never got a blob, with no error anywhere. `ground()` also bounds-checks now.
+     * `hedge` is in the map for the sizing and for the record, but hedges are grounded in their OWN placement branch
+     * (they live in the foliage batch, not `furnG`), so they never reach the `GROUNDED[p.kind]` test below. */
     const GROUNDED: Partial<Record<Prop['kind'] | LotProp['kind'], true>> = { bench: true, bin: true, dumpster: true, table: true, hedge: true, planter: true };
     // Every part of the foliage batch goes through leafSurface: the leaf albedo's UVs (the material carries the map),
     // the per-facet value jitter and the `leafMix` mask that keeps the map and the translucency emissive off the bark
@@ -1509,7 +1516,10 @@ export class PropRenderer {
     // The glow quad is filled by repackLampGlow instead (one disc per in-range lamp).
     this.lampGlowMesh = glowM;
     // Grounded furniture registry (see FURN_SHADOWS): flat arrays in placement order, filled as the props are placed.
-    const groundedN = counts.bench + counts.bin + counts.dumpster + counts.table + counts.hedge + lotCounts.planter;
+    let groundedN = 0;
+    for (const k of Object.keys(GROUNDED) as (Prop['kind'] | LotProp['kind'])[]) {
+      groundedN += (k in counts ? counts[k as Prop['kind']] : 0) + (k in lotCounts ? lotCounts[k as LotProp['kind']] : 0);
+    }
     this.furnX = new Float32Array(Math.max(1, groundedN));
     this.furnZ = new Float32Array(Math.max(1, groundedN));
     this.furnYaw = new Float32Array(Math.max(1, groundedN));
@@ -1517,6 +1527,7 @@ export class PropRenderer {
     this.furnHW = new Float32Array(Math.max(1, groundedN));
     this.furnHL = new Float32Array(Math.max(1, groundedN));
     const ground = (x: number, z: number, yaw: number, y: number, scale: number, f: { hw: number; hl: number }): void => {
+      if (this.furnCount >= this.furnX.length) throw new Error('grounded furniture registry overflow (GROUNDED / counts disagree)');
       const i = this.furnCount++;
       this.furnX[i] = x; this.furnZ[i] = z; this.furnYaw[i] = yaw; this.furnY[i] = y;
       this.furnHW[i] = f.hw * scale; this.furnHL[i] = f.hl * scale;
