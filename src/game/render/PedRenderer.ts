@@ -31,9 +31,9 @@ export const PED_RENDER = {
   cullDist: 96, cullFade: 6, cullFloor: 0.55, scale: 0.97, swingWalk: 0.55, swingFlee: 1.0, lyingLift: 0.22, armSwing: 0.75,
   /**
    * Blob half-width. Larger than the figure (a 1.2 m ellipse under a 1.75 m ped) because the shared blob texture is
-   * opaque only inside SHADOW_TUNING.core = 34 % of its radius and fades to nothing at the rim: at the old 0.46 the
+   * opaque only inside SHADOW_TUNING.core of its radius and fades to nothing at the rim: at the old 0.46 the
    * whole opaque core hid under the ped's own footprint, and the pavement pixels under a standing figure measured
-   * unchanged. At 0.6 the core is a 40 cm puddle that shows around the shoes.
+   * unchanged. At 0.6 the core is a 43 cm puddle that shows around the shoes.
    */
   shadowR: 0.6, shadowLift: 0.03, bob: 0.028, sway: 0.045,
   /**
@@ -44,8 +44,12 @@ export const PED_RENDER = {
    * `shadowStretchMax` x shadowR along it as the light drops, pushed `shadowAnchor` of the way out along it so the
    * dark part stays under the shoes and the tail runs away from the light. `shadowElevFloor` caps how long a very low
    * sun makes it.
+   *
+   * The stretch caps at 1.6 and the anchor at 0.25 (from 2.4 / 0.5): the blob is the floor's contact occlusion, not a
+   * second cast shadow, and at dusk - where the light is clamped to 15.6 deg and the blob is the ONLY grounding cue
+   * in the street - the old pair walked its opaque core the better part of half a metre off the shoes.
    */
-  shadowNarrow: 1.0, shadowStretchMax: 2.4, shadowElevFloor: 0.26, shadowAnchor: 0.5,
+  shadowNarrow: 1.0, shadowStretchMax: 1.6, shadowElevFloor: 0.26, shadowAnchor: 0.25,
   /** Height and width multipliers per ped span 1 +- spread/2 (fixed by the id). */
   heightSpread: 0.2, widthSpread: 0.2,
   /** Resting set of the arms across the body (radians): upper arm out from the ribs, forearm back in under it. */

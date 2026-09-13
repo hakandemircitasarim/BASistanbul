@@ -31,7 +31,7 @@ import type { Materials } from './Materials';
 import { LEAF_TILE_M } from './PropTextures';
 import { ContactShadows, groundYAt } from './ContactShadows';
 import { surface, tube, type Ring } from './PlayerRenderer';
-import { VEHICLE_RENDER, makeVehiclePaintMaterial, parkedMidGeometry, parkedNearGeometry, parkedShellGeometry, setPaintNight } from './VehicleRenderer';
+import { VEHICLE_RENDER, makeVehiclePaintMaterial, parkedMidGeometry, parkedNearGeometry, parkedShellGeometry, setPaintNight, shadowExtent } from './VehicleRenderer';
 
 export const PROP_DIMS = { palmTrunkH: 6.4, palmFrondLen: 4.4, palmFrondW: 2.3, lampH: 6.5, lampArm: 1.4, poolRadius: 5.5 } as const;
 
@@ -1046,10 +1046,12 @@ const CAR_TIER_MOVE = 1.5;
  * artefact the blobs exist to remove. At 44 the cut is the range alone, so the set only changes at 46 m, where a blob
  * is a few pixels. The cost is instance slots in one shared mesh (SHADOW_TUNING.capacity), not a draw call.
  *
- * Half-extents follow the vehicle profiles' own (hw * 1.55, hl * 1.14): a blob a little wider than the track and a
- * little shorter than the body.
+ * Half-extents come from the same `shadowExtent` the moving vehicles use, so a parked car and a driven one of the
+ * same spec are grounded identically: the footprint plus VEHICLE_RENDER.shadowSpread of opaque core, fading out over
+ * the rim. Computed off the spec, not off the loft's own hw / hl, which sit inboard of the tyres and short of the
+ * bumpers - blobs sized from those never got their dark part out from under the car.
  */
-const CAR_SHADOWS = { cap: 44, range: 46, w: 1.55, l: 1.14, lift: 0.045 } as const;
+const CAR_SHADOWS = { cap: 44, range: 46, lift: 0.045 } as const;
 
 /**
  * Real lamp light: a fixed pool of point lights created once and re-aimed at the nearest lamp heads every frame, so
@@ -1692,7 +1694,7 @@ export class PropRenderer {
       const i = this.pickIdx[k];
       const spec = SPECS[PARKED_SPECS[this.carGeo[i]]];
       this.carShadows.add(this.carX[i], this.carShadowY[i] + CAR_SHADOWS.lift, this.carZ[i],
-        spec.width * 0.5 * CAR_SHADOWS.w, spec.length * 0.5 * CAR_SHADOWS.l, this.carYaw[i], 1);
+        shadowExtent(spec.width * 0.5), shadowExtent(spec.length * 0.5), this.carYaw[i], 1);
     }
     this.carShadows.end();
   }

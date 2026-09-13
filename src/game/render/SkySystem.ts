@@ -47,7 +47,7 @@ const SHADOW_FADE = 0.1;
  */
 /**
  * WIDEST penumbra of the sun / moon shadow, in shadow-map texels: the disk a blocker tens of metres up gets. The box
- * is 132 m over 2048 texels, so a texel is 6.45 cm and 6 of them is a 0.39 m soft edge.
+ * is 132 m over 3072 texels, so a texel is 4.30 cm and 6 of them is a 0.26 m soft edge.
  *
  * This is a ceiling, not the usual case. Round 9 applied ~7 texels to nearly everything, which is 0.45 m of blur: a
  * person is 0.45 m wide, so a standing figure, a car and a palm crown all dissolved into a featureless grey smear on
@@ -72,9 +72,9 @@ const SHADOW_TAPS = 7;
  *
  * `nearM` / `midM` are blocker separations in metres, converted to light-space depth against the shadow camera's
  * far - near = 360 m span. `near` / `mid` are the fractions of SHADOW_RADIUS used below nearM and between nearM and
- * midM; beyond midM the full disk applies. At 6 texels that is 1.1 texels (7 cm) for anything within 3.5 m - a
- * figure, a wheel, a kerb, a bollard, a hedge - 2.5 texels (16 cm) for palm crowns and first-floor parapets, and
- * 6 texels (39 cm) for a facade thrown down the street. Round 9's single step sat at 1.5 m, which is SHORTER than a
+ * midM; beyond midM the full disk applies. At 6 texels of a 3072 map that is 1.1 texels (4.7 cm) for anything within
+ * 3.5 m - a figure, a wheel, a kerb, a bollard, a hedge - 2.5 texels (11 cm) for palm crowns and first-floor parapets,
+ * and 6 texels (26 cm) for a facade thrown down the street. Round 9's single step sat at 1.5 m, which is SHORTER than a
  * person, so every caster taller than a kerb landed in the wide bucket: that, not the shadow pass, is why nothing
  * read as a shape.
  */
@@ -153,11 +153,32 @@ function patchShadowEdgeFade(): void {
 }
 patchShadowEdgeFade();
 const SKY_TUNING = {
-  // 132 m wide (0.065 m a texel at 2048). The border is hidden by SHADOW_FADE, not by the box size, so the box is
-  // sized purely by what it can afford: it is the shadow pass' own caster set, and every metre of it is paid three
-  // times over (colour, GTAO, shadow map). At 150 m the dusk frame measured 726k triangles against a 720k ceiling;
-  // 132 gives ~6k of that back and still carries full shadow to 53 m, fading out to 66.
-  domeRadius: 850, sunDist: 700, sunScale: 34, moonScale: 55, starCount: 1400, shadowBox: 132, shadowMap: 2048, lightUnits: 3.0,
+  // 132 m wide. The border is hidden by SHADOW_FADE, not by the box size, so the box is sized purely by what it can
+  // afford: it is the shadow pass' own caster set, and every metre of it is paid three times over (colour, GTAO,
+  // shadow map). At 150 m the dusk frame measured 726k triangles against a 720k ceiling; 132 gives ~6k of that back
+  // and still carries full shadow to 53 m, fading out to 66.
+  //
+  // 3072, not 2048 and not round 11's 4096: the map is the RESOLUTION budget of every shadow in the frame, and at
+  // 2048 a 132 m box is 6.45 cm a texel, on top of which three's PCF path takes a hardware 2x2 tap - a ~13 cm floor
+  // on any shadow feature. A palm crown is 3-4 m with 30 cm frond gaps and reads beautifully out of that; a person is
+  // 45 cm wide with 13 cm limbs and dissolves into a featureless sausage, which is what the round-10 critic saw
+  // ("nothing that moves is attached to the ground"). It is not a dynamic-caster bug - a plain unskinned Mesh of the
+  // player's own geometry casts the same smear.
+  //
+  // THE PRICE IS MEMORY, AND IT IS NOT SMALL. three builds a PCF directional shadow as `new WebGLRenderTarget(w, h)`
+  // PLUS a `DepthTexture(w, h, UnsignedIntType)` (WebGLShadowMap.js), i.e. an RGBA8 colour attachment that is never
+  // sampled AND a 32-bit depth attachment: 8 bytes a texel. That is 33.6 MB at 2048, 75.5 MB at 3072 and 134.2 MB at
+  // 4096 - measured on the live renderer, not estimated (sun.shadow.map is 4096x4096, texture format 1023/type 1009,
+  // depthTexture type 1014). Round 11 took the 4096 and recorded the cost as "a 4096^2 depth attachment", i.e. half
+  // of it, against a documented texture budget of ~114 MB. None of this is visible in the triangle / draw-call gate.
+  //
+  // 3072 is where that curve is worth paying. Measured at hour 15 in the cross-light grounding frame, over the static
+  // right half of the frame (no peds), against the 4096 render: 3072 differs on 0.99 % of pixels by more than 8/255
+  // and 0.04 % by more than 20/255; 2048 differs on 2.27 % and 0.33 %. So 3072 keeps ~88 % of what 4096 bought over
+  // 2048 for 42 % of the memory it added, and what the remaining difference is, is the crispness of a shadow CONTOUR
+  // (diff-4096-vs-3072 lights up only the hedge and pole shadow edges), not whether a figure reads as a shape.
+  // Costs zero triangles and zero draw calls - the caster set is unchanged.
+  domeRadius: 850, sunDist: 700, sunScale: 34, moonScale: 55, starCount: 1400, shadowBox: 132, shadowMap: 3072, lightUnits: 3.0,
   // Clouds: uv scale of the flat-plane projection, density cut/softness, day and night coverage, drift per game hour.
   cloudScale: 0.6, cloudCut: 0.28, cloudSoft: 0.3, cloudDay: 0.45, cloudNight: 0.22, cloudDrift: 0.018,
   // Dome radiance multiplier (linear HDR): a bright day sky that ACES rolls off, unity at night so the stars keep their size.
@@ -361,11 +382,17 @@ export class SkySystem {
     sc.left = -half; sc.right = half; sc.top = half; sc.bottom = -half;
     sc.near = SHADOW_CAM_NEAR; sc.far = SHADOW_CAM_NEAR + SHADOW_DEPTH_SPAN;
     this.sun.shadow.bias = -0.00045;
-    // The normal offset scales with the filter, and the filter is now ~1.1 texels (7 cm) under anything close: at
-    // 0.09 m the offset was wider than the filter itself, pushing the lookup of a wall fragment off the surface far
-    // enough to erase the contact shadow of anything shallower (the cornice oversail, a sill, a bay recess) and
-    // lifting a figure's shadow off its own shoes.
-    this.sun.shadow.normalBias = 0.05;
+    // THE NORMAL OFFSET IS DERIVED FROM THE TEXEL, so it moves whenever SKY_TUNING.shadowMap does. It is an absolute
+    // world-space offset along the receiver normal; the only thing that hides it is the filter's own blur, and the
+    // blur halves every time the map doubles. At 132 m / 3072 a texel is 4.30 cm and SHADOW_PENUMBRA's near rung is
+    // 1.1 texels = 4.7 cm, so the offset has to stay under ~0.045 or it pushes the lookup further off the surface
+    // than the penumbra that is meant to swallow it - which erases the contact shadow of anything shallow (the
+    // cornice oversail, a sill, a bay recess) and lifts a figure's shadow off its own shoes. Round 9's 0.09 was
+    // twice that even at 2048's 6.45 cm texel; round 11 halved the texel and left the offset at 0.05.
+    // 0.035 is 0.8 of a texel: measured at hour 15, lowering it deepens the near contact shadow (the hedge-base
+    // pool reads 78.9 -> 74.9 mean luma going 0.05 -> 0.025) and no acne appears on the pavement or the kerb even
+    // at 0, so the remaining margin is there for the 15.6 deg grazing light at 19:00, not for the flat noon case.
+    this.sun.shadow.normalBias = 0.035;
     this.sun.shadow.radius = SHADOW_RADIUS;
     scene.add(this.sun);
     scene.add(this.sun.target);

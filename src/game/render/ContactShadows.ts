@@ -16,21 +16,27 @@ export const SHADOW_TUNING = {
   capacity: BUDGET.MAX_VEHICLES + BUDGET.MAX_PEDS + 48,
   texSize: 64,
   /**
-   * Radius (0..1) of the fully opaque core; the rest fades to nothing at the rim. 0.5, not the old 0.34: a ped blob is
-   * a 0.6 m ellipse, so a third of that put the whole opaque core UNDER the shoes and only the outer fade showed -
-   * the pavement a hand's width from a standing figure measured within 3 % of clear road, i.e. nothing. Half the
-   * radius still lands well inside a car's own footprint, so the vehicle blobs only firm up.
+   * Radius (0..1) of the fully opaque core; the rest fades to nothing at the rim.
+   *
+   * 0.72, not 0.5: with the multiply operator below the blob's alpha IS its occlusion, so the core is the only part
+   * of the mask that reads at all, and at 0.5 the whole of it sat inside the caster's own footprint. The old vehicle
+   * blob was 0.98 m across for a 1.8 m-wide sedan, so half of that put the dark part 20 cm INSIDE the sills - hiding
+   * every live blob in the city at noon moved the lot asphalt beside a parked car by 0.5/255, i.e. nothing.
+   * It is also the divisor VehicleRenderer.shadowExtent sizes the vehicle blobs by, so raising it widens them to
+   * match rather than shrinking the visible pool. A ped's 0.6 m ellipse keeps a 43 cm opaque puddle around the
+   * shoes. The remaining 28 % is still a smoothstep, so the rim does not read as a cut ellipse.
    */
-  core: 0.5,
-  /** Real cast shadows overlap the blobs by day; at night the moon shadow is faint, so the blob keeps cars grounded. */
-  dayOpacity: 0.3,
-  nightOpacity: 0.3,
+  core: 0.72,
   /**
-   * Neutral near-black, not the old 0x120b1c. That violet is darker than asphalt in luma but BLUER than it, so under
-   * a figure on a grey road the blob read as a blue smear painted on the tarmac rather than as shade; the split-tone
-   * grade then pushed the same pixels further toward blue.
+   * Occlusion of the core, i.e. how much light the multiply operator takes off the floor under a caster (see the
+   * material below). Real cast shadows overlap the blobs by day so the day term stays the smaller of the two; at
+   * night the moon shadow is almost nothing and the blob is the ONLY thing holding a car or a figure on the road.
+   *
+   * These are not the old alpha-over numbers and cannot be compared with them: 0.3 of an alpha-over toward a
+   * near-black was worth 5.5/255 on lit pavement and 0.5/255 on lot asphalt. 0.5 of a multiply takes half the light.
    */
-  color: 0x0f0f12,
+  dayOpacity: 0.5,
+  nightOpacity: 0.62,
 } as const;
 
 /**
@@ -98,16 +104,39 @@ class ShadowField {
   constructor(scene: THREE.Scene) {
     this.scene = scene;
     this.tex = blobTexture();
+    // MULTIPLY, not alpha-over. The blob used to be a near-black quad lerped over the floor at 30 %, which is a
+    // no-op on anything already dark: on lit lot asphalt it moved the mean by 0.5/255 (peak 22), inside the +-15/255
+    // swing of the asphalt's own macro texture, and on the 19:00 pavement by 0.23/255 - the shoes met the paving with
+    // literally no darkening. dst *= (1 - srcAlpha) instead makes the mask's alpha the OCCLUSION: it takes a fixed
+    // FRACTION of whatever light the floor had, so it reads the same on white paving, grey road and black asphalt,
+    // and it can never lighten anything (the old operator did, wherever the ground was darker than 0x0f0f12).
+    // The RGB of the source is multiplied by zero and never reaches the framebuffer, so this material has no colour.
+    // The alpha channel is kept on the destination (blendSrcAlpha/DstAlpha) so the blob does not punch holes in the
+    // composer's alpha on the HDR path.
     this.material = new THREE.MeshBasicMaterial({
-      color: SHADOW_TUNING.color, map: this.tex, transparent: true, opacity: SHADOW_TUNING.dayOpacity,
+      map: this.tex, transparent: true, opacity: SHADOW_TUNING.dayOpacity,
+      blending: THREE.CustomBlending,
+      blendSrc: THREE.ZeroFactor, blendDst: THREE.OneMinusSrcAlphaFactor, blendEquation: THREE.AddEquation,
+      blendSrcAlpha: THREE.ZeroFactor, blendDstAlpha: THREE.OneFactor, blendEquationAlpha: THREE.AddEquation,
       depthWrite: false, side: THREE.DoubleSide, fog: false, toneMapped: false,
     });
+    this.material.name = 'contactBlob'; // Renderer.sceneBreakdown() and the render probes attribute the mesh by this.
     const geo = new THREE.PlaneGeometry(1, 1);
     geo.rotateX(-Math.PI / 2);
     this.mesh = new THREE.InstancedMesh(geo, this.material, SHADOW_TUNING.capacity);
     this.mesh.count = 0;
     this.mesh.frustumCulled = false;
-    this.mesh.renderOrder = -1; // under every other transparent (light pools, neon, markers)
+    // Ground-transparent ladder: road paint and skid marks are renderOrder 1, the additive lamp pools 2, neon 3,
+    // markers 4, particles 5-6. The blob has to land BETWEEN the paint and the additives. At -1 it drew FIRST among
+    // the transparents, and since the paint writes no depth either, three then painted every lane line and lot bay
+    // line back over the multiply at full brightness - the one thing in the frame the darkest pool could not darken.
+    // It matters because `LOT_BAYS.bayPitch` is 3 m: a bay line sits 1.5 m from a parked car's centre, inside the
+    // opaque core of its blob, and every one of the up to 44 parked-car blobs has one running through it.
+    // Measured by toggling this line alone at hour 19 in the lot (a pure sort change - no shader, no material state,
+    // so a runtime A/B is valid here): 0.52 % of the frame moves by more than 8/255, and the bay line crossing a
+    // car's blob loses ~2 % of its brightness (mean of its brightest 200 px 158.0 -> 154.9).
+    // 1.5 keeps it under every additive (a light pool must add on top of the shaded floor, not under it).
+    this.mesh.renderOrder = 1.5;
     this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     for (let i = 0; i < SHADOW_TUNING.capacity; i++) this.mesh.setMatrixAt(i, zero);
     scene.add(this.mesh);

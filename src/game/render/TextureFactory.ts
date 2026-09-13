@@ -124,6 +124,19 @@ const MIP_DETAIL = 0.34;
  * the worst-case frame. Left at 8.
  */
 const GROUND_ANISO = 8;
+/**
+ * Exposed chippings on the asphalt tiles (see chipBed). Sizes are METRES, resolved against the tile's own px/m, so
+ * the bed stays the same physical size whatever resolution the tile is drawn at. 4.0-7.8 cm is 3-6 texels at the
+ * road's 73 px/m: coarse for real chippings and deliberately so, because anything finer is one texel and one texel
+ * is static. 1.35 clusters per square metre of 51 stones each is ~13,400 stones over the 14 m tile covering ~14 % of
+ * it, so most of what the eye lands on is still plain bitumen with beds of stone scattered through it.
+ */
+const CHIP = {
+  min: 0.040, max: 0.078,
+  perM2: 1.35, rMin: 0.18, rMax: 0.78, density: 62,
+  pale: [176, 168, 152], dark: [16, 15, 13],
+  paleA: [0.03, 0.075], darkA: [0.055, 0.135], darkShare: 0.52,
+} as const;
 
 /** Ground albedo families that carry a derived relief / roughness map (see groundNormal, groundRough). */
 type GroundMap = 'sidewalk' | 'plaza' | 'road' | 'lotAsphalt' | 'crosswalk';
@@ -2485,9 +2498,84 @@ export class TextureFactory {
    *
    * Called AFTER the tile's de-dither blur (see road()): a 3 x 3 pass would take most of the fine octave with it.
    */
-  private aggregate(ctx: CanvasRenderingContext2D, S: number): void {
+  private aggregate(ctx: CanvasRenderingContext2D, S: number, chipOff = -1): void {
     this.noiseWash(ctx, S, S, this.valueNoise('bitumenA', 256, 3, 3, 0.5, 613, 0.5), S, 0.13,
       this.valueNoise('bitumenB', 256, 11, 4, 0.5, 2207, 0.5), S, 0.11);
+    if (chipOff >= 0) this.chipBed(ctx, S, chipOff);
+  }
+
+  /**
+   * Exposed chippings: clustered two-tone stones laid over the tonal aggregate above.
+   *
+   * The two washes in `aggregate` bottom out at 0.16 m, so from two metres the bitumen between them is a smooth field
+   * and the road reads as painted lino - the one thing left in a walking frame that still says "untextured plane".
+   * A value-noise field cannot go finer without becoming per-texel static (at 73 px/m a 4 cm stone is three texels,
+   * i.e. a lattice of 256 on a 256 px noise canvas, which is white noise), so the stones are DRAWN, which also buys
+   * the two things noise cannot: they CLUSTER, and they come in two definite tones instead of a continuous ramp.
+   * That is the difference between a material and speckle, and it is the same argument the flat tone bands elsewhere
+   * in this file are made of - these are small flat plates of stone, not a grain field.
+   *
+   * Scale is chosen against the mip chain, not against real chippings (which would be one texel): CHIP.min..max is
+   * 3-6 texels, so mip 1 still holds 1.5-3 of them and mip 2 about one, i.e. the bed reads as stone out to ~8 m,
+   * has become tone by ~20 m and is gone before it can crawl. Contrast is deliberately low (the pale stone lifts a
+   * mid texel by ~8/255 at its strongest) because the ground normal map is a high-pass of THIS canvas: every chip is
+   * also a bump, and at twice this contrast the road glittered under a low sun and the pale stones read as confetti
+   * at 6 m.
+   *
+   * The bed is drawn ONCE and shared by all three asphalt tiles at different offsets. Twelve thousand ellipse fills
+   * cost ~90 ms of the boot-time texture budget; paying that per tile put ~270 ms on a ~1.03 s total, and the three
+   * tiles are never adjacent at a scale where one recognises a stone.
+   */
+  private chipBed(ctx: CanvasRenderingContext2D, S: number, off: number): void {
+    const bed = this.chipCanvas(S);
+    // The bed tiles seamlessly, so four copies around the offset cover the tile whatever the offset is.
+    const ox = off % S, oy = (off * 7919) % S;
+    for (let i = -1; i <= 0; i++) for (let j = -1; j <= 0; j++) ctx.drawImage(bed, ox + i * S, oy + j * S);
+  }
+
+  /** The shared chip bed on a transparent scratch canvas (see chipBed); never handed to THREE, so no texture memory. */
+  private chipCanvas(S: number): HTMLCanvasElement {
+    const key = `chips:${S}`;
+    const hit = this.scratch.get(key);
+    if (hit) return hit;
+    const { canvas, ctx } = this.canvas(S, S);
+    const px = S / ROAD_TILE_M;
+    const rng = new Random(4401);
+    const area = (S / px) * (S / px);
+    const nCluster = Math.round(area * CHIP.perM2);
+    // One stone: an ellipse, not a rect. At three to six texels a square chip reads as a magnified TEXEL - the pixel
+    // grid itself - which is the one shape a hand-made surface must never have; a rounded stone at the same size
+    // reads as a stone. Wrapped, so a chip crossing the edge is drawn again on the far side and the bed tiles.
+    const chip = (x: number, y: number, w: number, h: number, rot: number, style: string): void => {
+      ctx.fillStyle = style;
+      for (let ox = -1; ox <= 1; ox++) {
+        for (let oy = -1; oy <= 1; oy++) {
+          const cx = x + ox * S, cy = y + oy * S;
+          if (cx < -w || cx > S + w || cy < -h || cy > S + h) continue;
+          ctx.beginPath();
+          ctx.ellipse(cx, cy, w * 0.5, h * 0.5, rot, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    };
+    for (let i = 0; i < nCluster; i++) {
+      const cx = rng.range(0, S), cy = rng.range(0, S);
+      const r = rng.range(CHIP.rMin, CHIP.rMax) * px;
+      const n = Math.round(Math.PI * (r / px) * (r / px) * CHIP.density);
+      for (let j = 0; j < n; j++) {
+        // Uniform over the disc, so a bed has a definite edge instead of a gaussian falloff; the clusters overlap
+        // (CHIP.perM2 x their area is well over 1) so what reads is scattered stone, not a field of discs.
+        const a = rng.range(0, Math.PI * 2), d = Math.sqrt(rng.next()) * r;
+        const x = cx + Math.cos(a) * d, y = cy + Math.sin(a) * d;
+        const w = rng.range(CHIP.min, CHIP.max) * px, h = w * rng.range(0.45, 1.0);
+        const dark = rng.chance(CHIP.darkShare);
+        const c = dark ? CHIP.dark : CHIP.pale;
+        const al = dark ? rng.range(CHIP.darkA[0], CHIP.darkA[1]) : rng.range(CHIP.paleA[0], CHIP.paleA[1]);
+        chip(x, y, w, h, rng.range(0, Math.PI), rgba(c[0], c[1], c[2], al));
+      }
+    }
+    this.scratch.set(key, canvas);
+    return canvas;
   }
 
   /**
@@ -2672,7 +2760,7 @@ export class TextureFactory {
     // the manhole, the drain, the lane paint - is drawn after this line. (The pavement and plaza tiles have always
     // blurred at exactly this point in their own recipe, which is why neither of them shows the lattice.)
     this.blur3(ctx, S, S);
-    this.aggregate(ctx, S);
+    this.aggregate(ctx, S, 0);
     // Manhole in the inner lane, drain against one kerb.
     this.manhole(ctx, r, rng, cx + (rng.chance(0.5) ? 1 : -1) * rng.range(1.6, 2.4) * px, rng.range(0.2, 0.8) * S, 0.34 * px);
     const dSide = rng.chance(0.5) ? 0.35 * px : S - 0.35 * px - 0.36 * px;
@@ -2724,7 +2812,7 @@ export class TextureFactory {
     ctx.fillRect(S / 2 - 0.09 * px, 0, 0.18 * px, S);
     this.asphaltPatches(ctx, S, px, rng, 6, [0.18, 0.82]);
     this.blur3(ctx, S, S);
-    this.aggregate(ctx, S);
+    this.aggregate(ctx, S, 317);
     // A tarmac lot is laid in strips by a paver the width of a bay run: one transverse lap joint, soft, in the middle
     // of the tile - the one horizontal event, and at a fifth of the contrast the road's old trench line had.
     ctx.fillStyle = rgba(14, 14, 16, 0.12);
@@ -2766,7 +2854,7 @@ export class TextureFactory {
     }
     this.asphaltPatches(ctx, S, px, rng, 3, []);
     this.blur3(ctx, S, S);
-    this.aggregate(ctx, S);
+    this.aggregate(ctx, S, 733);
     this.manhole(ctx, null, rng, S / 2 + rng.range(-1.5, 1.5) * px, S / 2 + rng.range(-1.5, 1.5) * px, 0.34 * px);
     const band = 2.4 * px, m = 0.6 * px, stripe = 0.6 * px, gap = 0.5 * px;
     this.paintLayer(ctx, null, S, rng, (p) => {

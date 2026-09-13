@@ -270,6 +270,25 @@ export class GeoBuilder {
     this.idx.push(i, i + 1, i + 2, i, i + 2, i + 3);
   }
 
+  /**
+   * Vertical quad whose vertex colour ramps from `kBot` on the a-b edge to `kTop` on the c-d edge, around the colour
+   * set by setColor. The same trick polySides uses for a parapet's coping shadow, exposed for the windowed walls:
+   * a tone RAMP inside one quad, which is the only way to put a soft shadow line on a facade without a second quad.
+   */
+  quadRamp(ax: number, ay: number, az: number, bx: number, by: number, bz: number, cx: number, cy: number, cz: number, dx: number, dy: number, dz: number,
+    nx: number, ny: number, nz: number, ua: number, va: number, ub: number, vb: number, uc: number, vc: number, ud: number, vd: number,
+    kBot: number, kTop: number): void {
+    const r = this.r, g = this.g, b = this.b;
+    this.r = r * kBot; this.g = g * kBot; this.b = b * kBot;
+    const i = this.vertex(ax, ay, az, nx, ny, nz, ua, va);
+    this.vertex(bx, by, bz, nx, ny, nz, ub, vb);
+    this.r = r * kTop; this.g = g * kTop; this.b = b * kTop;
+    this.vertex(cx, cy, cz, nx, ny, nz, uc, vc);
+    this.vertex(dx, dy, dz, nx, ny, nz, ud, vd);
+    this.r = r; this.g = g; this.b = b;
+    this.idx.push(i, i + 1, i + 2, i, i + 2, i + 3);
+  }
+
   tri(ax: number, ay: number, az: number, bx: number, by: number, bz: number, cx: number, cy: number, cz: number, u: number, v: number): void {
     const ux = bx - ax, uy = by - ay, uz = bz - az, vx = cx - ax, vy = cy - ay, vz = cz - az;
     let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
@@ -1006,6 +1025,22 @@ function orientTone(nx: number, nz: number): number {
 }
 /** Peak-to-peak value drift between the vertical bands of one wall (bandRows), as a fraction of the wall tint. */
 const BAND_TONE_SPREAD = 0.07;
+/**
+ * Wall head band: the last WALL_HEAD_H metres of every windowed wall are split off as their own quad and ramped from
+ * the band's own tone at its foot down to WALL_HEAD_SHADE at the head.
+ *
+ * What a wall lacked was the ONE tonal event that tells the eye it is a wall with a top and not a coloured plane cut
+ * off by the sky: the shadow a coping or a roof-edge oversail throws down the last half metre of it. The roof kit
+ * gives that to buildings over CLUTTER_MIN_H (parapetWalls, cornice) and to nothing below it, which is every shop
+ * row and every suburb block - exactly the buildings the player stands under, so the band is emitted THERE ONLY.
+ * `bandRows` cannot carry it, because its bands are up to BAND_ROWS (four) storeys tall and a ramp over four storeys
+ * is a vignette, not a shadow line; hence a thin quad of its own. 0.5 m is a coping's depth, it costs 2 triangles
+ * per wall piece, and restricted to the 90 buildings of 368 that have no roof edge of their own it is +3.6k
+ * triangles of city geometry against +16.4k for every wall in the city.
+ *
+ * The band keeps the wall tile's UVs, so the window grid runs through it unbroken and only the tone steps.
+ */
+const WALL_HEAD_H = 0.5, WALL_HEAD_FOOT = 0.93, WALL_HEAD_SHADE = 0.6;
 
 const FACADE_MAX_LEN = 4096;
 /**
@@ -1017,6 +1052,11 @@ const FACADE_MAX_LEN = 4096;
  */
 function facade(gb: GeoBuilder, b: Building, ol: Outline, y0: number, y1: number, wall: number, roof: number, m: Massing, mask: number, jog: boolean, recess: boolean): void {
   const tw = m.tw, th = m.th, rowH = m.rowH, bayW = m.bayW;
+  // Only the roofs that get no parapet and no cornice (parapetWalls bails under CLUTTER_MIN_H, parapetBand only runs
+  // on towers): the shop rows and suburb blocks, which are the buildings the player actually stands under. Giving it
+  // to every wall of every tier as well measured +16.4k triangles of city geometry and +20k in the worst frame,
+  // which is the whole budget headroom for a line most of those walls already have from their roof kit.
+  const headBand = b.h <= CLUTTER_MIN_H;
   const reveal = darken(wall, 0.72), soffit = darken(wall, 0.6);
   for (let i = 0; i < ol.n; i++) {
     const fr = ol.edge(i);
@@ -1041,8 +1081,16 @@ function facade(gb: GeoBuilder, b: Building, ol: Outline, y0: number, y1: number
         gb.setColor(col, orient * (1 + (hash01(key * 41 + j * 7 + 3) - 0.5) * BAND_TONE_SPREAD));
         const uc = hashU(key * 17 + seg * 5 + j * 3) % 4;
         const u0 = uc / 4 + s0 / tw, u1 = uc / 4 + s1 / tw, v0 = (ya + kv * rowH) / th, v1 = (yb + kv * rowH) / th;
-        P(s0, dep, ya, a); P(s1, dep, ya, c); P(s1, dep, yb, d); P(s0, dep, yb, e);
-        gb.quad(a[0], a[1], a[2], c[0], c[1], c[2], d[0], d[1], d[2], e[0], e[1], e[2], fr.nx, 0, fr.nz, u0, v0, u1, v0, u1, v1, u0, v1);
+        // Top band: the last WALL_HEAD_H is its own quad so the roof edge can cast a shadow line down the wall head.
+        const head = headBand && j === bands.n - 1 && yb - ya > WALL_HEAD_H * 2.5;
+        const ym = head ? yb - WALL_HEAD_H : yb;
+        const vm = head ? (ym + kv * rowH) / th : v1;
+        P(s0, dep, ya, a); P(s1, dep, ya, c); P(s1, dep, ym, d); P(s0, dep, ym, e);
+        gb.quad(a[0], a[1], a[2], c[0], c[1], c[2], d[0], d[1], d[2], e[0], e[1], e[2], fr.nx, 0, fr.nz, u0, v0, u1, v0, u1, vm, u0, vm);
+        if (head) {
+          P(s0, dep, ym, a); P(s1, dep, ym, c); P(s1, dep, yb, d); P(s0, dep, yb, e);
+          gb.quadRamp(a[0], a[1], a[2], c[0], c[1], c[2], d[0], d[1], d[2], e[0], e[1], e[2], fr.nx, 0, fr.nz, u0, vm, u1, vm, u1, v1, u0, v1, WALL_HEAD_FOOT, WALL_HEAD_SHADE);
+        }
       }
     }
     // Reveals where the depth steps, soffits over the stepped-back pieces (the roof cap spans the full outline).

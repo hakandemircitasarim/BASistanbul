@@ -25,18 +25,25 @@ const SOLE = 0x4a4a52;
 const BUCKLE = 0xb9a05c;
 /**
  * Contact blob half-width. Bigger than it looks it should be (a 1.4 m ellipse under a 1.8 m figure), because the shared
- * blob texture is only opaque inside `SHADOW_TUNING.core` = 34 % of its radius and fades to nothing at the rim: at the
+ * blob texture is only opaque inside `SHADOW_TUNING.core` of its radius and fades to nothing at the rim: at the
  * geometrically "correct" 0.56 the whole opaque core hid under the figure's own footprint and the blob read as nothing
- * at all (measured: no change in the pavement pixels under the player at noon). At 0.7 the core is a 48 cm puddle that
+ * at all (measured: no change in the pavement pixels under the player at noon). At 0.7 the core is a 50 cm puddle that
  * shows around the shoes, which is what grounds the figure - especially at night, when there is no sun shadow at all.
  */
-const SHADOW_R = 0.7;
+export const SHADOW_R = 0.7;
 const SHADOW_LIFT = 0.03;
 /** Contact blob shape: `NARROW` of the old radius across the light direction, up to `STRETCH_MAX` along it. */
 const SHADOW_NARROW = 1.0;
-const SHADOW_STRETCH_MAX = 2.4;
+/**
+ * 1.6, not 2.4. The blob is a CONTACT term - the ambient occlusion of the floor a body stands on - not a second cast
+ * shadow, and the two disagree at exactly the hour the blob matters most: at 19:00 the light is clamped to 15.6 deg
+ * of elevation, so 1/elev saturated the stretch and STRETCH_MAX * ANCHOR pushed the opaque core 0.49 m along the
+ * light, off the shoes and onto bare pavement. That detached smear is the "nothing is attached to the ground" read.
+ * A short ellipse that leans the right way keeps the direction cue and stays under the feet.
+ */
+const SHADOW_STRETCH_MAX = 1.6;
 /** How far along the light direction the blob's centre is pushed, as a fraction of (length - width). */
-const SHADOW_ANCHOR = 0.5;
+const SHADOW_ANCHOR = 0.25;
 const SHADOW_ELEV_FLOOR = 0.26;
 /** Second tone break in each garment (see `playerGeometry`): lit chest yoke, shaded back, lit thigh front, knee crease. */
 const SHIRT_YOKE = 1.13;

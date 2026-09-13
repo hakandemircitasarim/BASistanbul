@@ -23,7 +23,7 @@ import { BUDGET } from '../core/Budget';
 import type { Transform } from '../core/Types';
 import { createTransform, lerpTransform } from '../core/Transform';
 import { clamp } from '../core/math';
-import { ContactShadows, groundYAt } from './ContactShadows';
+import { ContactShadows, SHADOW_TUNING, groundYAt } from './ContactShadows';
 import { surface, tube } from './PlayerRenderer';
 import type { Ring } from './PlayerRenderer';
 
@@ -59,7 +59,26 @@ export const VEHICLE_RENDER = {
   /** Body pitch (dive/squat) and roll (lean) limits in radians, and how hard longAccel / yawRate push them. */
   pitchGain: 0.010, pitchMax: 0.036, rollGain: 0.0035, rollMax: 0.055,
   shadowLift: 0.045,
+  /**
+   * How far past the car's own footprint the OPAQUE part of the contact blob reaches, in metres (see shadowExtent).
+   *
+   * The blob used to be sized off `hw` / `hl`, which are the LOFT's half-extents - the body inboard of the tyres and
+   * short of the bumpers - so a sedan got a 0.98 x 2.26 m ellipse around a 0.9 x 2.2 m footprint, and with the mask
+   * opaque only inside its core the dark part of it never left the underside of the car. Measured on lot asphalt: the
+   * ground beside a parked car moved 0.18/255 when every blob in the city was hidden, i.e. the blobs were doing
+   * nothing at all for vehicles. Sizing from the SPEC footprint plus a spread, and dividing by the core, puts the
+   * opaque part on ground the camera can see - the dark pool around the sills and the wheels that reads as weight.
+   */
+  shadowSpread: 0.34,
 } as const;
+
+/**
+ * Half-extent of a contact blob whose opaque core covers `half` (a footprint half-extent) plus `shadowSpread` metres
+ * of ground beyond it. The rim fades out over the remaining (1 - core) of the extent.
+ */
+export function shadowExtent(half: number): number {
+  return (half + VEHICLE_RENDER.shadowSpread) / SHADOW_TUNING.core;
+}
 
 const KEYS: VehicleKey[] = ['sedan', 'sport', 'van', 'police', 'taxi'];
 /** Head / tail light quads are drawn a little smaller than their anchor so the lamp bezel and lens rim show around them. */
@@ -952,8 +971,8 @@ function sedanProfile(s: VehicleSpec, kind: 'sedan' | 'police' | 'taxi'): Vehicl
     roof: { x: 0, y: H, z: 0, w: 0.3, h: 0.12, sweep: 0 },
     roofKind: 'none',
     wheelScale: 1,
-    shadowW: hw * 1.55,
-    shadowL: hl * 1.14,
+    shadowW: shadowExtent(s.width * 0.5),
+    shadowL: shadowExtent(s.length * 0.5),
     floor: c,
     belt,
   };
@@ -1050,8 +1069,8 @@ function sportProfile(s: VehicleSpec): VehicleProfile {
     roof: { x: 0, y: H, z: 0, w: 0.3, h: 0.12, sweep: 0 },
     roofKind: 'none',
     wheelScale: 1.08,
-    shadowW: hw * 1.55,
-    shadowL: hl * 1.14,
+    shadowW: shadowExtent(s.width * 0.5),
+    shadowL: shadowExtent(s.length * 0.5),
     floor: c,
     belt,
   };
@@ -1125,8 +1144,8 @@ function vanProfile(s: VehicleSpec): VehicleProfile {
     roof: { x: 0, y: H, z: 0, w: 0.3, h: 0.12, sweep: 0 },
     roofKind: 'none',
     wheelScale: 1.12,
-    shadowW: hw * 1.55,
-    shadowL: hl * 1.14,
+    shadowW: shadowExtent(s.width * 0.5),
+    shadowL: shadowExtent(s.length * 0.5),
     floor: c,
     belt,
   };

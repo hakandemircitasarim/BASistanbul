@@ -4,13 +4,17 @@ import { DayNightSystem, DAY_TUNING } from '../../src/game/systems/DayNightSyste
 import { ARCADE, BAND, CELL_KIND, CELL_STYLES, FacadeCellList, GeoBuilder, Outline, appendBuilding, appendBuildingDetail, appendStreetLevel, bandHeight, buildingGeometry, buildingTint, footprint, hasCrown, landmarkGeometries, massingOf } from '../../src/game/render/BuildingGeometry';
 import { MARK_UV, PLINTH_BAYS, PLINTH_TILE_W, ROOF_SEAM_U, ROOF_STRIP_PX, SHOP_BAYS, SHOP_BAY_W, SHOP_DOOR_W, SHOP_FASCIA_Y, SHOP_ROWS, SHOP_TILE_W, WINDOW_CELL, WINDOW_TILE_H, WINDOW_TILE_PX_H } from '../../src/game/render/TextureFactory';
 import { FACADE_RANGE, FacadeDetailRenderer } from '../../src/game/render/FacadeDetailRenderer';
-import { MeshStandardMaterial, Scene, ShaderChunk } from 'three';
+import { CustomBlending, MeshStandardMaterial, OneMinusSrcAlphaFactor, Scene, ShaderChunk, ZeroFactor } from 'three';
+import type { InstancedMesh, MeshBasicMaterial } from 'three';
 import type { BufferGeometry } from 'three';
 import { Random } from '../../src/game/core/Random';
 import { SHADOW_PENUMBRA, SHADOW_RADIUS, SKY_KEYS } from '../../src/game/render/SkySystem';
 import { ContactShadows, SHADOW_TUNING, groundYAt } from '../../src/game/render/ContactShadows';
 import { BUDGET } from '../../src/game/core/Budget';
 import { BLOCK, CURB_H, PITCH, ROAD_W, SIDEWALK_W } from '../../src/game/city/CityConfig';
+import { VEHICLE_RENDER, shadowExtent } from '../../src/game/render/VehicleRenderer';
+import { PED_RENDER } from '../../src/game/render/PedRenderer';
+import { SHADOW_R as PLAYER_SHADOW_R } from '../../src/game/render/PlayerRenderer';
 import { Vehicle } from '../../src/game/entities/Vehicle';
 import { SPECS } from '../../src/game/entities/VehicleSpecs';
 import type { Building, Landmark } from '../../src/game/city/CityData';
@@ -480,6 +484,60 @@ test('contact shadow slices: the shared blob mesh covers every renderer that res
     total += n;
   }
   expect(SHADOW_TUNING.capacity >= total, `blob capacity ${SHADOW_TUNING.capacity} covers the ${total} reserved slots`);
+});
+
+test('contact blobs multiply the floor, and their opaque core clears the caster that sits on it', () => {
+  // Two properties the round-10 critic's "nothing that moves is attached to the ground" came down to, both of which
+  // are invisible to a screenshot diff of a single frame and easy to undo by accident:
+  //
+  // 1. The OPERATOR. The blob used to be a near-black quad lerped over the ground at 30 % opacity, which cannot
+  //    darken anything already darker than the quad: on lit lot asphalt it moved the mean 0.5/255, inside the
+  //    asphalt texture's own +-15/255 swing. dst *= (1 - srcAlpha) takes a fixed FRACTION of the floor instead, so
+  //    it reads the same on white paving and on black tarmac and can never lighten a pixel.
+  // 2. The SHAPE. Only the inner `core` of the mask is opaque, so a blob whose core is narrower than the caster's
+  //    own footprint hides its entire dark part under the caster and nothing lands on visible ground.
+  const scene = new Scene();
+  const slice = new ContactShadows(scene, 4);
+  const mesh = scene.children.find((o) => (o as InstancedMesh).isInstancedMesh) as InstancedMesh;
+  expect(!!mesh, 'the shared blob mesh is in the scene');
+  const mat = mesh.material as MeshBasicMaterial;
+  expect(mat.blending === CustomBlending && mat.blendSrc === ZeroFactor && mat.blendDst === OneMinusSrcAlphaFactor,
+    `the blob multiplies the framebuffer (blending ${mat.blending}, src ${mat.blendSrc}, dst ${mat.blendDst})`);
+  expect(mat.transparent && !mat.depthWrite && mat.opacity > 0.35,
+    `the blob is a transparent, non-depth-writing darkener at opacity ${mat.opacity}`);
+  //
+  // The two casters that actually DEPEND on `core` are the ped and the player: their blob radii are fixed metres and
+  // are NOT divided by it, so shrinking `core` shrinks their opaque puddle straight back under their own shoes. The
+  // vehicles cannot regress that way - `shadowExtent` divides by `core`, so `shadowExtent(h) * core` is identically
+  // `h + shadowSpread` and an assertion written that way tests `shadowSpread > 0.25` and nothing else. Assert what is
+  // load-bearing for each: a fixed-radius blob against the footprint it has to clear, and the vehicles against the
+  // spread itself plus a ceiling, so a small `core` cannot inflate the blobs without bound instead.
+  //
+  // Footprint half-spans a standing figure has to clear, in metres: shoes ~0.12 long-side each side of centre with a
+  // stance of ~0.2, i.e. ~0.22 for a ped and ~0.25 for the (larger) player.
+  const PED_FOOT_HALF = 0.22, PLAYER_FOOT_HALF = 0.25;
+  const pedCore = PED_RENDER.shadowR * SHADOW_TUNING.core;
+  expect(pedCore > PED_FOOT_HALF + 0.15,
+    `a ped's opaque blob core (${pedCore.toFixed(2)} m) clears its own ${PED_FOOT_HALF} m foot half-span`);
+  const playerCore = PLAYER_SHADOW_R * SHADOW_TUNING.core;
+  expect(playerCore > PLAYER_FOOT_HALF + 0.15,
+    `the player's opaque blob core (${playerCore.toFixed(2)} m) clears his own ${PLAYER_FOOT_HALF} m foot half-span`);
+  expect(VEHICLE_RENDER.shadowSpread > 0.25,
+    `a vehicle blob's opaque core reaches ${VEHICLE_RENDER.shadowSpread} m past the spec footprint onto visible ground`);
+  for (const key of Object.keys(SPECS) as (keyof typeof SPECS)[]) {
+    const spec = SPECS[key];
+    const halfW = spec.width * 0.5, halfL = spec.length * 0.5;
+    const coreW = shadowExtent(halfW) * SHADOW_TUNING.core;
+    const coreL = shadowExtent(halfL) * SHADOW_TUNING.core;
+    expect(coreW > halfW + 0.25 && coreL > halfL + 0.25,
+      `${key}'s opaque blob core (${coreW.toFixed(2)} x ${coreL.toFixed(2)} m) reaches past its own ` +
+      `${halfW.toFixed(2)} x ${halfL.toFixed(2)} m footprint onto visible ground`);
+    // The rim is the other half: `core` is the divisor, so a small one swells the whole quad instead of shrinking
+    // the pool. Past 1.6x the body the fade alone is wider than the car and the blob reads as a fog patch.
+    expect(shadowExtent(halfW) < halfW * 1.6 + 0.6 && shadowExtent(halfL) < halfL * 1.6 + 0.6,
+      `${key}'s blob quad (${shadowExtent(halfW).toFixed(2)} x ${shadowExtent(halfL).toFixed(2)} m) stays close to its body`);
+  }
+  slice.dispose();
 });
 
 test('groundYAt: the sidewalk apron reads as kerb height on ALL FOUR faces of every block, the carriageway as road', () => {

@@ -81,6 +81,48 @@ const SURF = {
   canvas: { roughness: 0.9, metalness: 0, env: 0.3 },
 } as const;
 
+/**
+ * Sky-probe strength, made real.
+ *
+ * three OVERRIDES material.envMapIntensity whenever the environment comes from `scene.environment` rather than from
+ * the material's own `envMap`: WebGLRenderer.setProgram writes `scene.environmentIntensity` (1 by default) into the
+ * envMapIntensity uniform of every standard / lambert / phong material whose `envMap` is null. The probe here is the
+ * PMREM sky on the SCENE, so the whole `env` column of SURF above - every per-family probe strength this file has
+ * ever declared - has been DEAD, and the entire city has been answering the sky dome at full intensity. That is the
+ * ambient fill that was washing the shadows off the floor: a sky dome answers a horizontal surface from every
+ * direction at once, so unlit asphalt read within a factor of four of sunlit asphalt.
+ *
+ * `probeScale` below gives each family its `env` back by scaling the IBL terms in its own shader, which is the one
+ * place scene.environmentIntensity cannot reach. Measured back to back on the noon frame at (1036, 635), over the
+ * lot-asphalt band x 300..1000 / y 430..640, luma percentiles:
+ *
+ *                                       p10   p50   p90   p90/p10   mean
+ *     probe 1.0, no lift (what shipped)  36    51   155     4.31    73.1
+ *     probe = SURF.env + lift 1.22       26    41   146     5.62    66.5
+ *     probe = 0.55 x SURF.env + 1.32     23    45   136     5.91    67.2
+ *
+ * i.e. the table's own values take 28 % off the SHADOWED road for 6 % off the sunlit road - 30 % more lit-to-shadow
+ * ratio - and going below them keeps paying at a rising cost to the lit surface.
+ *
+ * Cutting the probe darkens the LIT ground as well, so this is the albedo compensation: the ground families are
+ * multiplied by GROUND_DAY_LIFT in full daylight to put the sunlit value back where it was, which scales the sun
+ * term and the remaining fill together and leaves the RATIO the probe cut bought. It is ramped off after dark
+ * (applyGroundLift), where the fill is the hemisphere and the lamps and the probe is worth ~1 % of the frame.
+ *
+ * The sun's own intensity lives in SkySystem and is deliberately NOT touched here. WHO IS ON THE HOLDER, exactly:
+ * the ground families (road / crosswalk / lotAsphalt / roadMark on probeRoad, sidewalk / pavement / plaza / grass /
+ * dirt on probeGround, sand on probeSand) - every one of which applyGroundLift also compensates - plus the two leaf
+ * materials on probeFoliage, which use it for the night ramp only and keep a daytime value of 1.
+ *
+ * EVERYTHING ELSE still runs on the scene's intensity and its `envMapIntensity` is dead in exactly the same way:
+ * the windowed families, `plain` (the roofline trim mesh and the backdrop hills), `glow`, and everything owned by the
+ * vehicle / ped / player renderers. Do not move a family onto the holder without the matching albedo compensation -
+ * a probe cut with no lift is a one-sided loss, which is what it cost the rooflines the first time round 11 tried it.
+ */
+const GROUND_DAY_LIFT = 1.22;
+/** Base albedo tints of the ground families that have one, so GROUND_DAY_LIFT can scale them without drift. */
+const GROUND_TINT = { pave: 0xaea89c, dirt: 0x5a4e3c } as const;
+
 export class Materials {
   private _night = 0;
   readonly building: Record<BuildingStyle, THREE.MeshStandardMaterial>;
@@ -130,6 +172,24 @@ export class Materials {
   private readonly lampDay = new THREE.Color(0x6a6a70);
   private readonly lampNight = new THREE.Color(0xfff2c8).multiplyScalar(HDR_BOOST);
   private glassMat: THREE.MeshStandardMaterial | null = null;
+  /** Per-family sky-probe strength, shared by reference into each family's shader (see probeScale). */
+  private readonly probeRoad = { value: SURF.road.env };
+  private readonly probeGround = { value: SURF.ground.env };
+  private readonly probeSand = { value: SURF.sand.env };
+  /**
+   * Leaf probe share, 1 by day and ramped to 0.3 at full night by applyNight. This is the half of the round-10
+   * "crowns go dark after sunset" fix that never ran: it was written as `palmFrond.envMapIntensity = ...` in
+   * applyNight, which three overwrites with scene.environmentIntensity on every draw (see the note above SURF), so
+   * only the albedo half was live and a moonlit crown still answered the sky dome at full strength. The DAY value is
+   * deliberately 1 and not SURF.foliage.env: giving the crowns their table value back is a separate look decision
+   * that would darken every tree at noon, and this round is about the floor.
+   *
+   * MEASURED, so nobody chases it again: making the ramp real is worth 0.13/255 on a tree crown at hour 21 (mean
+   * luma 15.21 -> 15.08 over the crown, against 0.00 on a sky control). The night sky probe is nearly black, so the
+   * crowns' night look is carried entirely by the albedo dim (FOLIAGE_NIGHT_DIM) and the roughness ramp below. The
+   * line is kept because it now does what it says rather than silently nothing, not because it is visible.
+   */
+  private readonly probeFoliage = { value: 1 };
 
   constructor(tex: TextureFactory) {
     this.building = {} as Record<BuildingStyle, THREE.MeshStandardMaterial>;
@@ -280,6 +340,21 @@ export class Materials {
     this.macroVariation(this.pavement, patch, macroFor(TILE_M.pavement), 0.13);
     this.macroVariation(this.sand, macro, macroFor(TILE_M.sand), 0.12);
     this.macroVariation(this.grass, macro, macroFor(TILE_M.grass), 0.22);
+    // Sky probe per family (see probeScale): last, so it wraps the macro patch instead of being overwritten by it.
+    for (const m of [this.road, this.crosswalk, this.lotAsphalt, this.roadMark]) this.probeScale(m, this.probeRoad);
+    for (const m of [this.sidewalk, this.pavement, this.plaza, this.grass, this.dirt]) this.probeScale(m, this.probeGround);
+    this.probeScale(this.sand, this.probeSand);
+    // Foliage gets the holder too, but only so applyNight can pull the probe down after dark - its DAY value stays
+    // at the scene intensity (see probeFoliage). NOT `plain` / `glow`: those are the roofline trim mesh (parapet
+    // bands, cornices, crown trim, neon bodies) and the backdrop hill ring, which are neither ground nor lifted by
+    // applyGroundLift, so a probe cut there is a one-sided loss. Measured at noon on the downtown roofline camera
+    // (702 / 213.5, yaw 1.571, pitch -0.2), mean luma of the trim band with the cut vs without: the white parapet
+    // course 123.3 -> 136.1 and the block roofline behind it 121.2 -> 126.0, against +0.09 on a windowed-wall control
+    // and 0.00 on a sky control. With the cut the near-white coping that catches the sky flattens to a dead grey.
+    // The windowed families (building / shopfront / plinth) are deliberately left on the scene's intensity too:
+    // their probe term is multiplied up on the glazing only (facadeSurfacePatch's uPaneEnv), so cutting it dims
+    // every window as much as the plaster beside it.
+    for (const m of [this.palmFrond, this.foliage]) this.probeScale(m, this.probeFoliage);
     this.setNight(0);
     // Name every material after its field so Renderer.sceneBreakdown() can attribute merged meshes (debug only).
     for (const [k, v] of Object.entries(this)) if (v instanceof THREE.Material && !v.name) v.name = k;
@@ -446,8 +521,10 @@ export class Materials {
     const leafDim = 1 - FOLIAGE_NIGHT_DIM * n;
     this.palmFrond.color.setHex(PALM_FROND_TINT).multiplyScalar(leafDim);
     this.foliage.color.setScalar(leafDim);
-    this.palmFrond.envMapIntensity = SURF.foliage.env * (1 - 0.7 * n);
-    this.foliage.envMapIntensity = SURF.foliage.env * (1 - 0.7 * n);
+    // Probe share of the leaves, through the shader holder: `envMapIntensity` here would be overwritten by
+    // scene.environmentIntensity on every draw (probeScale's doc block), which is why this line did nothing for
+    // a whole round.
+    this.probeFoliage.value = 1 - 0.7 * n;
     // The moon's broad specular lobe on 0.65-rough leaves was the actual pale grey: a crown whose canopy normals sat
     // near the half vector lit up in the moon's blue-white regardless of its albedo. Leaves go matte after dark.
     this.palmFrond.roughness = PALM_FROND_ROUGHNESS + (0.97 - PALM_FROND_ROUGHNESS) * n;
@@ -458,6 +535,55 @@ export class Materials {
     this.road.roughness = SURF.road.roughnessDay + n * (SURF.road.roughnessNight - SURF.road.roughnessDay);
     this.crosswalk.roughness = this.road.roughness;
     this.lotAsphalt.roughness = this.road.roughness;
+    this.applyGroundLift(n);
+  }
+
+  /**
+   * Daylight albedo lift on the ground families, ramped off after dark. It is the other half of `probeScale`: the
+   * probe cut takes the sunlit road down with the shadowed road, and this puts the SUNLIT value back. Multiplying the
+   * albedo scales the sun term and the remaining fill together, so the lit / shadowed ratio the probe cut bought is
+   * kept while the frame's overall level is not. At night lift = 1 and the ground is exactly what it was.
+   */
+  private applyGroundLift(n: number): void {
+    const lift = 1 + (GROUND_DAY_LIFT - 1) * (1 - n);
+    this.road.color.setScalar(lift);
+    this.crosswalk.color.setScalar(lift);
+    this.lotAsphalt.color.setScalar(lift);
+    // The lane paint takes the same probe cut as the asphalt it lies on (probeRoad), so it needs the same lift or it
+    // loses contrast against a road that just gained 22 % of albedo: a stop bar and a lot bay line are ground.
+    this.roadMark.color.setScalar(lift);
+    this.plaza.color.setScalar(lift);
+    this.grass.color.setScalar(lift);
+    this.sand.color.setScalar(lift);
+    this.sidewalk.color.setHex(GROUND_TINT.pave).multiplyScalar(lift);
+    this.pavement.color.setHex(GROUND_TINT.pave).multiplyScalar(lift);
+    this.dirt.color.setHex(GROUND_TINT.dirt).multiplyScalar(lift);
+  }
+
+  /**
+   * Gives one material its own sky-probe strength by scaling the IBL terms in its shader.
+   *
+   * `material.envMapIntensity` cannot do this while the probe lives on the scene (see the SURF / GROUND_DAY_LIFT note
+   * above): three writes scene.environmentIntensity over it on every draw. The two IBL accumulators are in scope right
+   * after `lights_fragment_maps` for every standard material - this is the same seam facadeSurfacePatch already uses
+   * to lift the probe on glazing - so a single uniform multiply there is the whole fix. `k` is shared by reference
+   * across a family, which is how a family can be re-tuned per frame (none is, today) from one holder.
+   *
+   * Any onBeforeCompile already on the material is chained, not replaced, and its cache key with it: two materials
+   * whose generated source differs (a macroVariation ground tile vs a plain one) must never share a program.
+   */
+  private probeScale(m: THREE.MeshStandardMaterial, k: { value: number }): void {
+    const prev = m.onBeforeCompile;
+    const prevKey = m.customProgramCacheKey;
+    const prevTag = prevKey ? prevKey.call(m) : prev ? prev.toString() : 'none';
+    m.onBeforeCompile = (shader, renderer) => {
+      if (prev) prev.call(m, shader, renderer);
+      shader.uniforms.uProbeK = k;
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nuniform float uProbeK;')
+        .replace('#include <lights_fragment_maps>', '#include <lights_fragment_maps>\niblIrradiance *= uProbeK;\nradiance *= uProbeK;');
+    };
+    m.customProgramCacheKey = () => `probe1:${prevTag}`;
   }
 
   /** Scrolls the water albedo/normal UVs (opposite drifts give a moving specular) and the surf line. */
