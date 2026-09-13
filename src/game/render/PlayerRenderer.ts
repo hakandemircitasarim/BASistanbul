@@ -272,6 +272,20 @@ export function fillAttr(g: THREE.BufferGeometry, name: string, value: number): 
 }
 
 /**
+ * Adds a single-float attribute whose value is chosen per vertex from its height. Used for the colour-source flag on
+ * a torso that is trousers below the belt and shirt above it: one tube, two garments, no extra triangles and no
+ * second draw.
+ */
+export function fillAttrY(g: THREE.BufferGeometry, name: string, fn: (y: number) => number): THREE.BufferGeometry {
+  const pos = g.attributes.position as THREE.BufferAttribute;
+  const n = pos.count;
+  const a = new Float32Array(n);
+  for (let i = 0; i < n; i++) a[i] = fn(pos.getY(i));
+  g.setAttribute(name, new THREE.BufferAttribute(a, 1));
+  return g;
+}
+
+/**
  * Rotates everything below `pivotY` about the x axis through (0, pivotY, 0), blending in over `blend` metres so a
  * tube bends at a joint instead of snapping. Used to pre-bend pedestrian knees and elbows in geometry.
  */
@@ -416,10 +430,19 @@ export function hand(s: number, side: number, segs: number, rings: number): THRE
   const palm = blob(0.034 * s, 0.062 * s, 0.062 * s, segs, rings);
   palm.rotateY(side * 0.22);
   palm.translate(-side * 0.004 * s, wrist - 0.046 * s, 0.010 * s);
-  // Finger mass: a second, narrower lobe hanging off the palm and curled a little forward. Without it the hand ended
-  // at the palm and the arm read as a tube with a bud on it - the "rounded stub" of the critic's list. Twelve
-  // triangles a hand at the crowd's tessellation, twenty-four at the player's.
-  const fingers = blob(0.030 * s, 0.040 * s, 0.046 * s, Math.max(4, segs - 2), Math.max(3, rings - 2));
+  // Finger mass: THREE lobes, not one. A hand hanging at the side spreads its fingers front-to-back (the palm faces
+  // the thigh), so the splits run along z. One smooth lobe is a mitten - at the two to four metres the camera can get
+  // to a pedestrian it is the "no hands" of the critic's first-ranked failure - and three lobes with their own
+  // normals put two real shading grooves in it for the price of two small ellipsoids. The middle lobe is the longest,
+  // as a hand's is, so the outline is not a flat paddle end.
+  const fseg = Math.max(4, segs - 2), fring = Math.max(3, rings - 2);
+  const digits: THREE.BufferGeometry[] = [];
+  for (const [dz, len] of [[-0.030, 0.036], [0, 0.042], [0.030, 0.034]] as [number, number][]) {
+    const d = blob(0.030 * s, len * s, 0.0165 * s, fseg, fring);
+    d.translate(0, (0.040 - len) * s, dz * s);
+    digits.push(d);
+  }
+  const fingers = fuseBare(digits);
   fingers.rotateX(-0.30);
   fingers.rotateY(side * 0.22);
   fingers.translate(-side * 0.006 * s, wrist - 0.106 * s, 0.020 * s);
@@ -460,6 +483,13 @@ export function bakeAO(g: THREE.BufferGeometry, s: number): THREE.BufferGeometry
     ao *= pocket(x, y, z, 0, 0.76 * s, 0, 0.17 * s, 0.30); // between the thighs (wider now that the legs are apart)
     ao *= pocket(x, y, z, 0, 1.51 * s, 0.02 * s, 0.1 * s, 0.22); // under the chin
     ao *= 1 - 0.14 * smoothstep(1.44 * s, 1.5 * s, y) * (1 - smoothstep(1.52 * s, 1.58 * s, y)); // inside the collar
+    // Under the shirt hem: the hem and the belt stand proud of the seat, so the trousers they overhang sit in shade.
+    // Without it the waist is a colour change with no depth - the garments read as printed bands on one tube.
+    ao *= 1 - 0.16 * smoothstep(0.80 * s, P.beltLo * s, y) * (1 - smoothstep(P.beltLo * s, P.beltHi * s, y));
+    // Wrists: the hand is a separate mass hanging off the forearm, and the step between them needs a shadow or the
+    // two read as one tube however the hand is sculpted (HAND_TONE does the albedo half of the same job).
+    ao *= pocket(x, y, z, -P.shoulderX * s, 0.783 * s, 0.004 * s, 0.048 * s, 0.26);
+    ao *= pocket(x, y, z, P.shoulderX * s, 0.783 * s, 0.004 * s, 0.048 * s, 0.26);
     // Hair line: skin just below the cap edge (fringe over the brow, deeper at the temples and the nape).
     const nx = x / rx, ny = (y - cy) / ry, nz = z / rz;
     const rr = Math.sqrt(nx * nx + ny * ny + nz * nz);
@@ -468,6 +498,12 @@ export function bakeAO(g: THREE.BufferGeometry, s: number): THREE.BufferGeometry
       const edge = f < 0.5 ? HAIR_FRONT * 0.95 + (1.7 - HAIR_FRONT * 0.95) * (f * 2) : 1.7 + 0.55 * ((f - 0.5) * 2);
       const th = Math.acos(clamp(ny / Math.max(1e-6, rr), -1, 1));
       ao *= 1 - 0.18 * (1 - smoothstep(edge - 0.02, edge + 0.32, th));
+      // Eye sockets: the brow stands proud of the face and the eye block is sunk under it, so the skin around the eye
+      // belongs in shade. Two dark bars on a flat oval is what reads as a mannequin at two metres; the same two bars
+      // inside a socket read as a face. Skin only - the eye and brow blocks are painted absolute colours.
+      for (const sx of [-1, 1]) {
+        ao *= pocket(x, y, z, sx * rx * 0.38, cy + ry * (EYE_Y + 0.06), rz * 0.9, rx * 0.55, 0.28);
+      }
     }
     if (ao < 1) col.setXYZ(i, col.getX(i) * ao, col.getY(i) * ao, col.getZ(i) * ao);
   }
@@ -546,7 +582,18 @@ export function headParts(s: number, segs: number, rings: number, hairRows: numb
   mouth.translate(0, my, faceZ(0, my, cy, rx, ry, rz, jaw) - rz * 0.045);
   emit('brow', mouth);
   // Hair: the fringe stops at HAIR_FRONT (a real forehead above the brows) and the nape keeps its long edge.
-  emit('hair', hairCap(cy + ry * 0.02, rx * 1.075 + 0.003, ry * 1.09, rz * 1.075 + 0.003, segs, hairRows, HAIR_FRONT, 1.76, 2.06, 0.15, 0.17));
+  emit('hair', hairFor(s, segs, hairRows));
+}
+
+/**
+ * The hair cap `headParts` wraps over the skull, at a chosen tessellation. Exported on its own because the crowd's far
+ * tier builds a head out of a skull and this cap alone - no ears, nose, eyes, brows or mouth - and it has to be the
+ * SAME cap, or a ped changes the shape of its head as it crosses the tier line.
+ */
+export function hairFor(s: number, segs: number, rows: number): THREE.BufferGeometry {
+  const P = PROFILE;
+  const cy = P.headCY * s, rx = P.headRX * s, ry = P.headRY * s, rz = P.headRZ * s;
+  return hairCap(cy + ry * 0.02, rx * 1.075 + 0.003, ry * 1.09, rz * 1.075 + 0.003, segs, rows, HAIR_FRONT, 1.76, 2.06, 0.15, 0.17);
 }
 
 /** Face furniture heights, in head radii about the skull centre: eyes, brows and the front hairline (polar, radians). */

@@ -120,14 +120,62 @@ const SURF = {
  * dirt on probeGround, sand on probeSand) - every one of which applyGroundLift also compensates - plus the two leaf
  * materials on probeFoliage, which use it for the night ramp only and keep a daytime value of 1.
  *
- * EVERYTHING ELSE still runs on the scene's intensity and its `envMapIntensity` is dead in exactly the same way:
- * the windowed families, `plain` (the roofline trim mesh and the backdrop hills), `glow`, and everything owned by the
- * vehicle / ped / player renderers. Do not move a family onto the holder without the matching albedo compensation -
- * a probe cut with no lift is a one-sided loss, which is what it cost the rooflines the first time round 11 tried it.
+ * Round 13 added the windowed families (building / shopfront / plinth) on probeFacade with their own lift, for the
+ * reason in the FACADE_PROBE block below. EVERYTHING ELSE still runs on the scene's intensity and its
+ * `envMapIntensity` is dead in exactly the same way: `plain` (the roofline trim mesh and the backdrop hills),
+ * `glow`, `facade` (the built window-frame / sill / balcony detail), and everything owned by the vehicle / ped /
+ * player renderers. Do not move a family onto the holder without the matching albedo compensation - a probe cut with
+ * no lift is a one-sided loss, which is what it cost the rooflines the first time round 11 tried it.
  */
 const GROUND_DAY_LIFT = 1.22;
 /** Base albedo tints of the ground families that have one, so GROUND_DAY_LIFT can scale them without drift. */
 const GROUND_TINT = { pave: 0xaea89c, dirt: 0x5a4e3c } as const;
+
+/**
+ * THE SAME TRADE, NOW FOR THE VERTICALS: probe share and matching albedo lift of the windowed families
+ * (building x 5 styles, shopfront, plinth).
+ *
+ * The city read as flat painted cards because the sun was not a key light on anything vertical. Measured over 11,193
+ * raycast-classified samples in nine frames (downtown NE / downtown SW / beachfront x 08:00 / 12:00 / 17:00, 1280x720,
+ * clock + pose pinned, every term zeroed by a SOURCE edit and a fresh page), sun share of display luminance:
+ *
+ *                                     lit ground        sun-facing facade     facade facing away
+ *     sun.intensity = 0              53-62 %            16-37 %               0.5-2.1 %
+ *
+ * The deficit is not geometry: at 08:00 and 17:00 a sun-facing wall gets MORE direct irradiance than the ground
+ * (N.L 0.90 vs 0.28, 0.85 vs 0.34) and still reads at 18 % / 35 % against the ground's 37 % / 54 %. It is not the
+ * hemisphere (1.7-10.2 % of a sunlit facade), not the normal map (<= 0.3/255 with it off), not GTAO (off in every
+ * frame) and not applyGroundLift (0.0 % on facades - it only touches the ground families). It is the PMREM sky probe:
+ * worth 18-37 % of a sunlit facade and 49-62 % of a shaded one, against 4-18 % of lit ground, because the ground
+ * families already run at SURF.env through probeScale while the windowed ones sat on scene.environmentIntensity = 1.
+ * In absolute terms at noon the probe puts 66.9/255 into a shadowed facade and 14.3/255 into shadowed paving, so a
+ * facade's shadow sits at 131.7 against a lit 135.2 - a 1.03 ratio - while the ground's sits at 35.5 against 157.1.
+ *
+ * 0.30 + 1.40 is a MEASURED pair, not an interpolated one. Re-measured at the same pixels with this exact patch in
+ * place (sun share = base vs the same build with sun.intensity = 0, both shot per variant):
+ *
+ *     bucket (n)                                sun share      level        lit ground in the same frame
+ *     12:00 downtown, wall on the sun azimuth (765)  37.0 -> 52.7 %   132.7 -> 134.7   61.4 -> 61.4 %
+ *     17:00 downtown, N.L 0.75 (250)                 34.3 -> 53.5 %   161.1 -> 158.7   53.0 -> 52.9 %
+ *     17:00 downtown, N.L 0.50 (735)                 30.3 -> 48.6 %   108.3 -> 102.5   53.0 -> 52.9 %
+ *     12:00 beachfront, pale shopfront wall (130)    26.3 -> 38.7 %   189.9 -> 193.4   58.5 -> 58.4 %
+ *     17:00 beachfront (141)                         21.0 -> 36.3 %   163.7 -> 160.5   48.4 -> 48.3 %
+ *
+ * i.e. the downtown faces land inside the 45-55 % band the round asked for and the beachfront's pale walls, which
+ * start 11 points lower, land at 36-39 %. Lit ground is untouched at every hour (<= 0.1 % of level and of share).
+ * Lit-to-shaded facade contrast at noon, same orientation, goes 132.7 / 87.1 = 1.52 to 134.7 / 70.9 = 1.90.
+ * The conservative pair is 0.45 / 1.25 (48.8 % / 49.6 % on phase 1's measurement); anything between is unmeasured.
+ *
+ * BOTH HALVES RAMP OFF WITH THE NIGHT FACTOR (applyNight / applyGroundLift), which is not cosmetic: after dark the
+ * probe is what carries the orange dusk sky on the towers, and `material.color` does not scale `emissive` (three
+ * multiplies that by emissiveIntensity alone), so at n = 1 the night city is the frame it was. Measured on the
+ * fixed-camera sandbox, whole frame, this build against the previous commit: 21:00 promenade (n = 1) mean luma
+ * 46.38 -> 46.39, 0.03 % of pixels off by more than 8/255; 22:00 parked car 40.73 -> 40.73, 0.00 %. At dusk the ramp
+ * is partly in (19:00 is n = 0.36, so probeFacade 0.55 and lift 1.26): the 19:00 downtown street moves -1.8/255 mean
+ * with 4.8 % of pixels over 8/255 and the dusk skyline -1.3/255 with 1.4 % - both frames keep their sunset glow.
+ */
+const FACADE_PROBE = 0.30;
+const FACADE_DAY_LIFT = 1.40;
 
 export class Materials {
   private _night = 0;
@@ -196,6 +244,8 @@ export class Materials {
    * line is kept because it now does what it says rather than silently nothing, not because it is visible.
    */
   private readonly probeFoliage = { value: 1 };
+  /** Windowed-facade probe share (FACADE_PROBE by day, ramped back to 1 at full night by applyNight). */
+  private readonly probeFacade = { value: FACADE_PROBE };
 
   constructor(tex: TextureFactory) {
     this.building = {} as Record<BuildingStyle, THREE.MeshStandardMaterial>;
@@ -357,10 +407,13 @@ export class Materials {
     // (702 / 213.5, yaw 1.571, pitch -0.2), mean luma of the trim band with the cut vs without: the white parapet
     // course 123.3 -> 136.1 and the block roofline behind it 121.2 -> 126.0, against +0.09 on a windowed-wall control
     // and 0.00 on a sky control. With the cut the near-white coping that catches the sky flattens to a dead grey.
-    // The windowed families (building / shopfront / plinth) are deliberately left on the scene's intensity too:
-    // their probe term is multiplied up on the glazing only (facadeSurfacePatch's uPaneEnv), so cutting it dims
-    // every window as much as the plaster beside it.
     for (const m of [this.palmFrond, this.foliage]) this.probeScale(m, this.probeFoliage);
+    // The windowed families DO take the holder (FACADE_PROBE + FACADE_DAY_LIFT above): they are the verticals the
+    // sun was not keying. It has to run after facadeSurfacePatch so probeScale chains that patch instead of
+    // replacing it - the pane lift (uPaneEnv, applied inside lights_fragment_maps) is then scaled with the rest of
+    // the probe term, which is intended: the glazing keeps its extra sky share RELATIVE to the plaster beside it.
+    for (let i = 0; i < STYLES.length; i++) this.probeScale(this.building[STYLES[i]], this.probeFacade);
+    for (const m of [this.shopfront, this.plinth]) this.probeScale(m, this.probeFacade);
     this.setNight(0);
     // Name every material after its field so Renderer.sceneBreakdown() can attribute merged meshes (debug only).
     for (const [k, v] of Object.entries(this)) if (v instanceof THREE.Material && !v.name) v.name = k;
@@ -556,6 +609,9 @@ export class Materials {
     // scene.environmentIntensity on every draw (probeScale's doc block), which is why this line did nothing for
     // a whole round.
     this.probeFoliage.value = 1 - 0.7 * n;
+    // Facades: the daylight probe cut ramps back to the scene intensity as the sun goes, so the dusk and night
+    // skyline keeps the sky it reflects (and at n = 1 is byte-identical to the pre-round-13 frame).
+    this.probeFacade.value = FACADE_PROBE + (1 - FACADE_PROBE) * n;
     // The moon's broad specular lobe on 0.65-rough leaves was the actual pale grey: a crown whose canopy normals sat
     // near the half vector lit up in the moon's blue-white regardless of its albedo. Leaves go matte after dark.
     this.palmFrond.roughness = PALM_FROND_ROUGHNESS + (0.97 - PALM_FROND_ROUGHNESS) * n;
@@ -589,6 +645,13 @@ export class Materials {
     this.sidewalk.color.setHex(GROUND_TINT.pave).multiplyScalar(lift);
     this.pavement.color.setHex(GROUND_TINT.pave).multiplyScalar(lift);
     this.dirt.color.setHex(GROUND_TINT.dirt).multiplyScalar(lift);
+    // Facade albedo compensation for the FACADE_PROBE cut, on the same ramp. Their base colour is white (the tone
+    // comes from the map and the vertex colour), so a scalar is the whole tint. `emissive` is untouched by
+    // material.color in three, so lit windows, shop interiors and lobby glow are the same at every hour.
+    const flift = 1 + (FACADE_DAY_LIFT - 1) * (1 - n);
+    for (let i = 0; i < STYLES.length; i++) this.building[STYLES[i]].color.setScalar(flift);
+    this.shopfront.color.setScalar(flift);
+    this.plinth.color.setScalar(flift);
   }
 
   /**

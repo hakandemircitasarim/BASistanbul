@@ -84,10 +84,35 @@ const SHADOW_TAPS = 7;
  * blocker probe is pinned outright: it only ever reads a +- pair, and rotating THAT per pixel dithered the penumbra
  * WIDTH, which was the second half of the same crosshatch.
  *
- * 2 and 3 texels: the near rung of the ladder is 1.1 texels and the mid rung (palm crowns, first-floor parapets)
- * 2.5, so the shadows a player walks past are all smooth; only a facade thrown down the street rotates.
+ * ROUND 13: THE ROTATION IS NOT WORTH IT AT ANY WIDTH THIS PROJECT USES, so the gate is set above the widest disk
+ * (SHADOW_RADIUS is 6 texels, this is 8) and the ramp never engages. Round 12 only ramped it out below 2 texels, i.e.
+ * it left it at FULL strength on exactly the shadow the last critic photographed: a tower's shadow edge on the plaza,
+ * which is the far rung (6 texels, an 8.4 px penumbra in the frame).
+ *
+ * Measured on the shadow ATTENUATION FIELD - luma(sun shadows off) minus luma(sun shadows on), which cancels the
+ * paving albedo and leaves only what the filter did - over the 70 x 95 px block straddling that edge
+ * (/rendertest?hour=15&quality=high&ao=0&view=plaza, 1280x720, film grain zeroed so the two shots are comparable),
+ * counting the steps where the field RISES as it crosses from lit to shadow (a gradient never does):
+ *
+ *     rotation source                       reversals per row   rows with a reversal   penumbra
+ *     stock IGN of gl_FragCoord (round 12)        2.00                 89.7 %           8.44 px
+ *     white-noise hash of gl_FragCoord            1.55                 82.8 %           8.46 px
+ *     world-locked angle, one turn / 4 m          0.29                 20.7 %           8.27 px
+ *     pinned (this)                               0.16                 14.9 %           9.59 px
+ *
+ * So the ordered pattern is not the problem WITH the rotation, the rotation is: re-randomising it with real noise
+ * fixes nothing (82.8 %), because at 7 taps over a 6-texel disk each rotation of the tap set is a different estimate
+ * of the same edge, and the difference between neighbouring pixels IS the artefact whether it is ordered or not. The
+ * pinned disk is fixed in LIGHT space, so its residual is attached to the shadow instead of to the screen, and the
+ * profile becomes a monotone ramp (and 1.15 px wider - the rotation had been narrowing the penumbra as well).
+ * Round 9's reason for the rotation was a Vogel ROSETTE at 5 taps; at 7 there is none - checked at the same hour on
+ * the palm-frond shadows on the plaza paving (the frond tips come out smoother pinned, not scalloped) and on the
+ * tower edge above, which is the widest disk in the game.
+ *
+ * The ramp is kept, not deleted: it is the mechanism that would bring the rotation back if SHADOW_RADIUS ever went
+ * past 8 texels, where a 7-tap disk really would start to scallop.
  */
-const SHADOW_DITHER = { fromTexels: 2, spanTexels: 3 } as const;
+const SHADOW_DITHER = { fromTexels: 8, spanTexels: 3 } as const;
 /**
  * Blocker-distance ladder, the thing that decides how wide the disk actually gets (see patchShadowPenumbra).
  *
@@ -218,8 +243,20 @@ const SKY_TUNING = {
   cloudScale: 0.6, cloudCut: 0.28, cloudSoft: 0.3, cloudDay: 0.45, cloudNight: 0.22, cloudDrift: 0.018,
   // Dome radiance multiplier (linear HDR): a bright day sky that ACES rolls off, unity at night so the stars keep their size.
   exposureDay: 1.8, exposureNight: 1.0,
-  // Reflection probe resolution (equirect) and refresh cadence in game hours. 256x128 is the smallest size at which the
-  // horizon crease, the skyline row and the hard sun disc survive PMREM filtering on a clearcoat car roof.
+  // Reflection probe source resolution (equirect) and refresh cadence in game hours.
+  //
+  // THIS NUMBER IS NOT THE REFLECTION'S RESOLUTION AND RAISING IT BUYS NOTHING - measured, so nobody spends the time
+  // again. PMREMGenerator._fromTexture sizes its cube from `texture.image.width / 4`, so a 256x128 equirect becomes a
+  // 64 px cube face (lodMax 6) and a 1024x512 one a 256 px face. Rendered at the parked-car camera
+  // (/rendertest?hour=12&quality=high&ao=0&cam=962.8,1.85,504.2&look=959.5,0.9,507.5, the sports car's bonnet fills
+  // 150x66 px at 4.5 m), 512x256 moved the bonnet's mean luma by 0.13/255 and its standard deviation by -0.01, and
+  // 1024x512 by 0.20/255 and -0.03. The reflection a car shows is limited by the PAINT's lobe, not by the probe:
+  // the base is metalness 0.45 / roughness 0.35, whose IBL lobe integrates roughly a 40 degree cone and averages any
+  // probe feature finer than that away, and the only sharp lobe is the clearcoat's, which carries F0 = 0.04.
+  // Measured that way round too: replacing the probe's whole sky with alternating 0.25x / 2.2x bands every 2.5 deg of
+  // elevation - an 8.8:1 contrast the real sky never has - moved the same bonnet by 2.44/255 and its sd by +0.47,
+  // and a sunlit flank by 2.19/255. So probe CONTENT is worth about 2/255 of structure on paint and probe STRENGTH is
+  // worth a lot of level (killing scene.environment costs the bonnet 19.9/255 and its blue channel 62.6/255).
   probeW: 256, probeH: 128, probeRefreshHours: 0.3,
   // Probe skyline: number of silhouette blocks around the horizon, their height range in sin(elevation) and gap chance.
   probeBlocks: 44, probeBlockMinH: 0.012, probeBlockMaxH: 0.075, probeGapChance: 0.3,
