@@ -367,8 +367,9 @@ function farGeometry(): THREE.BufferGeometry {
   const rad = R.farRadial;
   const hipY = P.hipY * s, shY = P.shoulderY * s;
   const parts: THREE.BufferGeometry[] = [];
-  // Torso: lidded at the collar only. The hip end closes between the thighs where nothing can see it, but the collar
-  // opening is 1.45 m up and the chase camera rides at 2.2 m, so it is looked into from above at every distance.
+  // Torso: lidded at the collar only. The hip end is left open - it is 0.66 m up, between the thighs, and the chase
+  // camera rides at 2.2 m, so nothing ever looks up into it - while the collar opening is at 1.45 m and IS looked
+  // down into from every distance, so it has to be closed or the figure has a hole in its neck.
   const farTorso = farPart(paintTorso(tube(farRings(torsoRings(s), FAR_TORSO_Y, s), rad, true, false), s), 0, V_ALL, 0, 0);
   parts.push(fillAttrY(farTorso, 'absCol', (y) => (y < PANTS_Y * s ? 3 : 0)));
   parts.push(farPart(level(tube(farRings(neckRings(s), FAR_NECK_Y, s), rad, false, false), 1), 2, V_ALL, 0, 0));
