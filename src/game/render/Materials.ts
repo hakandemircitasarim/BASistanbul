@@ -41,6 +41,12 @@ const FOLIAGE_NIGHT_DIM = 0.65;
 /** Daylight roughness of the alpha fronds (0.97 at full night: no moon highlight on the leaves). */
 const PALM_FROND_ROUGHNESS = 0.65;
 /**
+ * Ceiling (linear radiance) of the leaf materials' specular sum, applied as a Reinhard knee - see leafSpecularPatch.
+ * A leaf is a matte dielectric with a faint waxy sheen; anything past this is the low-sun Fresnel runaway that turned
+ * the spawn palms into white cut-outs at 07:00.
+ */
+const LEAF_SPEC_CEIL = 0.08;
+/**
  * Half width of the frond alpha ramp around alphaTest (see the palmFrond shader patch). Alpha-to-coverage dithers
  * whatever lands inside this band into an MSAA sample mask, and on a 4-sample resolve that mask is a visible stipple:
  * at +-0.08 the leaflet serrations (which cross the band over a texel or two) grew a horizontal comb at 15-40 m on
@@ -305,7 +311,7 @@ export class Materials {
         '}',
       ].join('\n'));
     };
-    this.palmFrond.customProgramCacheKey = () => 'palmFrondSharpen6';
+    this.palmFrond.customProgramCacheKey = () => 'palmFrondSharpen8';
     // Solid foliage (PropRenderer bakes the normals: canopy normals on the far fronds, face normals on the crowns and
     // hedges) with the same daylight-only translucency emissive as the fronds, so the far palm LOD and the tree crowns
     // fall dark with the near fronds after sunset instead of standing in the street as pale cut-outs.
@@ -316,7 +322,7 @@ export class Materials {
     // leafTexture), which is why it must be masked off the bark the same batch carries: leafMapMixPatch below.
     this.foliage = new THREE.MeshStandardMaterial({ map: leafTexture(), vertexColors: true, roughness: SURF.foliage.roughness, metalness: SURF.foliage.metalness, envMapIntensity: SURF.foliage.env, emissive: PALM_FROND_TINT, emissiveIntensity: PALM_FROND_EMISSIVE_DAY });
     this.foliage.onBeforeCompile = (shader) => { this.leafSpecularPatch(shader); Materials.leafMapMixPatch(shader); };
-    this.foliage.customProgramCacheKey = () => 'foliageLeaf5';
+    this.foliage.customProgramCacheKey = () => 'foliageLeaf7';
     this.lampPole = new THREE.MeshStandardMaterial({ color: 0x3a3d44, roughness: SURF.metal.roughness, metalness: SURF.metal.metalness, envMapIntensity: SURF.metal.env });
     this.bench = new THREE.MeshStandardMaterial({ color: 0x8a5a30, roughness: SURF.wood.roughness, metalness: 0, envMapIntensity: SURF.wood.env });
     this.hydrant = new THREE.MeshStandardMaterial({ color: 0xd8302a, roughness: SURF.paint.roughness, metalness: SURF.paint.metalness, envMapIntensity: SURF.paint.env });
@@ -449,7 +455,32 @@ export class Materials {
       .replace('#include <lights_physical_fragment>', THREE.ShaderChunk.lights_physical_fragment
         .replace('material.specularColor = vec3( 0.04 );', 'material.specularColor = vec3( 0.04 * uLeafSpec );')
         // F90 too: the probe's grazing-angle reflection (the multi-scatter term) is what a scaled F0 alone leaves behind.
-        .replace('material.specularF90 = 1.0;\n', 'material.specularF90 = uLeafSpec;\n'));
+        .replace('material.specularF90 = 1.0;\n', 'material.specularF90 = uLeafSpec;\n'))
+      // Specular CEILING, the daylight half of the same bug the night ramp above fixes.
+      //
+      // Measured at hour 7 on the spawn's right-hand palm by writing the lighting terms straight to gl_FragColor:
+      // the albedo is a clean green (screenshot P1), and `directSpecular + indirectSpecular` ALONE is a flat pale
+      // khaki cut-out filling the whole crown (P2) - i.e. every green pixel of that palm was specular, not leaf.
+      // Splitting the terms into channels (P3) showed direct and indirect specular both saturated while the indirect
+      // DIFFUSE was ~0: at a low sun the leaf planes and the eye are both near grazing, so the dielectric Fresnel
+      // runs to F90 on every texel at once and a rough (0.65) lobe smears it over the whole frond. Nothing about the
+      // night ramp helps - uLeafSpec is 1 in the morning, which is exactly when the sky is brightest.
+      //
+      // A hard clamp would just be a flat plateau of a different colour, so this is a per-channel Reinhard knee:
+      // small highlights (a leaf catching the noon sun) pass through untouched, and the runaway dawn term is
+      // compressed asymptotically toward LEAF_SPEC_CEIL. It is applied to the sum, before the albedo is multiplied
+      // in, so it can never make a leaf lighter than its own green plus that ceiling.
+      .replace('#include <lights_fragment_end>', [
+        '#include <lights_fragment_end>',
+        '{',
+        `  const float leafCeil = ${LEAF_SPEC_CEIL.toFixed(3)};`,
+        '  vec3 leafSpecSum = reflectedLight.directSpecular + reflectedLight.indirectSpecular;',
+        '  vec3 leafKnee = leafSpecSum / ( 1.0 + leafSpecSum / leafCeil );',
+        '  vec3 leafScale = leafKnee / max( leafSpecSum, vec3( 1e-4 ) );',
+        '  reflectedLight.directSpecular *= leafScale;',
+        '  reflectedLight.indirectSpecular *= leafScale;',
+        '}',
+      ].join('\n'));
   }
 
   get nightFactor(): number { return this._night; }

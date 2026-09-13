@@ -9,7 +9,7 @@ import type { Transform } from '../core/Types';
 import { createTransform, lerpTransform } from '../core/Transform';
 import { clamp, damp, smoothstep } from '../core/math';
 import { DAY_TUNING } from '../systems/DayNightSystem';
-import { ContactShadows, groundYAt } from './ContactShadows';
+import { ContactShadows, contactExtent, groundYAt } from './ContactShadows';
 
 const SHIRT = 0xff7a00;
 const COLLAR = 0xd95f00;
@@ -24,13 +24,16 @@ const SHOE = 0x1b1b20;
 const SOLE = 0x4a4a52;
 const BUCKLE = 0xb9a05c;
 /**
- * Contact blob half-width. Bigger than it looks it should be (a 1.4 m ellipse under a 1.8 m figure), because the shared
- * blob texture is only opaque inside `SHADOW_TUNING.core` of its radius and fades to nothing at the rim: at the
- * geometrically "correct" 0.56 the whole opaque core hid under the figure's own footprint and the blob read as nothing
- * at all (measured: no change in the pavement pixels under the player at noon). At 0.7 the core is a 50 cm puddle that
- * shows around the shoes, which is what grounds the figure - especially at night, when there is no sun shadow at all.
+ * Half-span of the player's own footprint in metres (he is a little larger than a ped, PED_FOOT_HALF 0.22): a shoe is
+ * ~0.12 either side of its centre line on a ~0.26 stance.
  */
-export const SHADOW_R = 0.7;
+export const PLAYER_FOOT_HALF = 0.25;
+/**
+ * Contact blob half-width: the footprint grown by the shared spill and penumbra (see ContactShadows.contactExtent),
+ * so the undiluted part of the pool lands on the paving AROUND the shoes instead of hiding under them. It is what
+ * grounds the figure at night, when there is no sun shadow at all.
+ */
+export const SHADOW_R = contactExtent(PLAYER_FOOT_HALF);
 const SHADOW_LIFT = 0.03;
 /** Contact blob shape: `NARROW` of the old radius across the light direction, up to `STRETCH_MAX` along it. */
 const SHADOW_NARROW = 1.0;
@@ -816,11 +819,11 @@ export class PlayerRenderer {
     updateGroundShadow(this.groundShadow, this.scene, SHADOW_NARROW, SHADOW_STRETCH_MAX, SHADOW_ELEV_FLOOR);
     const gs = this.groundShadow;
     const gyS = this.groundY + SHADOW_LIFT;
-    if (!p.alive) this.shadows.add(this.interp.x, gyS, this.interp.z, SHADOW_R, SHADOW_R * 1.8, this.interp.yaw, sc);
+    if (!p.alive) this.shadows.add(this.interp.x, gyS, this.interp.z, SHADOW_R, SHADOW_R * 1.8, this.interp.yaw, sc, 1);
     else {
       // See PED_RENDER.shadowAnchor: the full (rz - rx) offset walks the blob's opaque core away from the feet.
       const rx = SHADOW_R * SHADOW_NARROW, rz = SHADOW_R * gs.stretch, push = (rz - rx) * SHADOW_ANCHOR;
-      this.shadows.add(this.interp.x + gs.dirX * push, gyS, this.interp.z + gs.dirZ * push, rx, rz, Math.atan2(gs.dirX, gs.dirZ), sc);
+      this.shadows.add(this.interp.x + gs.dirX * push, gyS, this.interp.z + gs.dirZ * push, rx, rz, Math.atan2(gs.dirX, gs.dirZ), sc, 1);
     }
     this.shadows.end();
 

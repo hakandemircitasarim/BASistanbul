@@ -23,7 +23,7 @@ import { BUDGET } from '../core/Budget';
 import type { Transform } from '../core/Types';
 import { createTransform, lerpTransform } from '../core/Transform';
 import { clamp } from '../core/math';
-import { ContactShadows, SHADOW_TUNING, groundYAt } from './ContactShadows';
+import { ContactShadows, contactExtent, groundYAt } from './ContactShadows';
 import { surface, tube } from './PlayerRenderer';
 import type { Ring } from './PlayerRenderer';
 
@@ -59,25 +59,19 @@ export const VEHICLE_RENDER = {
   /** Body pitch (dive/squat) and roll (lean) limits in radians, and how hard longAccel / yawRate push them. */
   pitchGain: 0.010, pitchMax: 0.036, rollGain: 0.0035, rollMax: 0.055,
   shadowLift: 0.045,
-  /**
-   * How far past the car's own footprint the OPAQUE part of the contact blob reaches, in metres (see shadowExtent).
-   *
-   * The blob used to be sized off `hw` / `hl`, which are the LOFT's half-extents - the body inboard of the tyres and
-   * short of the bumpers - so a sedan got a 0.98 x 2.26 m ellipse around a 0.9 x 2.2 m footprint, and with the mask
-   * opaque only inside its core the dark part of it never left the underside of the car. Measured on lot asphalt: the
-   * ground beside a parked car moved 0.18/255 when every blob in the city was hidden, i.e. the blobs were doing
-   * nothing at all for vehicles. Sizing from the SPEC footprint plus a spread, and dividing by the core, puts the
-   * opaque part on ground the camera can see - the dark pool around the sills and the wheels that reads as weight.
-   */
-  shadowSpread: 0.34,
 } as const;
 
 /**
- * Half-extent of a contact blob whose opaque core covers `half` (a footprint half-extent) plus `shadowSpread` metres
- * of ground beyond it. The rim fades out over the remaining (1 - core) of the extent.
+ * Half-extent of a contact blob for a vehicle whose footprint half-extent on that axis is `half`.
+ *
+ * Sized from the SPEC footprint, not from `hw` / `hl`: those are the LOFT's half-extents, inboard of the tyres and
+ * short of the bumpers, so a blob built from them started already tucked under the car. Everything past the
+ * footprint - how far the undiluted occlusion spills onto visible ground, how wide the soft edge is - now lives in
+ * SHADOW_TUNING and is the same for a car, a pedestrian and the player; there is no division by the mask's opaque
+ * fraction any more, because the mask derives its falloff from this extent rather than the other way round.
  */
 export function shadowExtent(half: number): number {
-  return (half + VEHICLE_RENDER.shadowSpread) / SHADOW_TUNING.core;
+  return contactExtent(half);
 }
 
 const KEYS: VehicleKey[] = ['sedan', 'sport', 'van', 'police', 'taxi'];
@@ -1394,7 +1388,18 @@ function wheelGeometry(): THREE.BufferGeometry {
   const pts: THREE.Vector2[] = [];
   for (let i = 0; i < half.length; i++) pts.push(new THREE.Vector2(half[i][0], -half[i][1]));
   for (let i = half.length - 2; i >= 0; i--) pts.push(new THREE.Vector2(half[i][0], half[i][1]));
-  add(new THREE.LatheGeometry(pts, SEG), TYRE, (x, _y, z) => (Math.hypot(x, z) < r * 0.95 ? 0.72 : 1.1));
+  // Sidewall tones, by radius from the axle (the lathe is authored about y, so `add` still sees lathe space here).
+  // Four bands instead of the old two, for nothing: a tyre seen at 6 m is not one black mass and not a flat disc
+  // either - the bead seat is buried in the rim's shadow, the moulded sidewall bulges out and catches the sky, and
+  // the shoulder falls away again before the tread. The steps land on the lathe's own profile rings, so each one is a
+  // real crease in the silhouette rather than a painted line.
+  add(new THREE.LatheGeometry(pts, SEG), TYRE, (x, _y, z) => {
+    const rad = Math.hypot(x, z) / r;
+    if (rad >= 0.95) return 1.1; // tread
+    if (rad >= 0.88) return 0.62; // shoulder, turning away from the sky
+    if (rad >= 0.74) return 1.0; // moulded sidewall crest
+    return rad >= 0.62 ? 0.72 : 0.5; // sidewall down to the bead seat, deep in the rim's shadow
+  });
   // Rim: a dark dish deep in the bead; on each dish face seven thin tapered plates (2 cm deep, 1.5 cm proud) and a hub
   // cap. Both faces get them because the same instance geometry serves the left and right wheels.
   add(new THREE.CylinderGeometry(rimR, rimR, dishFace * 2, SEG, 1, false), DISH, (_x, y) => (Math.abs(y) < dishFace - 0.001 ? 0.5 : 0.95));

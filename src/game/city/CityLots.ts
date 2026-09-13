@@ -274,8 +274,18 @@ const PARKED_H = 1.5;
  * clears its neighbour's box; the renderer's unit is longer than the pitch, so a row reads as one continuous hedge),
  * 0.62 m high, standing `off` outside the lot's kerb ring in the block's inset band (the pavement between the lot and
  * the sidewalk), broken at the gate (`gateClear` either side of the drive lane) and short of the lot corners by `cornerClear`.
+ *
+ * `hitDepth` is the collider's depth, NOT `depth`: CityRendererProps lofts the drawn unit through wobbling
+ * cross-sections whose widest station reaches 1.03 x 1.12 half-depths plus a 0.06 lean, i.e. 0.433 m out from the
+ * centre line at the largest instance scale, while a `depth`-wide box stops at 0.318. The player pushed out of the
+ * narrow box therefore stood with 11 cm of hedge drawn through his shins. 0.9 m covers the drawn envelope.
+ *
+ * `pointClear` opens a break in the run at every named point (the player spawn first of all). The spawn camera sits
+ * 6.2 m behind the player on the pavement side of the run, so a continuous hedge across that bay filled the bottom
+ * third of the game's first frame at every hour; at this radius the break is wider than the frustum is at the hedge
+ * plane, and it reads on the ground as the opening where the pavement meets the lot.
  */
-export const HEDGE = { len: 1.9, depth: 0.6, h: 0.62, off: 1.0, pitch: 2.0, gateClear: 1.5, cornerClear: 0.4 } as const;
+export const HEDGE = { len: 1.9, depth: 0.6, h: 0.62, off: 1.0, pitch: 2.0, gateClear: 1.5, cornerClear: 0.4, hitDepth: 0.9, pointClear: 5.5 } as const;
 
 /** Axis-aligned rectangle in world space. */
 export interface Rect { x0: number; z0: number; x1: number; z1: number }
@@ -417,12 +427,39 @@ export function furnishLots(ctx: GenContext): void {
   furnishStreets(ctx);
 }
 
+/** The named points (spawn, mission starts, garage, ...) that could fall on this lot's hedge runs, as a flat x,z list. */
+function namedPointsNear(ctx: GenContext, lot: Lot): number[] {
+  const out: number[] = [];
+  const p = ctx.points;
+  if (!p) return out;
+  const reach = Math.max(lot.w, lot.d) / 2 + HEDGE.off + HEDGE.pointClear;
+  const add = (x: number, z: number): void => { if (Math.abs(x - lot.x) <= reach && Math.abs(z - lot.z) <= reach) out.push(x, z); };
+  add(p.playerSpawn.x, p.playerSpawn.z);
+  add(p.hospital.x, p.hospital.z);
+  add(p.policeStation.x, p.policeStation.z);
+  add(p.garage.x, p.garage.z);
+  add(p.beachDelivery.x, p.beachDelivery.z);
+  add(p.pier.x, p.pier.z);
+  for (let i = 0; i < p.missionStarts.length; i++) add(p.missionStarts[i].x, p.missionStarts[i].z);
+  return out;
+}
+
+/** True when a hedge unit centred here would stand inside a named point's break (see HEDGE.pointClear). */
+function nearNamedPoint(pts: number[], x: number, z: number): boolean {
+  for (let i = 0; i < pts.length; i += 2) {
+    const dx = pts[i] - x, dz = pts[i + 1] - z;
+    if (dx * dx + dz * dz < HEDGE.pointClear * HEDGE.pointClear) return true;
+  }
+  return false;
+}
+
 /**
  * Hedge rows on the street-facing edges of one lot (the edges on the block's inset line): a run of 2 m units in the
  * inset band, with a break at the gate. Units carry a box collider, so the player walks around them.
  */
 function addLotHedges(ctx: GenContext, rng: Random, lot: Lot, lay: LotLayout): void {
   const blk = ctx.blocks[blockIndex(lot.blockCol, lot.blockRow)];
+  const pts = namedPointsNear(ctx, lot);
   const x0 = lot.x - lot.w / 2, x1 = lot.x + lot.w / 2, z0 = lot.z - lot.d / 2, z1 = lot.z + lot.d / 2;
   const H = HEDGE;
   for (let edge = 0; edge < 4; edge++) {
@@ -437,9 +474,10 @@ function addLotHedges(ctx: GenContext, rng: Random, lot: Lot, lay: LotLayout): v
     for (let a = a0 + H.len / 2; a + H.len / 2 <= a1 + 1e-6; a += H.pitch) {
       if (gateHalf > 0 && Math.abs(a - gateA) < gateHalf + H.len / 2) continue;
       const x = alongX ? a : across, z = alongX ? across : a;
-      const ex = alongX ? H.len / 2 : H.depth / 2, ez = alongX ? H.depth / 2 : H.len / 2;
+      if (nearNamedPoint(pts, x, z)) continue;
+      const ex = alongX ? H.len / 2 : H.hitDepth / 2, ez = alongX ? H.hitDepth / 2 : H.len / 2;
       if (!rectClear(ctx.hash, x - ex, z - ez, x + ex, z + ez, 0.04)) continue;
-      addPropBox(ctx, 'hedge', x, z, yaw, rng.range(0.94, 1.06), H.depth / 2, H.len / 2, H.h);
+      addPropBox(ctx, 'hedge', x, z, yaw, rng.range(0.94, 1.06), H.hitDepth / 2, H.len / 2, H.h);
     }
   }
 }

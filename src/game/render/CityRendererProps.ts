@@ -1047,9 +1047,9 @@ const CAR_TIER_MOVE = 1.5;
  * is a few pixels. The cost is instance slots in one shared mesh (SHADOW_TUNING.capacity), not a draw call.
  *
  * Half-extents come from the same `shadowExtent` the moving vehicles use, so a parked car and a driven one of the
- * same spec are grounded identically: the footprint plus VEHICLE_RENDER.shadowSpread of opaque core, fading out over
- * the rim. Computed off the spec, not off the loft's own hw / hl, which sit inboard of the tyres and short of the
- * bumpers - blobs sized from those never got their dark part out from under the car.
+ * same spec are grounded identically: the spec footprint plus SHADOW_TUNING.spill of undiluted occlusion and
+ * SHADOW_TUNING.penumbra of soft edge. Computed off the spec, not off the loft's own hw / hl, which sit inboard of
+ * the tyres and short of the bumpers - blobs sized from those never got their dark part out from under the car.
  */
 const CAR_SHADOWS = { cap: 44, range: 46, lift: 0.045 } as const;
 

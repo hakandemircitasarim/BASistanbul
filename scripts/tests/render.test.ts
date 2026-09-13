@@ -13,8 +13,8 @@ import { ContactShadows, SHADOW_TUNING, groundYAt } from '../../src/game/render/
 import { BUDGET } from '../../src/game/core/Budget';
 import { BLOCK, CURB_H, PITCH, ROAD_W, SIDEWALK_W } from '../../src/game/city/CityConfig';
 import { VEHICLE_RENDER, shadowExtent } from '../../src/game/render/VehicleRenderer';
-import { PED_RENDER } from '../../src/game/render/PedRenderer';
-import { SHADOW_R as PLAYER_SHADOW_R } from '../../src/game/render/PlayerRenderer';
+import { PED_FOOT_HALF, PED_RENDER } from '../../src/game/render/PedRenderer';
+import { PLAYER_FOOT_HALF, SHADOW_R as PLAYER_SHADOW_R } from '../../src/game/render/PlayerRenderer';
 import { Vehicle } from '../../src/game/entities/Vehicle';
 import { SPECS } from '../../src/game/entities/VehicleSpecs';
 import type { Building, Landmark } from '../../src/game/city/CityData';
@@ -437,6 +437,15 @@ test('SkySystem: the shadow chunk is patched for both a soft penumbra and the bo
   // caster taller than a kerb straight into the widest disk.
   const probes = (chunk.match(/shadowCoord\.z - 0\./g) || []).length;
   expect(probes === 4, `the ladder takes four blocker probes, two per rung (got ${probes})`);
+  // Round 12: the per-pixel rotation of the disk is RAMPED IN with the disk's width, and the blocker probe does not
+  // rotate at all. Three rotates by an interleaved-gradient noise of gl_FragCoord on every fragment, which at seven
+  // taps leaves an ordered, screen-stable crosshatch over every soft shadow edge in the frame - measured on the
+  // promenade at 15:00, where it was the most conspicuous engine artefact in a 2560 x 1440 crop. The taps must read
+  // the ramped angle, not `phi`, or the weave is straight back.
+  expect(chunk.includes('float tapPhi = phi *'), 'the disk rotation is ramped with softRadius, not applied flat');
+  expect(!/vogelDiskSample\( \d+, 7, phi \)/.test(chunk), 'no tap still uses the unramped screen-space rotation');
+  expect(chunk.includes('vec2 probeDir = vec2( radius, 0.0 )'),
+    'the blocker probe is pinned: rotating it per pixel dithers the penumbra WIDTH, which is the same crosshatch');
 });
 
 test('BuildingGeometry: the roof cornice carries its own shadow line (a vertex ramp down the fillet)', () => {
@@ -506,36 +515,37 @@ test('contact blobs multiply the floor, and their opaque core clears the caster 
   expect(mat.transparent && !mat.depthWrite && mat.opacity > 0.35,
     `the blob is a transparent, non-depth-writing darkener at opacity ${mat.opacity}`);
   //
-  // The two casters that actually DEPEND on `core` are the ped and the player: their blob radii are fixed metres and
-  // are NOT divided by it, so shrinking `core` shrinks their opaque puddle straight back under their own shoes. The
-  // vehicles cannot regress that way - `shadowExtent` divides by `core`, so `shadowExtent(h) * core` is identically
-  // `h + shadowSpread` and an assertion written that way tests `shadowSpread > 0.25` and nothing else. Assert what is
-  // load-bearing for each: a fixed-radius blob against the footprint it has to clear, and the vehicles against the
-  // spread itself plus a ceiling, so a small `core` cannot inflate the blobs without bound instead.
+  //    That property is now a MINIMUM WORLD EXTENT rather than a fraction: `contactExtent` grows a caster's own
+  //    footprint half-span by SHADOW_TUNING.spill of undiluted occlusion plus SHADOW_TUNING.penumbra of soft edge,
+  //    and the shader derives the falloff from that extent (see blobMaskPatch) instead of the extent being derived
+  //    from the falloff. The regression this guards is the old one in its new clothes: a caster sizing its blob to
+  //    its own silhouette, so every dark pixel of it lands under the caster where the camera cannot see it.
   //
-  // Footprint half-spans a standing figure has to clear, in metres: shoes ~0.12 long-side each side of centre with a
-  // stance of ~0.2, i.e. ~0.22 for a ped and ~0.25 for the (larger) player.
-  const PED_FOOT_HALF = 0.22, PLAYER_FOOT_HALF = 0.25;
-  const pedCore = PED_RENDER.shadowR * SHADOW_TUNING.core;
-  expect(pedCore > PED_FOOT_HALF + 0.15,
-    `a ped's opaque blob core (${pedCore.toFixed(2)} m) clears its own ${PED_FOOT_HALF} m foot half-span`);
-  const playerCore = PLAYER_SHADOW_R * SHADOW_TUNING.core;
-  expect(playerCore > PLAYER_FOOT_HALF + 0.15,
-    `the player's opaque blob core (${playerCore.toFixed(2)} m) clears his own ${PLAYER_FOOT_HALF} m foot half-span`);
-  expect(VEHICLE_RENDER.shadowSpread > 0.25,
-    `a vehicle blob's opaque core reaches ${VEHICLE_RENDER.shadowSpread} m past the spec footprint onto visible ground`);
-  for (const key of Object.keys(SPECS) as (keyof typeof SPECS)[]) {
-    const spec = SPECS[key];
-    const halfW = spec.width * 0.5, halfL = spec.length * 0.5;
-    const coreW = shadowExtent(halfW) * SHADOW_TUNING.core;
-    const coreL = shadowExtent(halfL) * SHADOW_TUNING.core;
-    expect(coreW > halfW + 0.25 && coreL > halfL + 0.25,
-      `${key}'s opaque blob core (${coreW.toFixed(2)} x ${coreL.toFixed(2)} m) reaches past its own ` +
-      `${halfW.toFixed(2)} x ${halfL.toFixed(2)} m footprint onto visible ground`);
-    // The rim is the other half: `core` is the divisor, so a small one swells the whole quad instead of shrinking
-    // the pool. Past 1.6x the body the fade alone is wider than the car and the blob reads as a fog patch.
-    expect(shadowExtent(halfW) < halfW * 1.6 + 0.6 && shadowExtent(halfL) < halfL * 1.6 + 0.6,
-      `${key}'s blob quad (${shadowExtent(halfW).toFixed(2)} x ${shadowExtent(halfL).toFixed(2)} m) stays close to its body`);
+  // Footprint half-spans a standing figure has to clear, in metres: shoes ~0.12 each side of their centre line with a
+  // stance of ~0.2, i.e. 0.22 for a ped and 0.25 for the (larger) player.
+  expect(SHADOW_TUNING.spill > 0.2,
+    `the opaque core spills ${SHADOW_TUNING.spill} m past every caster's footprint onto ground the camera can see`);
+  expect(SHADOW_TUNING.penumbra > 0.15 && SHADOW_TUNING.penumbra < SHADOW_TUNING.spill * 2.5,
+    `the ${SHADOW_TUNING.penumbra} m penumbra softens the pool without turning it into a fog patch`);
+  const casters: [string, number, number][] = [
+    ['ped', PED_FOOT_HALF, PED_RENDER.shadowR],
+    ['player', PLAYER_FOOT_HALF, PLAYER_SHADOW_R],
+  ];
+  for (const [key, halfW, halfL] of Object.keys(SPECS).map((k) => {
+    const spec = SPECS[k as keyof typeof SPECS];
+    return [k, spec.width * 0.5, spec.length * 0.5] as [string, number, number];
+  })) {
+    casters.push([`${key} (across)`, halfW, shadowExtent(halfW)], [`${key} (along)`, halfL, shadowExtent(halfL)]);
+  }
+  for (const [name, foot, extent] of casters) {
+    const core = extent - SHADOW_TUNING.penumbra;
+    expect(core > foot + 0.2,
+      `${name}'s opaque blob core (${core.toFixed(2)} m) clears its own ${foot.toFixed(2)} m footprint half-span ` +
+      `by ${(core - foot).toFixed(2)} m of visible ground`);
+    // The other half: the pool is a CONTACT term, not a fog patch. Past the footprint plus a metre it stops reading
+    // as the ground under a thing and starts reading as weather.
+    expect(extent < foot + 1.0,
+      `${name}'s blob half-extent (${extent.toFixed(2)} m) stays close to its ${foot.toFixed(2)} m footprint`);
   }
   slice.dispose();
 });

@@ -10,11 +10,11 @@
 // FACADE_RANGE.highWindow, where a 0.15 m frame is a pixel anyway.
 import * as THREE from 'three';
 import type { BuildingStyle } from '../city/CityData';
-import { CELL_KIND, CELL_STRIDE, CELL_STYLES, FacadeCellList } from './BuildingGeometry';
+import { CELL_KIND, CELL_STRIDE, CELL_STYLES, FacadeCellList, WALL_KIT } from './BuildingGeometry';
 import { WINDOW_CELL, WINDOW_CELL_FRAME_PX } from './TextureFactory';
 
 /** Pack ranges (m) per unit kind, the sixth-floor cut-off for windows and the camera move that triggers a repack. */
-export const FACADE_RANGE = { window: 55, balcony: 90, ac: 45, pipe: 70, highWindow: 30, highFloorY: 20.5, repackMove: 15 } as const;
+export const FACADE_RANGE = { window: 55, balcony: 90, ac: 45, pipe: 70, wallKit: 60, joint: 42, highWindow: 30, highFloorY: 20.5, repackMove: 15 } as const;
 /** Instance budget of the batch (units inside the ranges are packed nearest-first until it is full). */
 const MAX_UNITS = 3000;
 /**
@@ -174,6 +174,50 @@ function acUnit(w: number, h: number): THREE.BufferGeometry {
   return u.build();
 }
 
+/**
+ * Blank-elevation kit for a face of unit width (x -0.5..0.5, scaled by the face length per instance, so band heights
+ * and depths never stretch) standing on the wall foot: a plinth band, and on floor line `course` (0 = none) a string
+ * course with a shaded soffit. The shade factors multiply the instance colour (the wall tint), so the plinth is a
+ * darker value of the same wall and the course head a lighter one - the value step is the whole point, a contrasting
+ * hue here reads as a decal.
+ */
+function wallKitUnit(variant: number): THREE.BufferGeometry {
+  const u = new UnitBuilder();
+  const K = WALL_KIT;
+  const course = variant & 15;
+  const x0 = -0.5, x1 = 0.5;
+  if ((variant & 16) !== 0) {
+    // Plinth: front in a darker value, a lit top chamfer where it returns to the wall. Skipped on a wall that starts
+    // above a shop band - that band already gives the elevation its base.
+    u.setColor(0xffffff, 0.62);
+    u.box(x0, 0, 0, x1, K.plinthH, K.plinthOut, F.front);
+    u.setColor(0xffffff, 1.15);
+    u.box(x0, 0, 0, x1, K.plinthH, K.plinthOut, F.top);
+  }
+  if (course > 0) {
+    const y0 = course * K.floorH, y1 = y0 + K.courseH;
+    u.setColor(0xffffff, 0.98);
+    u.box(x0, y0, 0, x1, y1, K.courseOut, F.front | F.top);
+    // Soffit: the underside of a projecting course never sees the sky, and that dark line under a pale band is what
+    // makes it read as a moulding instead of a painted stripe.
+    u.setColor(0xffffff, 0.55);
+    u.box(x0, y0, 0, x1, y1, K.courseOut, F.bottom);
+  }
+  return u.build();
+}
+
+/** Expansion-joint cover strip of unit height (y 0..1, scaled per instance): front plus both flanks, a value darker. */
+function jointUnit(): THREE.BufferGeometry {
+  const u = new UnitBuilder();
+  const K = WALL_KIT;
+  const h = K.jointW / 2;
+  u.setColor(0xffffff, 0.8);
+  u.box(-h, 0, 0, h, 1, K.jointOut, F.front);
+  u.setColor(0xffffff, 0.62);
+  u.box(-h, 0, 0, h, 1, K.jointOut, F.left | F.right);
+  return u.build();
+}
+
 /** Rainwater downpipe: a square-section pipe of unit height (y 0..1, scaled per instance), front and both flanks. */
 function pipeUnit(): THREE.BufferGeometry {
   const u = new UnitBuilder();
@@ -244,6 +288,12 @@ export class FacadeDetailRenderer {
     } else if (kind === CELL_KIND.ac) {
       key = `ac:${Math.round(w * 100)}:${Math.round(h * 100)}`;
       make = () => acUnit(w, h);
+    } else if (kind === CELL_KIND.wallKit) {
+      key = `wk:${variant}`;
+      make = () => wallKitUnit(variant);
+    } else if (kind === CELL_KIND.joint) {
+      key = 'joint';
+      make = () => jointUnit();
     } else {
       key = 'pipe';
       make = () => pipeUnit();
@@ -270,6 +320,7 @@ export class FacadeDetailRenderer {
     this.lastZ = camZ;
     const d = this.cells.data, n = this.cells.n, mesh = this.mesh;
     const rW = FACADE_RANGE.window * FACADE_RANGE.window, rB = FACADE_RANGE.balcony * FACADE_RANGE.balcony, rA = FACADE_RANGE.ac * FACADE_RANGE.ac, rP = FACADE_RANGE.pipe * FACADE_RANGE.pipe;
+    const rK = FACADE_RANGE.wallKit * FACADE_RANGE.wallKit, rJ = FACADE_RANGE.joint * FACADE_RANGE.joint;
     const rHigh = FACADE_RANGE.highWindow * FACADE_RANGE.highWindow;
     let k = 0;
     // Two passes, the near half first, so a crowded street fills the budget with its nearest units.
@@ -280,7 +331,8 @@ export class FacadeDetailRenderer {
         const ddx = x - camX, ddz = z - camZ;
         const d2 = ddx * ddx + ddz * ddz;
         const code = d[o + 7], kind = code & 7;
-        const range = kind === CELL_KIND.window ? rW : kind === CELL_KIND.balcony ? rB : kind === CELL_KIND.ac ? rA : rP;
+        const range = kind === CELL_KIND.window ? rW : kind === CELL_KIND.balcony ? rB : kind === CELL_KIND.ac ? rA
+          : kind === CELL_KIND.wallKit ? rK : kind === CELL_KIND.joint ? rJ : rP;
         if (pass === 0 ? d2 > range * 0.25 : d2 <= range * 0.25 || d2 > range) continue;
         // The wall hides anything on a face turned away from the camera.
         if (-ddx * nx - ddz * nz < 0) continue;
@@ -288,7 +340,11 @@ export class FacadeDetailRenderer {
         const h = d[o + 6];
         dummy.position.set(x, y, z);
         dummy.rotation.set(0, Math.atan2(nx, nz), 0);
-        if (kind === CELL_KIND.pipe) dummy.scale.set(1, h, 1); else dummy.scale.set(1, 1, 1);
+        // A pipe and a joint strip are unit-height, a wall kit unit-width: the batch stretches the one axis whose
+        // stretch changes nothing (a band's height and depth stay put however long the face is).
+        if (kind === CELL_KIND.pipe || kind === CELL_KIND.joint) dummy.scale.set(1, h, 1);
+        else if (kind === CELL_KIND.wallKit) dummy.scale.set(d[o + 5], 1, 1);
+        else dummy.scale.set(1, 1, 1);
         dummy.updateMatrix();
         mat.copy(dummy.matrix);
         mesh.setGeometryIdAt(k, this.geomOf[i]);

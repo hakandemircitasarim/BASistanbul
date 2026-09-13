@@ -14,19 +14,36 @@ export const SHADOW_TUNING = {
    * build silently gets fewer blobs than it asks for.
    */
   capacity: BUDGET.MAX_VEHICLES + BUDGET.MAX_PEDS + 48,
-  texSize: 64,
   /**
-   * Radius (0..1) of the fully opaque core; the rest fades to nothing at the rim.
+   * How far the FULLY OPAQUE part of a blob reaches past the caster's own footprint, in metres, and how wide the
+   * penumbra that fades it out is. Both are WORLD widths and both are honoured on all four sides of any blob
+   * whatever its aspect, which is the whole point of the procedural mask below.
    *
-   * 0.72, not 0.5: with the multiply operator below the blob's alpha IS its occlusion, so the core is the only part
-   * of the mask that reads at all, and at 0.5 the whole of it sat inside the caster's own footprint. The old vehicle
-   * blob was 0.98 m across for a 1.8 m-wide sedan, so half of that put the dark part 20 cm INSIDE the sills - hiding
-   * every live blob in the city at noon moved the lot asphalt beside a parked car by 0.5/255, i.e. nothing.
-   * It is also the divisor VehicleRenderer.shadowExtent sizes the vehicle blobs by, so raising it widens them to
-   * match rather than shrinking the visible pool. A ped's 0.6 m ellipse keeps a 43 cm opaque puddle around the
-   * shoes. The remaining 28 % is still a smoothstep, so the rim does not read as a cut ellipse.
+   * The old mask was a radial ramp in a 64 x 64 texture, opaque only inside `core` (0.72) of its radius. Two things
+   * followed from that, and both of them are the "nothing that moves is grounded" read:
+   *
+   *  - the opaque part was a fixed FRACTION of the quad, so it could only be pushed onto visible ground by making
+   *    the quad huge. A sedan's blob was 3.44 x 7.06 m for a 1.8 x 4.4 m car, and the extra was all ramp: a 2 m wide
+   *    grey wash with no edge anywhere near the sills. Measured on lot asphalt at noon (a parked sedan at 965.5,
+   *    507.5, camera 3.5 m away), hiding the blob mesh moved the ground 0.25 m outboard of the sill by 40/255 - but
+   *    over a metre and a half of falloff, which reads as haze, not as contact.
+   *  - a radial ramp on a 1:2.5 quad is an ELLIPSE, so the same texel is 0.4 m of falloff across the car and 1.0 m
+   *    along it, and the opaque core pinches to nothing at the bumpers. The corners of the footprint - exactly where
+   *    a car meets the road - got the least occlusion of anywhere on the blob.
+   *
+   * The mask is now a rounded RECTANGLE whose corner radius and falloff width are these metres, computed in the
+   * fragment shader from the instance's own world scale (see blobMaskPatch). `spill` puts real, undiluted occlusion
+   * on ground the camera can see past the silhouette; `penumbra` is the soft edge that keeps it from reading as a
+   * decal. Keep the sum modest: it is the radius of the visible dark pool around every car, ped and player in the
+   * city, and on pale paving a wide one reads as a halo rather than as a shadow.
    */
-  core: 0.72,
+  spill: 0.26,
+  penumbra: 0.34,
+  /**
+   * Floor on a blob's half-extent. Nothing in the city is small enough to need it today (the narrowest caster is a
+   * ped at 0.22 m), but a caster that asks for a 5 cm blob should still get a visible pool rather than a dot.
+   */
+  minHalf: 0.5,
   /**
    * Occlusion of the core, i.e. how much light the multiply operator takes off the floor under a caster (see the
    * material below). Real cast shadows overlap the blobs by day so the day term stays the smaller of the two; at
@@ -38,6 +55,18 @@ export const SHADOW_TUNING = {
   dayOpacity: 0.5,
   nightOpacity: 0.62,
 } as const;
+
+/**
+ * Half-extent of the blob quad for a caster whose own footprint half-extent on that axis is `half`: the footprint,
+ * plus the opaque spill, plus the penumbra that fades it out. Used by every caster (vehicles, parked props, the
+ * crowd, the player) so one set of metres in SHADOW_TUNING describes the contact term everywhere.
+ *
+ * It is deliberately NOT divided by anything. The old `shadowExtent` divided by the mask's opaque fraction, which is
+ * how a 1.8 m car ended up with a 3.44 m blob; the mask now derives its own falloff from this extent instead.
+ */
+export function contactExtent(half: number): number {
+  return Math.max(half + SHADOW_TUNING.spill + SHADOW_TUNING.penumbra, SHADOW_TUNING.minHalf);
+}
 
 /**
  * Height of the walkable surface under a world point: block interiors and their sidewalks are raised to CURB_H,
@@ -66,44 +95,91 @@ const scl = new THREE.Vector3();
 const euler = new THREE.Euler(0, 0, 0, 'YXZ');
 const zero = new THREE.Matrix4().set(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
-/** Soft radial alpha mask (white RGB, falloff in alpha) built without a canvas so Node tests can construct it. */
-function blobTexture(): THREE.DataTexture {
-  const n = SHADOW_TUNING.texSize;
-  const data = new Uint8Array(n * n * 4);
-  const c = (n - 1) / 2;
-  for (let y = 0; y < n; y++) {
-    for (let x = 0; x < n; x++) {
-      const dx = (x - c) / c, dy = (y - c) / c;
-      const d = Math.sqrt(dx * dx + dy * dy);
-      const t = clamp((1 - d) / (1 - SHADOW_TUNING.core), 0, 1);
-      const a = t * t * (3 - 2 * t); // smoothstep
-      const i = (y * n + x) * 4;
-      data[i] = 255; data[i + 1] = 255; data[i + 2] = 255;
-      data[i + 3] = Math.round(a * 255);
-    }
-  }
-  const tex = new THREE.DataTexture(data, n, n, THREE.RGBAFormat);
-  tex.minFilter = THREE.LinearFilter;
-  tex.magFilter = THREE.LinearFilter;
-  tex.wrapS = THREE.ClampToEdgeWrapping;
-  tex.wrapT = THREE.ClampToEdgeWrapping;
-  tex.generateMipmaps = false;
-  tex.needsUpdate = true;
-  return tex;
+/**
+ * The blob mask, in the shader instead of in a texture.
+ *
+ * The occlusion has to be a rounded rectangle whose corner radius and falloff are fixed WORLD widths, on a quad whose
+ * aspect is different for every instance (a sedan is 1:2, a ped is 1:1, a stretched dusk ped blob is 1:1.6). One
+ * shared texture cannot express that - a radial ramp stretched to the quad is an ellipse whose falloff is as
+ * anisotropic as the quad - so the mask is evaluated per fragment from the instance's own scale, which the vertex
+ * stage already has in `instanceMatrix`. Columns 0 and 2 of a compose(pos, yaw, (sx, 1, sz)) matrix have lengths sx
+ * and sz, i.e. the blob's world width and length; nothing extra is uploaded per instance for the shape.
+ *
+ * `vBlobFade` is the penumbra as a FRACTION of the half-extent on each axis, so the fragment stage can work in the
+ * quad's own [-1, 1] space and still get a constant world falloff on both axes.
+ *
+ * The distance field is the standard rounded-box one: distance outside the core rect, in penumbra units. It is 0 on
+ * and inside the core (undiluted occlusion out to `spill` past the footprint), 1 at the rim, and its level sets are
+ * rounded rectangles, so a car's corners get the same contact darkening as its flanks. Round casters blend to the
+ * radial form of the same field (see `round` on `add`).
+ *
+ * Two per-instance scalars ride on instanceColor, whose RGB this material throws away anyway (the multiply blend
+ * below multiplies the source colour by zero): .r is the caster's fade, .g its roundness. No extra buffer, and no
+ * value that anything else in the pipeline can read.
+ */
+function blobMaskPatch(shader: THREE.WebGLProgramParametersWithUniforms, penumbra: { value: number }): void {
+  shader.uniforms.uBlobPenumbra = penumbra;
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <common>', [
+      '#include <common>',
+      'uniform float uBlobPenumbra;',
+      'varying vec2 vBlobQ;',
+      'varying vec2 vBlobFade;',
+    ].join('\n'))
+    .replace('#include <begin_vertex>', [
+      '#include <begin_vertex>',
+      'vBlobQ = position.xz * 2.0;',
+      '#ifdef USE_INSTANCING',
+      '  vec2 blobHalf = vec2( length( instanceMatrix[ 0 ].xyz ), length( instanceMatrix[ 2 ].xyz ) ) * 0.5;',
+      '#else',
+      '  vec2 blobHalf = vec2( 1.0 );',
+      '#endif',
+      'vBlobFade = clamp( vec2( uBlobPenumbra ) / max( blobHalf, vec2( 1e-3 ) ), vec2( 0.03 ), vec2( 1.0 ) );',
+    ].join('\n'));
+  shader.fragmentShader = shader.fragmentShader
+    .replace('#include <common>', [
+      '#include <common>',
+      'varying vec2 vBlobQ;',
+      'varying vec2 vBlobFade;',
+      '#ifdef USE_INSTANCING_COLOR',
+      '  #define vBlobRound vColor.g',
+      '#else',
+      '  #define vBlobRound 0.0',
+      '#endif',
+    ].join('\n'))
+    .replace('#include <alphatest_fragment>', [
+      '{',
+      '  vec2 blobCore = max( vec2( 1.0 ) - vBlobFade, vec2( 0.0 ) );',
+      '  vec2 blobOut = max( abs( vBlobQ ) - blobCore, vec2( 0.0 ) ) / vBlobFade;',
+      '  float blobBox = length( blobOut );',
+      // Round casters (a figure) take the same field on the RADIUS instead of per axis, so their pool is an ellipse
+      // rather than a rounded square: the corners of a rounded square under a pair of shoes are the one place the
+      // blob stops looking like occlusion and starts looking like a decal.
+      '  float blobFadeR = ( vBlobFade.x + vBlobFade.y ) * 0.5;',
+      '  float blobEll = ( length( vBlobQ ) - ( 1.0 - blobFadeR ) ) / blobFadeR;',
+      '  float blobD = clamp( mix( blobBox, blobEll, vBlobRound ), 0.0, 1.0 );',
+      '  diffuseColor.a *= 1.0 - ( blobD * blobD * ( 3.0 - 2.0 * blobD ) );',
+      '  #ifdef USE_INSTANCING_COLOR',
+      '    diffuseColor.a *= vColor.r;', // per-instance spawn / cull fade, see ContactShadows.add
+      '  #endif',
+      '  if ( diffuseColor.a <= 0.0 ) discard;',
+      '}',
+      '#include <alphatest_fragment>',
+    ].join('\n'));
 }
 
 /** The single shared mesh; owns the slice allocator and the day/night opacity. */
 class ShadowField {
   readonly mesh: THREE.InstancedMesh;
-  private readonly tex: THREE.DataTexture;
   private readonly material: THREE.MeshBasicMaterial;
   private readonly scene: THREE.Scene;
+  /** Penumbra width in metres, shared by reference into the shader (see blobMaskPatch). */
+  private readonly penumbra = { value: SHADOW_TUNING.penumbra };
   private cursor = 0;
   private refs = 0;
 
   constructor(scene: THREE.Scene) {
     this.scene = scene;
-    this.tex = blobTexture();
     // MULTIPLY, not alpha-over. The blob used to be a near-black quad lerped over the floor at 30 %, which is a
     // no-op on anything already dark: on lit lot asphalt it moved the mean by 0.5/255 (peak 22), inside the +-15/255
     // swing of the asphalt's own macro texture, and on the 19:00 pavement by 0.23/255 - the shoes met the paving with
@@ -114,16 +190,22 @@ class ShadowField {
     // The alpha channel is kept on the destination (blendSrcAlpha/DstAlpha) so the blob does not punch holes in the
     // composer's alpha on the HDR path.
     this.material = new THREE.MeshBasicMaterial({
-      map: this.tex, transparent: true, opacity: SHADOW_TUNING.dayOpacity,
+      transparent: true, opacity: SHADOW_TUNING.dayOpacity,
       blending: THREE.CustomBlending,
       blendSrc: THREE.ZeroFactor, blendDst: THREE.OneMinusSrcAlphaFactor, blendEquation: THREE.AddEquation,
       blendSrcAlpha: THREE.ZeroFactor, blendDstAlpha: THREE.OneFactor, blendEquationAlpha: THREE.AddEquation,
       depthWrite: false, side: THREE.DoubleSide, fog: false, toneMapped: false,
     });
+    this.material.onBeforeCompile = (shader) => blobMaskPatch(shader, this.penumbra);
+    this.material.customProgramCacheKey = () => 'contactBlobMask1';
     this.material.name = 'contactBlob'; // Renderer.sceneBreakdown() and the render probes attribute the mesh by this.
     const geo = new THREE.PlaneGeometry(1, 1);
     geo.rotateX(-Math.PI / 2);
     this.mesh = new THREE.InstancedMesh(geo, this.material, SHADOW_TUNING.capacity);
+    // Per-instance fade rides on instanceColor (see blobMaskPatch): the mask reads .r as an alpha multiplier, and the
+    // multiply blend throws the source RGB away, so nothing else in the pipeline sees these values.
+    this.mesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(SHADOW_TUNING.capacity * 3).fill(1), 3);
+    this.mesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
     this.mesh.count = 0;
     this.mesh.frustumCulled = false;
     // Ground-transparent ladder: road paint and skid marks are renderOrder 1, the additive lamp pools 2, neon 3,
@@ -162,8 +244,14 @@ class ShadowField {
     this.material.opacity = SHADOW_TUNING.dayOpacity + (SHADOW_TUNING.nightOpacity - SHADOW_TUNING.dayOpacity) * t;
   }
 
+  /** The instanceColor buffer, whose .r channel is the per-instance fade (see blobMaskPatch). Never null here. */
+  get fades(): THREE.InstancedBufferAttribute {
+    return this.mesh.instanceColor as THREE.InstancedBufferAttribute;
+  }
+
   flush(): void {
     this.mesh.instanceMatrix.needsUpdate = true;
+    this.fades.needsUpdate = true;
   }
 
   release(): void {
@@ -173,7 +261,6 @@ class ShadowField {
     this.mesh.geometry.dispose();
     this.mesh.dispose();
     this.material.dispose();
-    this.tex.dispose();
     fields.delete(this.scene);
   }
 }
@@ -214,16 +301,30 @@ export class ContactShadows {
     this.used = 0;
   }
 
-  /** Ellipse of half-extents (rx, rz) centred at (x, y, z), aligned to yaw; fade 0..1 shrinks it away. */
-  add(x: number, y: number, z: number, rx: number, rz: number, yaw: number, fade: number): void {
+  /**
+   * Rounded-rectangle pool of half-extents (rx, rz) centred at (x, y, z), aligned to yaw. `rx` / `rz` are the OUTER
+   * half-extents - use `contactExtent` to derive them from a caster's footprint - and the mask is undiluted out to
+   * SHADOW_TUNING.penumbra inside the rim.
+   *
+   * `fade` (0..1) both shrinks the pool and scales its occlusion, so a caster easing in at spawn or out at the crowd
+   * cull distance does not leave a full-strength shadow behind. Shrink alone used to do it, which meant a ped at the
+   * cull edge still printed a solid (if small) disc at full darkness.
+   *
+   * `round` (0..1) picks the shape: 0 is the rounded rectangle a car's footprint wants, 1 the ellipse a standing
+   * figure wants. A figure given the rectangle stands in a visible rounded square, which reads as a decal.
+   */
+  add(x: number, y: number, z: number, rx: number, rz: number, yaw: number, fade: number, round = 0): void {
     if (this.used >= this.cap) return;
     const f = fade <= 0 ? 0 : fade > 1 ? 1 : fade;
+    const r = round <= 0 ? 0 : round > 1 ? 1 : round;
     pos.set(x, y, z);
     euler.set(0, yaw, 0);
     quat.setFromEuler(euler);
     scl.set(rx * 2 * f, 1, rz * 2 * f);
     mat4.compose(pos, quat, scl);
-    this.field.mesh.setMatrixAt(this.start + this.used, mat4);
+    const i = this.start + this.used;
+    this.field.mesh.setMatrixAt(i, mat4);
+    this.field.fades.setXYZ(i, f, r, 0);
     this.used++;
   }
 

@@ -4,7 +4,7 @@
 // forearm on the upper arm), walk swing with bob, sway and torso lean, per-ped height/width jitter, tumble/lying
 // pose, fade, distance collapse. Track E.
 import * as THREE from 'three';
-import { ContactShadows, groundYAt } from './ContactShadows';
+import { ContactShadows, contactExtent, groundYAt } from './ContactShadows';
 import type { World } from '../world/World';
 import type { Transform } from '../core/Types';
 import { createTransform, lerpTransform } from '../core/Transform';
@@ -15,6 +15,13 @@ import {
   headParts, legRings, makeGroundShadow, makeRimUniforms, neckRings, nightFromHour, paintFn, paintShoe, ringAt,
   setRimNight, shoe, surface, torsoRings, tube, updateGroundShadow, type Ring, type RimUniforms,
 } from './PlayerRenderer';
+
+/**
+ * Half-span of a standing figure's footprint in metres: a shoe is ~0.12 either side of its own centre line and the
+ * stance is ~0.2 wide, so ~0.22 for a ped. The contact blob is grown from THIS, not from the body's silhouette -
+ * what has to be darkened is the ground the feet stand on.
+ */
+export const PED_FOOT_HALF = 0.22;
 
 export const PED_RENDER = {
   /**
@@ -30,12 +37,11 @@ export const PED_RENDER = {
    */
   cullDist: 96, cullFade: 6, cullFloor: 0.55, scale: 0.97, swingWalk: 0.55, swingFlee: 1.0, lyingLift: 0.22, armSwing: 0.75,
   /**
-   * Blob half-width. Larger than the figure (a 1.2 m ellipse under a 1.75 m ped) because the shared blob texture is
-   * opaque only inside SHADOW_TUNING.core of its radius and fades to nothing at the rim: at the old 0.46 the
-   * whole opaque core hid under the ped's own footprint, and the pavement pixels under a standing figure measured
-   * unchanged. At 0.6 the core is a 43 cm puddle that shows around the shoes.
+   * Blob half-width: the ped's own stance half-span (PED_FOOT_HALF) grown by the shared contact spill and penumbra,
+   * so the undiluted part of the pool lands on the pavement AROUND the shoes rather than under them. Derived rather
+   * than tuned, so the contact term of a ped, the player and a car all stay the same shape of thing.
    */
-  shadowR: 0.6, shadowLift: 0.03, bob: 0.028, sway: 0.045,
+  shadowR: contactExtent(PED_FOOT_HALF), shadowLift: 0.03, bob: 0.028, sway: 0.045,
   /**
    * Contact blob geometry. It used to be a circle centred on the ped, the same size whatever the hour: it pointed
    * nowhere, so it read as a detached disc lying beside the feet rather than as a shadow. Now it is an ellipse aligned
@@ -493,19 +499,19 @@ export class PedRenderer {
       if (sc > 0.01) {
         if (lying) {
           // A body on the ground is its own silhouette: keep the blob under it, aligned with the ped, not with the sun.
-          this.shadows.add(t.x, gy + R.shadowLift, t.z, R.shadowR * 1.7 * wide, R.shadowR * 0.75 * wide, t.yaw, sc);
+          this.shadows.add(t.x, gy + R.shadowLift, t.z, R.shadowR * 1.7 * wide, R.shadowR * 0.75 * wide, t.yaw, sc, 1);
         } else {
           const gs = this.groundShadow;
           const rx = R.shadowR * R.shadowNarrow * wide;
           const rz = R.shadowR * gs.stretch * wide;
           // Only `shadowAnchor` of the way out, not the full (rz - rx). Pushing the ellipse until its near RIM sat
-          // under the shoes left its opaque core — the blob texture is solid only inside SHADOW_TUNING.core — the best
-          // part of a metre downlight of the figure, which is exactly the "detached blob lying beside the feet" read
+          // under the shoes left its undiluted core — the mask is solid only inside SHADOW_TUNING.penumbra of the
+          // rim — the best part of a metre downlight of the figure, which is exactly the "detached blob" read
           // the stretch was added to cure. Half the offset keeps the dark part under the ped and still runs the tail
           // away from the light.
           const push = (rz - rx) * R.shadowAnchor;
           this.shadows.add(t.x + gs.dirX * push, gy + R.shadowLift, t.z + gs.dirZ * push, rx, rz,
-            Math.atan2(gs.dirX, gs.dirZ), sc);
+            Math.atan2(gs.dirX, gs.dirZ), sc, 1);
         }
       }
       n++;

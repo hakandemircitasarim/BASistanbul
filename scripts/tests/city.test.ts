@@ -570,8 +570,30 @@ test('street trees and lot hedges: placement, clearances, colliders', () => {
     const onX = Math.abs(Math.abs(h.z - lot!.z) - (lot!.d / 2 + HEDGE.off)) < 1e-6;
     const gateEdge = lay.gate === 0 || lay.gate === 2 ? onX && Math.sign(h.z - lot!.z) === (lay.gate === 0 ? 1 : -1) : !onX && Math.sign(h.x - lot!.x) === (lay.gate === 1 ? 1 : -1);
     if (gateEdge) expect(Math.abs((onX ? h.x : h.z) - (onX ? lot!.x : lot!.z)) >= LOT_BAYS.gateW / 2 + HEDGE.gateClear + HEDGE.len / 2 - 1e-6, 'hedge stays out of the gate');
-    expect(aabbs.some((k) => k.shape.kind === 'aabb' && h.x > k.shape.minX && h.x < k.shape.maxX && h.z > k.shape.minZ && h.z < k.shape.maxZ), 'hedge has an AABB collider');
+    // The collider must cover the DRAWN envelope, not the nominal depth: CityRendererProps lofts the unit out to
+    // 1.03 x 1.12 half-depths plus a 0.06 lean at the largest instance scale, and the player is pushed out of the box,
+    // so a box narrower than that leaves the hedge drawn through his shins.
+    const drawn = ((HEDGE.depth / 2) * 1.12 * 1.03 + 0.06 * 1.03) * h.scale;
+    const box = aabbs.find((k) => k.shape.kind === 'aabb' && h.x > k.shape.minX && h.x < k.shape.maxX && h.z > k.shape.minZ && h.z < k.shape.maxZ);
+    expect(box !== undefined, 'hedge has an AABB collider');
+    const s = box!.shape as { minX: number; minZ: number; maxX: number; maxZ: number };
+    const half = onX ? (s.maxZ - s.minZ) / 2 : (s.maxX - s.minX) / 2;
+    expect(half >= drawn - 1e-6, `hedge collider (${half.toFixed(3)} m half-depth) covers the drawn envelope (${drawn.toFixed(3)} m)`);
+    for (const p of Object.values(c.points)) {
+      const list = Array.isArray(p) ? p : [p];
+      for (const q of list) expect(Math.hypot(q.x - h.x, q.z - h.z) >= HEDGE.pointClear - 1e-6, `hedge keeps ${HEDGE.pointClear} m clear of a named point`);
+    }
     for (const b of c.buildings) expect(Math.abs(b.x - h.x) > b.w / 2 + 0.3 || Math.abs(b.z - h.z) > b.d / 2 + 0.3, 'hedge never touches a building');
+  }
+  // The break at the spawn is what keeps the game's first frame out of the planting: the third-person camera stands
+  // CAMERA_TUNING.orbitDist (6.2 m) behind the player, so a hedge closer than that to the spawn is drawn in front of it.
+  const spawn = c.points.playerSpawn;
+  for (const h of hedges) expect(Math.hypot(h.x - spawn.x, h.z - spawn.z) >= HEDGE.pointClear, 'no hedge unit inside the spawn break');
+  // ...and the player cannot be left standing inside one: every hedge box plus his 0.4 m radius is the distance the
+  // push-out settles at, so his capsule must clear the drawn foliage.
+  for (const h of hedges) {
+    const box = aabbs.find((k) => k.shape.kind === 'aabb' && h.x > k.shape.minX && h.x < k.shape.maxX && h.z > k.shape.minZ && h.z < k.shape.maxZ);
+    expect(box !== undefined, 'every hedge unit is a collider the player is pushed out of');
   }
   const b = generateCity(1907).city;
   expect(JSON.stringify(b.props.filter((p) => p.kind === 'tree' || p.kind === 'hedge')) === JSON.stringify([...c.props.filter((p) => p.kind === 'tree' || p.kind === 'hedge')]), 'trees and hedges deterministic for the seed');

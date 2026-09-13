@@ -68,6 +68,27 @@ export const SHADOW_RADIUS = 6;
  */
 const SHADOW_TAPS = 7;
 /**
+ * Where the per-pixel rotation of the Vogel disk is allowed to come back, in shadow-map texels of `softRadius`.
+ *
+ * Three rotates the disk by an interleaved-gradient noise of gl_FragCoord, which is a fixed screen-space plane wave:
+ * it decorrelates the taps, but at a handful of taps the residue is an ORDERED pattern, and an ordered pattern that
+ * is stable in screen space reads as woven fabric lying over the world rather than as noise. Measured at 15:00 on the
+ * promenade (2560 x 1440, camera 1186 / 600): the whole soft edge of every palm shadow, on the paving and on the sand,
+ * carried a visible diagonal crosshatch - the single most "engine artefact" thing in the frame. Pinning the rotation
+ * (phi = 0) in a source A/B removed it completely and left a clean gradient, because each tap is already a bilinear
+ * hardware-PCF fetch, so a disk a couple of texels wide needs no decorrelation at all.
+ *
+ * It IS needed once the disk is wide: that is what the rotation was raised for in round 9 (five taps over six texels
+ * scalloped into a visible rosette). So the rotation is ramped in with the disk instead of being on everywhere -
+ * nothing below `fromTexels` rotates, everything above `fromTexels + spanTexels` rotates exactly as before. The
+ * blocker probe is pinned outright: it only ever reads a +- pair, and rotating THAT per pixel dithered the penumbra
+ * WIDTH, which was the second half of the same crosshatch.
+ *
+ * 2 and 3 texels: the near rung of the ladder is 1.1 texels and the mid rung (palm crowns, first-floor parapets)
+ * 2.5, so the shadows a player walks past are all smooth; only a facade thrown down the street rotates.
+ */
+const SHADOW_DITHER = { fromTexels: 2, spanTexels: 3 } as const;
+/**
  * Blocker-distance ladder, the thing that decides how wide the disk actually gets (see patchShadowPenumbra).
  *
  * `nearM` / `midM` are blocker separations in metres, converted to light-space depth against the shadow camera's
@@ -112,10 +133,10 @@ function patchShadowPenumbra(): void {
 					texture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 4, 5, phi ) * radius, shadowCoord.z ) )
 				) * 0.2;`;
   const taps: string[] = [];
-  for (let i = 0; i < SHADOW_TAPS; i++) taps.push(`					texture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( ${i}, ${SHADOW_TAPS}, phi ) * softRadius, shadowCoord.z ) )`);
+  for (let i = 0; i < SHADOW_TAPS; i++) taps.push(`					texture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( ${i}, ${SHADOW_TAPS}, tapPhi ) * softRadius, shadowCoord.z ) )`);
   const dzNear = (SHADOW_PENUMBRA.nearM / SHADOW_DEPTH_SPAN).toFixed(6);
   const dzMid = (SHADOW_PENUMBRA.midM / SHADOW_DEPTH_SPAN).toFixed(6);
-  const wide = `				vec2 probeDir = vec2( cos( phi ), sin( phi ) ) * radius;
+  const wide = `				vec2 probeDir = vec2( radius, 0.0 );
 				float blockerNear = max(
 					1.0 - texture( shadowMap, vec3( shadowCoord.xy + probeDir, shadowCoord.z - ${dzNear} ) ),
 					1.0 - texture( shadowMap, vec3( shadowCoord.xy - probeDir, shadowCoord.z - ${dzNear} ) ) );
@@ -125,6 +146,7 @@ function patchShadowPenumbra(): void {
 				float softRadius = radius * ( ${SHADOW_PENUMBRA.near.toFixed(3)}
 					+ blockerNear * ${(SHADOW_PENUMBRA.mid - SHADOW_PENUMBRA.near).toFixed(3)}
 					+ blockerFar * ${(1 - SHADOW_PENUMBRA.mid).toFixed(3)} );
+				float tapPhi = phi * clamp( ( softRadius / texelSize.x - ${SHADOW_DITHER.fromTexels.toFixed(2)} ) / ${SHADOW_DITHER.spanTexels.toFixed(2)}, 0.0, 1.0 );
 
 				shadow = (
 ${taps.join(' +\n')}

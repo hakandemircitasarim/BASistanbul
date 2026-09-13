@@ -272,7 +272,7 @@ export class CityRenderer {
       // The street mask picks the faces that get plan jogs, recessed bays and corner chamfers.
       const bandTop = street ? bandHeight(b, plinth) : 0;
       appendBuilding(builders[b.style], b, street && !plinth ? bandTop - 0.3 : BASE_WALL_Y, mask);
-      appendBuildingDetail(builders[b.style], trim, b, rng, this.wallSigns, mask, bandTop, this.facadeCells, this.facadeKeepOut(b, keep));
+      appendBuildingDetail(builders[b.style], trim, b, rng, this.wallSigns, mask, bandTop, this.facadeCells, this.facadeKeepOut(b, keep), this.facadeCells);
       if (street) appendStreetLevel(builders[b.style], plinth ? plinthBand : shopBand, b, rng, plinth, awning, mask);
     }
     for (let i = 0; i < STYLES.length; i++) {

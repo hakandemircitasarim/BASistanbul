@@ -1290,11 +1290,20 @@ export function landmarkGeometries(l: Landmark): LandmarkPart[] {
 /** A big painted/neon wall sign derived deterministically for a blank facade (CityRenderer turns it into an atlas quad). */
 export interface WallSign { x: number; y: number; z: number; yaw: number; w: number; h: number; color: number; word: number }
 
-/** Kinds of built facade detail listed for FacadeDetailRenderer (low bits of a cell's code). */
-export const CELL_KIND = { window: 0, balcony: 1, ac: 2, pipe: 3 } as const;
+/**
+ * Kinds of built facade detail listed for FacadeDetailRenderer (low bits of a cell's code).
+ *
+ * `wallKit` and `joint` are the minimum kit every BLANK elevation gets - the side and party walls the street relief
+ * skips. A blank wall used to be one flat plane of the wall tint from the pavement to the cornice, which at 12 m was
+ * the emptiest surface in the frame; the kit is a plinth band in a darker value, one string course on a floor line
+ * and a few raised expansion-joint strips, i.e. the three things every real party wall has and none of which needs a
+ * texture. They ride the same distance-packed batch as the window frames, so a blank wall beyond FACADE_RANGE.wallKit
+ * costs nothing.
+ */
+export const CELL_KIND = { window: 0, balcony: 1, ac: 2, pipe: 3, wallKit: 4, joint: 5 } as const;
 /** Style index of a cell's code (bits 3..5), in this order. */
 export const CELL_STYLES: readonly BuildingStyle[] = ['artdeco', 'glass', 'concrete', 'neon', 'residential'];
-/** Floats per unit in FacadeCellList.data: x, y, z (unit origin on the wall plane), nx, nz (outward wall normal), w, h (size in the wall plane; a pipe's h is its length), code, colour (0xRRGGBB). */
+/** Floats per unit in FacadeCellList.data: x, y, z (unit origin on the wall plane), nx, nz (outward wall normal), w, h (size in the wall plane; a pipe's / joint's h is its length, a wallKit's w its face length), code, colour (0xRRGGBB). */
 export const CELL_STRIDE = 9;
 /** Packs a unit's kind, style index, ground-row flag and an 8-bit variant into one float (exact: it stays under 2^24). */
 export function cellCode(kind: number, style: number, ground: boolean, variant: number): number {
@@ -1322,6 +1331,13 @@ export class FacadeCellList {
   /** Field `k` (0..CELL_STRIDE-1) of unit i. */
   get(i: number, k: number): number { return this.data[i * CELL_STRIDE + k]; }
 }
+/**
+ * The blank-elevation kit's dimensions, shared with FacadeDetailRenderer (which builds the geometry) and the tests.
+ * `courseFloor` is the floor line the string course runs on as a fraction of the wall height, quantised to whole
+ * floors so the batch needs one geometry variant per floor index instead of one per building.
+ */
+export const WALL_KIT = { plinthH: 1.15, plinthOut: 0.11, courseH: 0.34, courseOut: 0.15, jointW: 0.1, jointOut: 0.05, jointPitch: 9, minLen: 5, minH: 5, courseFloor: 0.45, floorH: FLOOR_H, maxCourse: 8 } as const;
+
 /** Rectangle of a rect face (0..3) in that face's frame (s along it from its start corner, y up) that no built unit may overlap: a neon sign box, a painted sign panel. */
 export interface FacadeKeepOut { face: number; s0: number; s1: number; y0: number; y1: number }
 function keptOut(keep: FacadeKeepOut[] | null, face: number, s0: number, s1: number, y0: number, y1: number): boolean {
@@ -1480,13 +1496,26 @@ function awningBay(gb: GeoBuilder, fr: FaceFrame, front: number, s0: number, s1:
   const px = (t: number, o: number): number => fr.sx + fr.tx * t + fr.nx * o;
   const pz = (t: number, o: number): number => fr.sz + fr.tz * t + fr.nz * o;
   if ((hv >>> 4) % 4 === 0) {
-    // Top, underside and fascia only: the end slivers are never noticed and the mesh is drawn twice a frame.
-    const depth = 1.4, thick = 0.25, yLow = yTop - thick, o1 = front + depth;
+    // Box canopy: a solid slab, not a sheet. It used to be three quads all in darken(color, 0.55) with no ends, which
+    // from the pavement read as one pure-black rectangle with no thickness - the flattest object on the street. Now it
+    // is 0.34 m thick with its own value scheme: a shaded top, the canvas colour on the fascia (the face a pedestrian
+    // actually looks at) and a PALE soffit, because the underside of a canopy is a painted board catching bounce off
+    // the pavement and is never the same value as its top. The two end caps close the slab so it keeps its thickness
+    // when the row is seen along the frontage.
+    const depth = 1.4, thick = 0.34, yLow = yTop - thick, o1 = front + depth;
     const u = CANVAS_PLAIN_U, v = CANVAS_PLAIN_V;
-    gb.setColor(darken(color, 0.55));
-    gb.texQuad(px(s0, o1), yTop, pz(s0, o1), px(s1, o1), yTop, pz(s1, o1), px(s1, front), yTop, pz(s1, front), px(s0, front), yTop, pz(s0, front), u, v, u, v, u, v, u, v);
-    gb.texQuad(px(s0, front), yLow, pz(s0, front), px(s1, front), yLow, pz(s1, front), px(s1, o1), yLow, pz(s1, o1), px(s0, o1), yLow, pz(s0, o1), u, v, u, v, u, v, u, v);
-    gb.texQuad(px(s0, o1), yLow, pz(s0, o1), px(s1, o1), yLow, pz(s1, o1), px(s1, o1), yTop, pz(s1, o1), px(s0, o1), yTop, pz(s0, o1), u, v, u, v, u, v, u, v);
+    const q = (ax: number, ao: number, ay: number, bx: number, bo: number, by: number, cx: number, co: number, cy: number, dx: number, dOff: number, dy: number): void => {
+      gb.texQuad(px(ax, ao), ay, pz(ax, ao), px(bx, bo), by, pz(bx, bo), px(cx, co), cy, pz(cx, co), px(dx, dOff), dy, pz(dx, dOff), u, v, u, v, u, v, u, v);
+    };
+    gb.setColor(darken(color, 0.62));
+    q(s0, o1, yTop, s1, o1, yTop, s1, front, yTop, s0, front, yTop);
+    gb.setColor(lighten(color, 0.62));
+    q(s0, front, yLow, s1, front, yLow, s1, o1, yLow, s0, o1, yLow);
+    gb.setColor(color);
+    q(s0, o1, yLow, s1, o1, yLow, s1, o1, yTop, s0, o1, yTop);
+    gb.setColor(darken(color, 0.78));
+    q(s0, front, yLow, s0, o1, yLow, s0, o1, yTop, s0, front, yTop);
+    q(s1, o1, yLow, s1, front, yLow, s1, front, yTop, s1, o1, yTop);
     return;
   }
   const depth = 1.5 + ((hv >>> 16) % 3) * 0.15, hang = 0.4, yOut = yTop - 0.8;
@@ -1905,6 +1934,50 @@ function facadeUnits(cells: FacadeCellList, keep: FacadeKeepOut[] | null, b: Bui
 }
 
 /**
+ * Minimum kit for the elevations the street relief skips: a plinth band at the foot, one string course on a floor
+ * line and raised expansion-joint strips at `WALL_KIT.jointPitch`. One kit unit per face plus one unit per joint,
+ * all in the distance-packed facade batch (FacadeDetailRenderer), so a wall out of range costs nothing.
+ *
+ * The kit deliberately carries no windows: a party wall has none, and the point is to give the plane a base, a
+ * horizontal and a rhythm - the three things that stop a 12 m flat grey rectangle reading as untextured cardboard.
+ */
+function blankWallKit(cells: FacadeCellList, b: Building, ol: Outline, streetMask: number, wallTop: number, bandTop: number, base: number): void {
+  const K = WALL_KIT;
+  // A building with a shop band wears it on every face, blank or not, so the wall there starts above the band cap and
+  // the plinth is already built: that face gets the course and the joints only.
+  const y0 = bandTop > 0 ? bandTop + 0.25 : 0;
+  const plinth = bandTop <= 0;
+  const hWall = wallTop - 0.5 - y0;
+  if (hWall < K.minH) return;
+  // The kit is UNTEXTURED and the wall beside it is not: the wall tile multiplies the wall tint by its own ~0.62
+  // average, so a unit handed the raw wall tint renders about 1.8x the wall it is supposed to belong to (measured:
+  // 160 against 90 at noon). Pre-multiplying by the tile average is what makes the plinth read as the same masonry a
+  // value darker instead of as a pale blank band stuck to the foot of the building. 0.34 is measured, not derived:
+  // the facade batch answers light a little differently from the wall material, so the factor was read off a crop
+  // (plinth 125 against wall 80 at 0.62) and set to land the plinth just under the wall's own value.
+  const wall = darken(lighten(base, WALL_LIGHTEN), 0.34);
+  const styleI = CELL_STYLES.indexOf(b.style);
+  // Course on a whole floor line above the kit's foot, never within 1.6 m of the wall head (0 = no course).
+  let course = Math.round((hWall * K.courseFloor) / K.floorH);
+  course = Math.min(course, Math.floor((hWall - 1.6) / K.floorH), K.maxCourse);
+  if (course < 1) course = 0;
+  const foot = plinth ? K.plinthH : 0.2;
+  for (let i = 0; i < ol.n; i++) {
+    if (ol.streetEdge(i, streetMask) || ol.face[i] < 0) continue;
+    const fr = ol.edge(i, wallFr);
+    if (fr.len < K.minLen) continue;
+    at(fr, fr.len / 2, 0, y0, pA);
+    cells.push(pA[0], pA[1], pA[2], fr.nx, fr.nz, fr.len, hWall, cellCode(CELL_KIND.wallKit, styleI, false, course | (plinth ? 16 : 0)), wall);
+    const n = Math.floor(fr.len / K.jointPitch);
+    for (let j = 1; j <= n; j++) {
+      const sJ = (fr.len * j) / (n + 1);
+      at(fr, sJ, 0, y0 + foot, pA);
+      cells.push(pA[0], pA[1], pA[2], fr.nx, fr.nz, K.jointW, hWall - foot - 0.3, cellCode(CELL_KIND.joint, styleI, false, 0), wall);
+    }
+  }
+}
+
+/**
  * Roof clutter, parapets, ledges, piers, slabs, balconies, crowns and blank-wall sign panels for one building.
  * Textured tiers, facade relief and sign panels go to `gb` (the building's style mesh, casts shadows); cornices,
  * roof clutter and crown trim go to `trim` (one city-wide plain mesh that stays out of the shadow pass — nothing on
@@ -1914,8 +1987,9 @@ function facadeUnits(cells: FacadeCellList, keep: FacadeKeepOut[] | null, b: Bui
  * band offsets as appendBuilding, so slabs step with the jogs and the built window units (listed into `cells` for
  * FacadeDetailRenderer, see facadeUnits) land on the painted cells. `keep` holds the rectangles no unit may overlap
  * (the building's neon sign boxes, in the rect faces' frames); the painted side-wall sign panel is pushed onto it.
+ * `wallCells` (opt-in, may be the same list as `cells`) receives the blank-elevation kit for the faces the relief skips.
  */
-export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Building, rng: Random, signs: WallSign[], streetMask = 15, bandTop = 0, cells: FacadeCellList | null = null, keep: FacadeKeepOut[] | null = null): void {
+export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Building, rng: Random, signs: WallSign[], streetMask = 15, bandTop = 0, cells: FacadeCellList | null = null, keep: FacadeKeepOut[] | null = null, wallCells: FacadeCellList | null = null): void {
   const x0 = b.x - b.w / 2, x1 = b.x + b.w / 2, z0 = b.z - b.d / 2, z1 = b.z + b.d / 2;
   const base = buildingTint(b);
   const roof = roofTint(base);
@@ -2129,6 +2203,10 @@ export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Buildi
       }
     }
   }
+  // The blank-elevation kit goes to `wallCells`, a separate opt-in list: `cells` is the street relief (window frames,
+  // balconies, AC boxes, downpipes) and a caller that asks only for that must not be handed units on walls that see
+  // no street. CityRenderer passes the same list for both, so in the game they share one batch and one draw call.
+  if (wallCells && b.style !== 'glass') blankWallKit(wallCells, b, ol, streetMask, Math.min(wallTop, topY), bandTop, base);
   if (b.style === 'neon' && wallTop > 12) {
     // Vertical neon fin down the street-facing corner.
     const dir = FACE_DIR[b.facing];

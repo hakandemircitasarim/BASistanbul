@@ -393,20 +393,26 @@ export class TextureFactory {
    * and left no visible aggregate at all. This is the operator a stone-in-bitumen surface actually needs.
    */
   private noiseWash(ctx: CanvasRenderingContext2D, W: number, H: number, noise: HTMLCanvasElement, span: number, amp: number,
-                    noise2?: HTMLCanvasElement, span2 = 0, amp2 = 0): void {
+                    noise2?: HTMLCanvasElement, span2 = 0, amp2 = 0, steps = 0, steps2 = 0): void {
     const nd = this.washField(W, H, noise, span);
     const nd2 = noise2 ? this.washField(W, H, noise2, span2) : null;
     const img = ctx.getImageData(0, 0, W, H);
     const d = img.data;
     const k = amp * 255 / 128, k2 = amp2 * 255 / 128;
+    // `steps` POSTERISES the field before it is added: the same shapes, but as flat plates with a hard edge between
+    // them instead of a continuous ramp. A continuous signed wash is an airbrush, and a magnified airbrush is exactly
+    // the "soft grey cloud blotch" a close asphalt frame must not have; the same field at three levels is three
+    // deliberate tones of bitumen laid in different decades, which is what the stylised target wants and what still
+    // reads as a decision after the mip chain and an 8x magnification at 2 m.
+    const q = (v: number, n: number): number => (n > 0 ? Math.round(((v - 128) / 128) * n) / n * 128 : v - 128);
     if (nd2) {
       for (let i = 0; i < d.length; i += 4) {
-        const n = (nd[i] - 128) * k + (nd2[i] - 128) * k2;
+        const n = q(nd[i], steps) * k + q(nd2[i], steps2) * k2;
         d[i] += n; d[i + 1] += n; d[i + 2] += n;
       }
     } else {
       for (let i = 0; i < d.length; i += 4) {
-        const n = (nd[i] - 128) * k;
+        const n = q(nd[i], steps) * k;
         d[i] += n; d[i + 1] += n; d[i + 2] += n;
       }
     }
@@ -550,15 +556,20 @@ export class TextureFactory {
       ctx.stroke();
     };
     for (let i = 0; i < n; i++) {
-      const pts = walk(rng.range(W * margin, W * (1 - margin)), rng.range(H * margin, H * (1 - margin)), rng.range(0, Math.PI * 2), rng.int(6, 14), 9 * scale);
+      // Per-crack scale AND a per-crack start angle: a crack drawn at one fixed step length and stroke width is a
+      // recognisable decal, and a recognisable decal inside a tiling texture is seen to repeat the moment two tiles
+      // are in the same frame. Between 0.55x and 1.7x with an independent heading, no two in a tile read as the same
+      // crack, so what tiles is a scatter of cracks rather than one crack printed over and over.
+      const sc = scale * rng.range(0.55, 1.7);
+      const pts = walk(rng.range(W * margin, W * (1 - margin)), rng.range(H * margin, H * (1 - margin)), rng.range(0, Math.PI * 2), rng.int(5, 13), 9 * sc);
       // Lit lip: a wider light stroke offset down-right, then the dark fissure over it.
-      stroke(pts, 0.8 * scale, 0.8 * scale, 1.9 * scale, rgba(255, 244, 228, lightA));
-      stroke(pts, 0, 0, 1.15 * scale, rgba(8, 6, 4, darkA));
+      stroke(pts, 0.8 * sc, 0.8 * sc, 1.9 * sc, rgba(255, 244, 228, lightA));
+      stroke(pts, 0, 0, 1.15 * sc, rgba(8, 6, 4, darkA));
       if (rng.chance(0.45)) {
         const k = rng.int(1, pts.length - 2);
-        const br = walk(pts[k][0], pts[k][1], rng.range(0, Math.PI * 2), rng.int(3, 6), 7 * scale);
-        stroke(br, 0.7 * scale, 0.7 * scale, 1.5 * scale, rgba(255, 244, 228, lightA * 0.8));
-        stroke(br, 0, 0, 0.9 * scale, rgba(8, 6, 4, darkA * 0.9));
+        const br = walk(pts[k][0], pts[k][1], rng.range(0, Math.PI * 2), rng.int(3, 6), 7 * sc);
+        stroke(br, 0.7 * sc, 0.7 * sc, 1.5 * sc, rgba(255, 244, 228, lightA * 0.8));
+        stroke(br, 0, 0, 0.9 * sc, rgba(8, 6, 4, darkA * 0.9));
       }
     }
   }
@@ -2469,16 +2480,54 @@ export class TextureFactory {
   }
 
   /**
-   * Shared asphalt base at any tile size: dark warm bitumen under a broad, low-contrast tonal mottle (patches 1-3 m
-   * across) and nothing finer - grain and aggregate specks read as static from a moving car, and the stylised target
-   * wants a clean colour field with its wear at the edges of the paint. Fills the roughness canvas (r) with a
-   * near-flat 1.0 base with a little variation.
+   * Flat tonal plates on a bitumen tile: `n` irregular wandering polygons 2.5-6 m across, each a single flat value
+   * off the base, drawn wrapped so the tile still meets itself. No gradient anywhere - the plate IS its edge.
+   */
+  private tonePlates(ctx: CanvasRenderingContext2D, S: number, rng: Random, n: number): void {
+    const px = S / ROAD_TILE_M;
+    for (let i = 0; i < n; i++) {
+      const cx = rng.range(0, S), cy = rng.range(0, S);
+      const rad = rng.range(1.3, 3.1) * px;
+      const dark = rng.chance(0.55);
+      const a = rng.range(0.02, 0.045);
+      ctx.fillStyle = dark ? rgba(16, 16, 19, a) : rgba(150, 146, 136, a * 0.8);
+      // 9-13 vertices on a wobbling radius: a re-laid patch has a ragged saw-cut outline, never a disc.
+      const m = rng.int(9, 13);
+      const rr: number[] = [];
+      for (let j = 0; j < m; j++) rr.push(rad * rng.range(0.62, 1.3));
+      for (let ox = -1; ox <= 1; ox++) {
+        for (let oy = -1; oy <= 1; oy++) {
+          const x = cx + ox * S, y = cy + oy * S;
+          if (x < -rad * 1.4 || x > S + rad * 1.4 || y < -rad * 1.4 || y > S + rad * 1.4) continue;
+          ctx.beginPath();
+          for (let j = 0; j < m; j++) {
+            const th = (j / m) * Math.PI * 2;
+            const vx = x + Math.cos(th) * rr[j], vy = y + Math.sin(th) * rr[j];
+            if (j === 0) ctx.moveTo(vx, vy); else ctx.lineTo(vx, vy);
+          }
+          ctx.closePath();
+          ctx.fill();
+        }
+      }
+    }
+  }
+
+  /**
+   * Shared asphalt base at any tile size: dark warm bitumen under a few FLAT tonal plates.
+   *
+   * It used to be `mottle`: 26 radial gradients 2.5-6.6 m across at 0.045 alpha. At 20 m that is an inoffensive
+   * mottle; at 2 m, where mip 0 is magnified about eight times, every one of them is a soft grey cloud with no edge
+   * anywhere in it - the "wet smear" read that survived two rounds of trying to cover it up with bands and grit on
+   * top. A gradient cannot be rescued by anything laid over it, because what fails is the absence of an edge. The
+   * plates below are the same tonal event with a hard boundary: at 2 m they read as bitumen laid in two campaigns,
+   * at 20 m as exactly the same mottle. The roughness canvas keeps its soft mottle - polish really is a gradient and
+   * roughness is never magnified into view.
    */
   private asphalt(ctx: CanvasRenderingContext2D, r: CanvasRenderingContext2D | null, S: number, rng: Random): void {
     const k = S / 512;
     ctx.fillStyle = '#2e2c29';
     ctx.fillRect(0, 0, S, S);
-    this.mottle(ctx, S, S, rng, 26, 90 * k, 240 * k, 0.045, 0, 0, true);
+    this.tonePlates(ctx, S, rng, 7);
     if (r) {
       r.fillStyle = grey(1);
       r.fillRect(0, 0, S, S);
@@ -2499,8 +2548,17 @@ export class TextureFactory {
    * Called AFTER the tile's de-dither blur (see road()): a 3 x 3 pass would take most of the fine octave with it.
    */
   private aggregate(ctx: CanvasRenderingContext2D, S: number, chipOff = -1): void {
-    this.noiseWash(ctx, S, S, this.valueNoise('bitumenA', 256, 3, 3, 0.5, 613, 0.5), S, 0.13,
-      this.valueNoise('bitumenB', 256, 11, 4, 0.5, 2207, 0.5), S, 0.11);
+    // Both fields are POSTERISED (see noiseWash's `steps`). Continuous, they were the second airbrush on the tile:
+    // the coarse one is a 4.7 m blob and the fine one a 1.3 m one, and a magnified soft blob is a smear whatever its
+    // amplitude.
+    //
+    // `steps` is 1 on the coarse field and 2 on the fine one, and that is not a contrast choice - n steps means
+    // 2n + 1 levels and 2n contour boundaries. At 3 the coarse field drew six nested contours around every local
+    // maximum and the road read as a topographic map (or, worse, as mip banding). At 1 there are exactly two
+    // boundaries: the darkest fifth of the field becomes one flat dark plate, the lightest fifth one flat pale plate,
+    // and everything between is left alone. That is the "two or three deliberate flat tonal bands" the surface wants.
+    this.noiseWash(ctx, S, S, this.valueNoise('bitumenA', 256, 3, 3, 0.5, 613, 0.5), S, 0.055,
+      this.valueNoise('bitumenB', 256, 11, 4, 0.5, 2207, 0.5), S, 0.06, 1, 2);
     if (chipOff >= 0) this.chipBed(ctx, S, chipOff);
   }
 
@@ -2761,6 +2819,10 @@ export class TextureFactory {
     // blurred at exactly this point in their own recipe, which is why neither of them shows the lattice.)
     this.blur3(ctx, S, S);
     this.aggregate(ctx, S, 0);
+    // Fatigue cracking: three fissures with almost no lit lip (bitumen has no bright fracture face the way a paving
+    // slab does). Each takes its own scale and heading from `cracks`, so the three in the tile are three different
+    // cracks rather than one decal stamped three times.
+    this.cracks(ctx, S, S, rng, 3, k * 1.15, 0.26, 0.025, 0.1);
     // Manhole in the inner lane, drain against one kerb.
     this.manhole(ctx, r, rng, cx + (rng.chance(0.5) ? 1 : -1) * rng.range(1.6, 2.4) * px, rng.range(0.2, 0.8) * S, 0.34 * px);
     const dSide = rng.chance(0.5) ? 0.35 * px : S - 0.35 * px - 0.36 * px;
@@ -2813,6 +2875,8 @@ export class TextureFactory {
     this.asphaltPatches(ctx, S, px, rng, 6, [0.18, 0.82]);
     this.blur3(ctx, S, S);
     this.aggregate(ctx, S, 317);
+    // A lot surface is thinner than a carriageway and cracks more: four, at their own scales (see cracks).
+    this.cracks(ctx, S, S, rng, 4, k * 1.15, 0.24, 0.025, 0.1);
     // A tarmac lot is laid in strips by a paver the width of a bay run: one transverse lap joint, soft, in the middle
     // of the tile - the one horizontal event, and at a fifth of the contrast the road's old trench line had.
     ctx.fillStyle = rgba(14, 14, 16, 0.12);

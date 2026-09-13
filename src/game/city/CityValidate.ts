@@ -4,6 +4,7 @@ import { BLOCK, GRID_COLS, GRID_ROWS, INTERSECTION_R, LANE_W, PLAZA_BLOCKS } fro
 import type { GeneratedCity } from './CityGenerator';
 import { colliderDistance, distToNearestRoadNode, onRoad } from './CityBuild';
 import { KERB_PARK } from './CityProps';
+import { HEDGE } from './CityLots';
 import type { CityData } from './CityData';
 
 const POINT_CLEARANCE = 0.6;
@@ -101,6 +102,16 @@ export function validateCity(g: GeneratedCity): string[] {
     if (!isFinite(s.yaw)) out.push(`parkedSpot[${i}] has a non-finite yaw`);
   }
   if (nearSpawn < 3) out.push(`only ${nearSpawn} parked spots within 40 m of playerSpawn`);
+  // The spawn bay must stay clear of the planting. The chase camera stands 6.2 m behind the player, so a hedge unit
+  // nearer than that to the spawn is drawn BETWEEN the camera and the player and fills the bottom third of the game's
+  // very first frame; CityLots opens a HEDGE.pointClear break at every named point to prevent it.
+  for (let i = 0; i < city.props.length; i++) {
+    const pr = city.props[i];
+    if (pr.kind !== 'hedge') continue;
+    if ((pr.x - p.playerSpawn.x) ** 2 + (pr.z - p.playerSpawn.z) ** 2 < HEDGE.pointClear * HEDGE.pointClear) {
+      out.push(`hedge at (${pr.x.toFixed(1)}, ${pr.z.toFixed(1)}) stands inside the ${HEDGE.pointClear} m spawn break`);
+    }
+  }
   // Props: never on a lane / intersection, never inside a building.
   for (let i = 0; i < city.props.length; i++) {
     const pr = city.props[i];
