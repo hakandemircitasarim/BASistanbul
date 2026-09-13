@@ -792,6 +792,10 @@ export class PlayerRenderer {
     this.mesh.updateMatrixWorld(true);
     this.mesh.bind(new THREE.Skeleton(this.bones));
     this.group.add(this.mesh);
+    // 'YXZ', not the default 'XYZ': the downed pose (sync) sets rotation.x = -PI/2 on top of the yaw. On 'XYZ' the
+    // yaw would be applied BEFORE the tip and the body would come to rest along world -Z whichever way the player had
+    // been facing, while its contact blob is laid along that yaw. Here the tipped figure turns with its yaw, so body
+    // and blob agree - the same relation PedRenderer's lying ped has. Nothing sets x or z while standing.
     this.group.rotation.order = 'YXZ';
     scene.add(this.group);
     this.shadows = new ContactShadows(scene, 1);

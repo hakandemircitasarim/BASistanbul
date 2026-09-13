@@ -18,25 +18,28 @@ Ayrıntılı sözleşmeler: `docs/GAME_DESIGN.md` (bölüm 0 = temel kurallar, 2
   (modül seviyesinde scratch nesneler, `out` parametreleri, sayaç döndüren sorgular).
 - Yoğun nesneler `InstancedMesh`, statik şehir birleştirilmiş (merged) geometri.
 - Çizim çağrısı bütçesi: kare başına < 120, üçgen bütçesi ≤ 720 bin. **Bütçe doğuş karesinde değil, EN KÖTÜ karede
-  ölçülür**: {doğuş, 20 m kuzey (x=1036 z=615), 40 m kuzey (z=595)} × {12, 19, 21}, `?autostart=1&hour=H&quality=high&noadapt=1`,
-  1280×720. Tur 8 yalnız doğuş karesini ölçtü ve kuzeye yürüyen kare 747,5 bin ile tavanın üstündeydi. Tur 12'nin
-  KAPANIŞINDA dokuz karenin hepsi yeniden ölçüldü (`scratchpad/pw/dv-worst.mjs <base>`, saat sabit, nüfus doyana
-  kadar bekleme: 40 yaya / 26-28 trafik) ve tur 11'in tablosuyla **tamı tamına** aynı çıktı — yani tur 12'nin
-  değişiklikleri (gölge haritası 3072, temas lekesinin sıra numarası, `plain`/`glow`'un probe listesinden çıkması)
-  üçgen ve çizim açısından nötr (doğuş – 20 m – 40 m, üçgen bin / çizim): öğlen 656,2/105 – 674,3/107 –
-  666,9/107; 19:00 684,7/109 – **703,6**/111 – 703,1/111; 21:00 688,0/108 – 702,1/110 – 700,9/110.
-  **En kötü 703.626 üçgen / 111 çizim (19:00, 20 m kuzey.)**
+  ölçülür**: {doğuş, 20 m kuzey (x=1036 z=615), 40 m kuzey (z=595)} × {**7**, 12, 19, 21},
+  `?autostart=1&hour=H&quality=high&noadapt=1`, 1280×720. Tur 8 yalnız doğuş karesini ölçtü ve kuzeye yürüyen kare
+  747,5 bin ile tavanın üstündeydi. Tur 12 üç saat örnekledi ve **SABAHI KAÇIRDI**: 07:00 sıradan bir oyun saati ve
+  19:00'dan 12,4 bin üçgen daha pahalı (alçak güneş + gölge kutusunun içindeki her şey aydınlık), yani sweep'e
+  eklendi. Tur 13'ün KAPANIŞINDA on iki karenin hepsi yeniden ölçüldü (`scratchpad/pw/dv-worst.mjs <base>`, saat
+  sabit, nüfus doyana kadar bekleme: 40 yaya / 26-28 trafik), doğuş – 20 m – 40 m, üçgen bin / çizim:
+  **07:00 692,1/109 – 718,4/111 – 711,4/111**; öğlen 659,2/105 – 676,5/107 – 669,4/107;
+  19:00 690,6/109 – 706,0/111 – 705,6/111; 21:00 691,8/108 – 704,5/110 – 705,0/112.
+  **En kötü 718.374 üçgen / 111 çizim (07:00, 20 m kuzey); en çok çizim 112 (21:00, 40 m).**
+  Şafağın tepesi 07:00'dir, komşuları değil: 06:00 712,6 bin, 06:30 713,7 bin, 07:30 714,9 bin (hepsi 20 m kuzey).
   Tabloyu 1280×720 dışında bir görüntü alanıyla ÖLÇME: bir tur-11 eleştirmeni aynı kareyi 640×360'ta 707.466 okudu
   ve tavana kalan payı 3,9 bin fazla gösterdi; LOD/paketleme kararları kare yüksekliğine bağlı.
-  **Bağlayıcı KONUM değişti**: 19:00'da da 21:00'de de en kötü kare artık 40 m değil **20 m kuzey**; yalnız eski
-  noktayı örnekleyen bir tur yanlış kareyi ölçer. Tavana kalan pay 16,4 bin üçgen (tur 10'un yazdığı ~50 bin değil)
-  ve 9 çizim. Tur 10'da orta kademe araç gövdesi (`veh:mid:*`) yeniden gölge döküyor: ölçülen bedeli +11,5 bin üçgen
-  ve +4 çizim (bandda bir düzine araçla; en kötü +5, anahtar başına bir çizim). Yeni kalıcı mesh eklemeden önce bunu
-  hesaba kat.
+  **Bağlayıcı KONUM 20 m kuzeydir**, 40 m değil — dört saatin dördünde de; yalnız eski noktayı örnekleyen bir tur
+  yanlış kareyi ölçer. **Tavana kalan pay 1,6 bin üçgen** (tur 12'nin yazdığı 14,0 bin değil: o rakam yalnızca
+  {12, 19, 21}'i örnekleyen bir sweep'ten geliyordu) ve 8 çizim. Yani yeni kalıcı bir mesh pratikte YOKTUR; yaya LOD
+  kademesi gibi üçgen GERİ KAZANAN bir iş bu satırın önünde gelir. Tur 10'da orta kademe araç gövdesi
+  (`veh:mid:*`) yeniden gölge döküyor: ölçülen bedeli +11,5 bin üçgen ve +4 çizim (bandda bir düzine araçla; en kötü
+  +5, anahtar başına bir çizim). Yeni kalıcı mesh eklemeden önce bunu hesaba kat.
   **Saati ölçüm boyunca sabitle**: güneş `sunDir.y > -0.06` eşiğini ~19.05'te geçiyor ve geçtiği anda tüm gölge geçişi
   düşüyor (aynı nokta 742 bin yerine 457 bin okuyor), yani sabitlenmemiş ölçümler karşılaştırılamaz.
   Nüfus da ölçümü kaydırır: kalabalık ve trafik yavaş doluyor, tavana (40 yaya / 28 trafik) oturmuş kare aynı noktada
-  ~658 bin okuyor. **Görsel bir tur kapanmadan önce dokuz kareyi de yeniden ölçüp bu satırı güncelle.**
+  ~658 bin okuyor. **Görsel bir tur kapanmadan önce on iki kareyi de yeniden ölçüp bu satırı güncelle.**
   Karenin en büyük kalemi kalabalık (40 × 1.926 × 2 = 154,1 bin, yüzde 22 — yaya başına 1.926, eski satırın yazdığı
   1.882 değil; sahnedeki altı `ped:part` örnekli mesh'i toplayarak ölçüldü): `PED_RENDER.cullDist` 96 m'dir, son
   `cullFade` 6 m'de yaya `cullFloor` (0,55) boyuna iner ve menzil dışındaki yaya listeden tamamen ÇIKAR — sıfır ölçekli
@@ -62,6 +65,11 @@ Ayrıntılı sözleşmeler: `docs/GAME_DESIGN.md` (bölüm 0 = temel kurallar, 2
   GROUND_DAY_LIFT 1,22); telafisiz kesme tek taraflı kayıptır — tur 11 `plain`/`glow`'u listeye koydu ve şehrin
   bütün çatı hattı harpuştasını 12,8/255 söndürdü (tur 12'de geri alındı). `plain` = çatı trim mesh'i + arka plan
   tepeleri, kaldırım taşı veya prop kabuğu DEĞİL.
+- Temas lekesinin şekli ve solması örnek başına `instanceColor` üzerinde taşınır ve parça (fragment) tarafında
+  **`USE_COLOR`** ile korunur. three r185 `USE_INSTANCING_COLOR`'ı YALNIZ vertex ön ekine yazar; parça ön eki aynı
+  durumu `USE_COLOR` diye bildirir (`color_pars_fragment` de `vColor`'ı onun altında tanımlar). Tur 12 parça yarısını
+  vertex-only tanıma bağlamıştı: her figürün lekesi sessizce yuvarlak DİKDÖRTGEN'e düşüyor ve kesme/doğuş solması hiç
+  uygulanmıyordu. CPU tarafı testler bunu göremez — `render.test.ts` yamalı parça kaynağını okuyup tanımı doğruluyor.
 - Temas lekesi (`ContactShadows`) bir ÇARPIMDIR (`dst *= 1 - srcAlpha`) ve `renderOrder` = **1,5**: yol boyası ve
   fren izinin (1) ÜSTÜNDE — ikisi de derinlik yazmaz, altta kalırsa boya çarpımın üstüne tam parlaklıkta yeniden
   basılır — ama her toplamalı katmanın (lamba havuzu 2, neon 3, işaret 4, parçacık 5-6) ALTINDA.
@@ -72,7 +80,13 @@ Ayrıntılı sözleşmeler: `docs/GAME_DESIGN.md` (bölüm 0 = temel kurallar, 2
   malzeme başına tek `THREE.BatchedMesh` kullanır (`setVisibleAt` ile `PROP_RANGE` dışındakiler gizli) ve kamera 15 m
   hareket edince yeniden paketler (park araçlarının iki kapaklı kademesi kendi 1,5 m'lik `CAR_TIER_MOVE` ritminde,
   çünkü 8 m'lik yakın bant 15 m'lik ritimle atanamaz); `FacadeDetailRenderer` pencere çerçevesi/denizlik/balkon/klima birimlerini aynı
-  şekilde ~55 m içinde tek BatchedMesh'te tutar. `WEBGL_multi_draw` gerekir.
+  şekilde ~55 m içinde tek BatchedMesh'te tutar; aynı paket sokağa bakmayan cephelerin asgari donatısını da taşır
+  (silme kuşağı `wallKit` 60 m, derz çıtası `joint` 42 m). **Hiçbir cephe boş DEĞİL**: `facade()` pencereli döşemeyi
+  binanın her yüzüne sarar, yani boyalı kat çizgileri (dünya y'si `m.rowH`'un katı) ve aks çizgileri (yüzün başlangıç
+  köşesinden `m.bayW`'nin katları) donatının arkasında durur. Bu ızgaraya oturmayan her donatı camı kesiyor: tur
+  12'nin FLOOR_H'a (3,5 m) oturttuğu silme bir kulenin bütün pencere sırasının alt üçte birini kesiyordu (rowH hiçbir
+  zaman 3,5 değil: 2,94 / 3,43 / 3,92 / 6,86), yuvarlak 9 m'deki derzler de camdan geçiyordu. Süpürgelik yok: döşemenin
+  zemin sırası (büyük dükkân camları) duvar dibinin 0,02 sıra üstünde başlıyor, yani güvenli bir yüksekliği yok. `WEBGL_multi_draw` gerekir.
 - Doku üretimi ana iş parçacığını bloke eder ve ilk kareden önce ödenir: sıfır argümanlı üreticilerin toplamı
   headless harness'ta ~1,03 s (yol 242 ms, lotAsphalt 172, crosswalk 151, kaldırım 99), gezinmeden ilk kareye ~7,0 s.
   `noiseWash` hedef tuvali havuzlanır (`washField`) ve eşli yıkamalar tek `getImageData`/`putImageData` paylaşır

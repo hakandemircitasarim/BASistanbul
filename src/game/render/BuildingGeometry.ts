@@ -1293,12 +1293,17 @@ export interface WallSign { x: number; y: number; z: number; yaw: number; w: num
 /**
  * Kinds of built facade detail listed for FacadeDetailRenderer (low bits of a cell's code).
  *
- * `wallKit` and `joint` are the minimum kit every BLANK elevation gets - the side and party walls the street relief
- * skips. A blank wall used to be one flat plane of the wall tint from the pavement to the cornice, which at 12 m was
- * the emptiest surface in the frame; the kit is a plinth band in a darker value, one string course on a floor line
- * and a few raised expansion-joint strips, i.e. the three things every real party wall has and none of which needs a
- * texture. They ride the same distance-packed batch as the window frames, so a blank wall beyond FACADE_RANGE.wallKit
- * costs nothing.
+ * `wallKit` (one string course) and `joint` (a raised expansion-joint strip) are the minimum kit every elevation the
+ * street relief SKIPS gets - the side and party walls, which carry no window frames, no balconies and no downpipes
+ * and were the emptiest surfaces in a 12 m frame. They ride the same distance-packed batch as the window frames, so
+ * a wall beyond FACADE_RANGE.wallKit costs nothing.
+ *
+ * Both are placed on the painted tile's OWN grid, and the kit has no plinth. The wall is not blank: `facade()` maps
+ * the windowed tile onto every face, street or not, so the painted floor lines (world y = a multiple of `m.rowH`)
+ * and bay lines (multiples of `m.bayW` from the face's start corner) run behind the kit. A course on the kit's own
+ * origin plus a multiple of FLOOR_H, or a joint at a round 9 m, lands wherever it happens to fall - measured, a
+ * course cut the bottom third of a whole window row of a set-back tower and the joints ran through the glazing. A
+ * plinth has no safe height at all: the tile's ground row (big shop panes) starts 0.02 of a row above the wall foot.
  */
 export const CELL_KIND = { window: 0, balcony: 1, ac: 2, pipe: 3, wallKit: 4, joint: 5 } as const;
 /** Style index of a cell's code (bits 3..5), in this order. */
@@ -1332,11 +1337,12 @@ export class FacadeCellList {
   get(i: number, k: number): number { return this.data[i * CELL_STRIDE + k]; }
 }
 /**
- * The blank-elevation kit's dimensions, shared with FacadeDetailRenderer (which builds the geometry) and the tests.
- * `courseFloor` is the floor line the string course runs on as a fraction of the wall height, quantised to whole
- * floors so the batch needs one geometry variant per floor index instead of one per building.
+ * The side-elevation kit's dimensions, shared with FacadeDetailRenderer (which builds the geometry) and the tests.
+ * `courseFloor` is roughly where up the wall the string course runs, as a fraction of the wall height; the exact
+ * height is snapped to a painted floor line by blankWallKit and travels on the unit's own y, so the batch needs ONE
+ * geometry for the course whatever building it belongs to.
  */
-export const WALL_KIT = { plinthH: 1.15, plinthOut: 0.11, courseH: 0.34, courseOut: 0.15, jointW: 0.1, jointOut: 0.05, jointPitch: 9, minLen: 5, minH: 5, courseFloor: 0.45, floorH: FLOOR_H, maxCourse: 8 } as const;
+export const WALL_KIT = { courseH: 0.34, courseOut: 0.15, jointW: 0.1, jointOut: 0.05, jointPitch: 9, minLen: 5, minH: 5, courseFloor: 0.45 } as const;
 
 /** Rectangle of a rect face (0..3) in that face's frame (s along it from its start corner, y up) that no built unit may overlap: a neon sign box, a painted sign panel. */
 export interface FacadeKeepOut { face: number; s0: number; s1: number; y0: number; y1: number }
@@ -1934,43 +1940,53 @@ function facadeUnits(cells: FacadeCellList, keep: FacadeKeepOut[] | null, b: Bui
 }
 
 /**
- * Minimum kit for the elevations the street relief skips: a plinth band at the foot, one string course on a floor
- * line and raised expansion-joint strips at `WALL_KIT.jointPitch`. One kit unit per face plus one unit per joint,
- * all in the distance-packed facade batch (FacadeDetailRenderer), so a wall out of range costs nothing.
+ * Minimum kit for the elevations the street relief skips: one string course on a painted floor line, and raised
+ * expansion-joint strips on painted bay lines about `WALL_KIT.jointPitch` apart. One course unit per face plus one
+ * unit per joint, all in the distance-packed facade batch (FacadeDetailRenderer), so a wall out of range costs
+ * nothing. `rowH` / `bayW` are the painted tile's row and bay pitches for this building (Massing) - the kit is
+ * placed ON that grid, see CELL_KIND.
  *
- * The kit deliberately carries no windows: a party wall has none, and the point is to give the plane a base, a
- * horizontal and a rhythm - the three things that stop a 12 m flat grey rectangle reading as untextured cardboard.
+ * The kit carries no windows and no plinth: the point is to give a plane the relief pass never touches a horizontal
+ * and a rhythm, which is what stops a 12 m wall of flat painted tile reading as a decal on cardboard.
  */
-function blankWallKit(cells: FacadeCellList, b: Building, ol: Outline, streetMask: number, wallTop: number, bandTop: number, base: number): void {
+function blankWallKit(cells: FacadeCellList, b: Building, ol: Outline, streetMask: number, wallTop: number, bandTop: number, base: number, rowH: number, bayW: number): void {
   const K = WALL_KIT;
-  // A building with a shop band wears it on every face, blank or not, so the wall there starts above the band cap and
-  // the plinth is already built: that face gets the course and the joints only.
+  // A building with a shop band wears it on every face, blank or not, so the wall there starts above the band cap.
   const y0 = bandTop > 0 ? bandTop + 0.25 : 0;
-  const plinth = bandTop <= 0;
   const hWall = wallTop - 0.5 - y0;
   if (hWall < K.minH) return;
   // The kit is UNTEXTURED and the wall beside it is not: the wall tile multiplies the wall tint by its own ~0.62
   // average, so a unit handed the raw wall tint renders about 1.8x the wall it is supposed to belong to (measured:
-  // 160 against 90 at noon). Pre-multiplying by the tile average is what makes the plinth read as the same masonry a
-  // value darker instead of as a pale blank band stuck to the foot of the building. 0.34 is measured, not derived:
-  // the facade batch answers light a little differently from the wall material, so the factor was read off a crop
-  // (plinth 125 against wall 80 at 0.62) and set to land the plinth just under the wall's own value.
+  // 160 against 90 at noon). Pre-multiplying by the tile average is what makes the band read as the same masonry a
+  // value darker instead of as a pale blank stripe stuck on the building. 0.34 is measured, not derived: the facade
+  // batch answers light a little differently from the wall material, so the factor was read off a crop (band 125
+  // against wall 80 at 0.62) and set to land the band just under the wall's own value.
   const wall = darken(lighten(base, WALL_LIGHTEN), 0.34);
   const styleI = CELL_STYLES.indexOf(b.style);
-  // Course on a whole floor line above the kit's foot, never within 1.6 m of the wall head (0 = no course).
-  let course = Math.round((hWall * K.courseFloor) / K.floorH);
-  course = Math.min(course, Math.floor((hWall - 1.6) / K.floorH), K.maxCourse);
-  if (course < 1) course = 0;
-  const foot = plinth ? K.plinthH : 0.2;
+  // The course runs ON a painted floor line. `facade` maps the tile with v = (y + kv * rowH) / th and kv is a WHOLE
+  // number of rows, so the painted lines sit at world y = a multiple of rowH on every face of every building whatever
+  // the band offsets are - the one phase the kit can trust. Rounding the target height (courseFloor of the wall) onto
+  // that grid is the whole fix: the course lands in the spandrel between two window rows instead of across the glass.
+  const courseY = Math.round((y0 + hWall * K.courseFloor) / rowH) * rowH;
+  const course = courseY > y0 + 1.2 && courseY + K.courseH < wallTop - 1.6;
+  const foot = 0.2;
   for (let i = 0; i < ol.n; i++) {
     if (ol.streetEdge(i, streetMask) || ol.face[i] < 0) continue;
     const fr = ol.edge(i, wallFr);
     if (fr.len < K.minLen) continue;
-    at(fr, fr.len / 2, 0, y0, pA);
-    cells.push(pA[0], pA[1], pA[2], fr.nx, fr.nz, fr.len, hWall, cellCode(CELL_KIND.wallKit, styleI, false, course | (plinth ? 16 : 0)), wall);
+    if (course) {
+      at(fr, fr.len / 2, 0, courseY, pA);
+      cells.push(pA[0], pA[1], pA[2], fr.nx, fr.nz, fr.len, K.courseH, cellCode(CELL_KIND.wallKit, styleI, false, 0), wall);
+    }
+    // Joints on the tile's BAY lines (multiples of bayW from the face's start corner, the same grid facadeUnits puts
+    // its window columns on), nearest the even jointPitch spacing. A painted opening covers at most 0.94 of its bay,
+    // so a 0.1 m strip on a bay line is always in masonry; an unsnapped one crossed the glazing about half the time.
     const n = Math.floor(fr.len / K.jointPitch);
+    let last = -1;
     for (let j = 1; j <= n; j++) {
-      const sJ = (fr.len * j) / (n + 1);
+      const sJ = Math.round((fr.len * j) / (n + 1) / bayW) * bayW;
+      if (sJ < bayW - 1e-6 || sJ > fr.len - bayW + 1e-6 || sJ === last) continue;
+      last = sJ;
       at(fr, sJ, 0, y0 + foot, pA);
       cells.push(pA[0], pA[1], pA[2], fr.nx, fr.nz, K.jointW, hWall - foot - 0.3, cellCode(CELL_KIND.joint, styleI, false, 0), wall);
     }
@@ -2206,7 +2222,7 @@ export function appendBuildingDetail(gb: GeoBuilder, trim: GeoBuilder, b: Buildi
   // The blank-elevation kit goes to `wallCells`, a separate opt-in list: `cells` is the street relief (window frames,
   // balconies, AC boxes, downpipes) and a caller that asks only for that must not be handed units on walls that see
   // no street. CityRenderer passes the same list for both, so in the game they share one batch and one draw call.
-  if (wallCells && b.style !== 'glass') blankWallKit(wallCells, b, ol, streetMask, Math.min(wallTop, topY), bandTop, base);
+  if (wallCells && b.style !== 'glass') blankWallKit(wallCells, b, ol, streetMask, Math.min(wallTop, topY), bandTop, base, rowH, bayW);
   if (b.style === 'neon' && wallTop > 12) {
     // Vertical neon fin down the street-facing corner.
     const dir = FACE_DIR[b.facing];

@@ -141,7 +141,12 @@ function blobMaskPatch(shader: THREE.WebGLProgramParametersWithUniforms, penumbr
       '#include <common>',
       'varying vec2 vBlobQ;',
       'varying vec2 vBlobFade;',
-      '#ifdef USE_INSTANCING_COLOR',
+      // USE_COLOR, not USE_INSTANCING_COLOR: three r185 emits USE_INSTANCING_COLOR in the VERTEX prefix only
+      // (WebGLProgram), while the FRAGMENT prefix answers an instanceColor attribute with USE_COLOR - which is also
+      // the define `color_pars_fragment` declares `varying vec4 vColor` under. Guarding the fragment half on the
+      // vertex-only define silently preprocessed both per-instance scalars away: every figure blob rendered as the
+      // rounded RECTANGLE this shape term exists to avoid, and the spawn / cull fade never reached the occlusion.
+      '#ifdef USE_COLOR',
       '  #define vBlobRound vColor.g',
       '#else',
       '  #define vBlobRound 0.0',
@@ -159,8 +164,8 @@ function blobMaskPatch(shader: THREE.WebGLProgramParametersWithUniforms, penumbr
       '  float blobEll = ( length( vBlobQ ) - ( 1.0 - blobFadeR ) ) / blobFadeR;',
       '  float blobD = clamp( mix( blobBox, blobEll, vBlobRound ), 0.0, 1.0 );',
       '  diffuseColor.a *= 1.0 - ( blobD * blobD * ( 3.0 - 2.0 * blobD ) );',
-      '  #ifdef USE_INSTANCING_COLOR',
-      '    diffuseColor.a *= vColor.r;', // per-instance spawn / cull fade, see ContactShadows.add
+      '  #ifdef USE_COLOR',
+      '    diffuseColor.a *= vColor.r;', // per-instance spawn / cull fade, see ContactShadows.add (USE_COLOR: see above)
       '  #endif',
       '  if ( diffuseColor.a <= 0.0 ) discard;',
       '}',
@@ -197,7 +202,7 @@ class ShadowField {
       depthWrite: false, side: THREE.DoubleSide, fog: false, toneMapped: false,
     });
     this.material.onBeforeCompile = (shader) => blobMaskPatch(shader, this.penumbra);
-    this.material.customProgramCacheKey = () => 'contactBlobMask1';
+    this.material.customProgramCacheKey = () => 'contactBlobMask2';
     this.material.name = 'contactBlob'; // Renderer.sceneBreakdown() and the render probes attribute the mesh by this.
     const geo = new THREE.PlaneGeometry(1, 1);
     geo.rotateX(-Math.PI / 2);

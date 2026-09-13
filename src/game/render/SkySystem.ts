@@ -121,8 +121,16 @@ const SHADOW_CAM_NEAR = 60;
  * The estimate costs four taps and no extra sampler: a sampler2DShadow fetch at a z pulled dz toward the light
  * answers 0 only where something stands at least that far in front of this fragment, which is exactly the
  * blocker-separation test PCSS does with a depth read. Two dz thresholds give a three-rung ladder (near / mid /
- * far), and each rung probes both ends of the disk's diameter so a fragment on the LIT side of a penumbra still
- * finds its blocker and softens symmetrically.
+ * far), and each rung probes both ends of BOTH of the shadow map's axes so a fragment on the LIT side of a penumbra
+ * still finds its blocker and softens symmetrically.
+ *
+ * Both axes, four fetches a rung, because the probe decides whether the disk widens at all and a probe pinned to one
+ * axis can only cross an edge that runs across it. The shadow camera is built with the default up, so U is the
+ * horizontal axis perpendicular to the sun's azimuth - exactly the direction a shadow's TIP edge runs: a fragment
+ * just outside such an edge kept both its probes on the lit side, found no blocker and stayed at the near rung, so
+ * a building's long dusk shadow was hard on its lit side and soft on its dark one, and which edges were hard rotated
+ * with the sun through the day. The max of the two axes keeps the old, dither-free pinned directions (the reason the
+ * probe is not spun by `phi` - a per-fragment probe angle made the ladder itself noisy) and restores the symmetry.
  */
 function patchShadowPenumbra(): void {
   const stock = `				shadow = (
@@ -136,13 +144,18 @@ function patchShadowPenumbra(): void {
   for (let i = 0; i < SHADOW_TAPS; i++) taps.push(`					texture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( ${i}, ${SHADOW_TAPS}, tapPhi ) * softRadius, shadowCoord.z ) )`);
   const dzNear = (SHADOW_PENUMBRA.nearM / SHADOW_DEPTH_SPAN).toFixed(6);
   const dzMid = (SHADOW_PENUMBRA.midM / SHADOW_DEPTH_SPAN).toFixed(6);
-  const wide = `				vec2 probeDir = vec2( radius, 0.0 );
-				float blockerNear = max(
-					1.0 - texture( shadowMap, vec3( shadowCoord.xy + probeDir, shadowCoord.z - ${dzNear} ) ),
-					1.0 - texture( shadowMap, vec3( shadowCoord.xy - probeDir, shadowCoord.z - ${dzNear} ) ) );
-				float blockerFar = max(
-					1.0 - texture( shadowMap, vec3( shadowCoord.xy + probeDir, shadowCoord.z - ${dzMid} ) ),
-					1.0 - texture( shadowMap, vec3( shadowCoord.xy - probeDir, shadowCoord.z - ${dzMid} ) ) );
+  const wide = `				vec2 probeU = vec2( radius, 0.0 );
+				vec2 probeV = vec2( 0.0, radius );
+				float blockerNear = max( max(
+					1.0 - texture( shadowMap, vec3( shadowCoord.xy + probeU, shadowCoord.z - ${dzNear} ) ),
+					1.0 - texture( shadowMap, vec3( shadowCoord.xy - probeU, shadowCoord.z - ${dzNear} ) ) ), max(
+					1.0 - texture( shadowMap, vec3( shadowCoord.xy + probeV, shadowCoord.z - ${dzNear} ) ),
+					1.0 - texture( shadowMap, vec3( shadowCoord.xy - probeV, shadowCoord.z - ${dzNear} ) ) ) );
+				float blockerFar = max( max(
+					1.0 - texture( shadowMap, vec3( shadowCoord.xy + probeU, shadowCoord.z - ${dzMid} ) ),
+					1.0 - texture( shadowMap, vec3( shadowCoord.xy - probeU, shadowCoord.z - ${dzMid} ) ) ), max(
+					1.0 - texture( shadowMap, vec3( shadowCoord.xy + probeV, shadowCoord.z - ${dzMid} ) ),
+					1.0 - texture( shadowMap, vec3( shadowCoord.xy - probeV, shadowCoord.z - ${dzMid} ) ) ) );
 				float softRadius = radius * ( ${SHADOW_PENUMBRA.near.toFixed(3)}
 					+ blockerNear * ${(SHADOW_PENUMBRA.mid - SHADOW_PENUMBRA.near).toFixed(3)}
 					+ blockerFar * ${(1 - SHADOW_PENUMBRA.mid).toFixed(3)} );

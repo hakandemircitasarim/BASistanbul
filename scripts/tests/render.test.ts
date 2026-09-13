@@ -436,7 +436,7 @@ test('SkySystem: the shadow chunk is patched for both a soft penumbra and the bo
   // Two dz thresholds = a three-rung ladder. One threshold is what round 9 had, and a single step at 1.5 m put every
   // caster taller than a kerb straight into the widest disk.
   const probes = (chunk.match(/shadowCoord\.z - 0\./g) || []).length;
-  expect(probes === 4, `the ladder takes four blocker probes, two per rung (got ${probes})`);
+  expect(probes === 8, `the ladder takes eight blocker probes, four per rung (got ${probes})`);
   // Round 12: the per-pixel rotation of the disk is RAMPED IN with the disk's width, and the blocker probe does not
   // rotate at all. Three rotates by an interleaved-gradient noise of gl_FragCoord on every fragment, which at seven
   // taps leaves an ordered, screen-stable crosshatch over every soft shadow edge in the frame - measured on the
@@ -444,8 +444,48 @@ test('SkySystem: the shadow chunk is patched for both a soft penumbra and the bo
   // the ramped angle, not `phi`, or the weave is straight back.
   expect(chunk.includes('float tapPhi = phi *'), 'the disk rotation is ramped with softRadius, not applied flat');
   expect(!/vogelDiskSample\( \d+, 7, phi \)/.test(chunk), 'no tap still uses the unramped screen-space rotation');
-  expect(chunk.includes('vec2 probeDir = vec2( radius, 0.0 )'),
-    'the blocker probe is pinned: rotating it per pixel dithers the penumbra WIDTH, which is the same crosshatch');
+  // Round 13: the probe directions stay PINNED (spinning them by phi dithers the penumbra WIDTH, which is the same
+  // crosshatch) but there are now two of them. A probe pinned to U alone can only cross an edge that runs across U,
+  // and U is perpendicular to the sun's azimuth - the direction a shadow's tip edge runs - so the most prominent soft
+  // edge in a dusk frame found no blocker on its lit side and stayed hard there while its dark side widened.
+  expect(chunk.includes('vec2 probeU = vec2( radius, 0.0 )') && chunk.includes('vec2 probeV = vec2( 0.0, radius )'),
+    'the blocker probe covers both shadow-map axes, so a penumbra softens the same way whichever way its edge runs');
+  expect(!/probe[UV] = vec2\([^)]*phi/.test(chunk), 'neither probe direction is spun per fragment');
+});
+
+test('BuildingGeometry: the side-elevation kit sits on the painted tile grid, never across a window', () => {
+  // The kit (one string course, a few expansion-joint strips) goes on the faces the street relief skips - and those
+  // faces are NOT blank: `facade` maps the windowed tile onto every face of every building, so the painted floor
+  // lines (world y = a multiple of m.rowH) and bay lines (multiples of m.bayW from the face's start corner) run
+  // behind it. Placed on the kit's own origin plus a round FLOOR_H, the course cut the bottom third of a whole window
+  // row of a set-back tower; at a round 9 m the joints crossed the glazing. Both must land on the painted grid.
+  const b = sampleBuilding({ id: 11, district: 'suburb', style: 'residential', h: 24, w: 60, d: 16 });
+  const cells = new FacadeCellList();
+  appendBuildingDetail(new GeoBuilder(), new GeoBuilder(), b, new Random(1), [], 1, 0, null, [], cells);
+  const m = massingOf(b);
+  const rowH = m.rowH, bayW = m.bayW;
+  const x0 = b.x - b.w / 2, x1 = b.x + b.w / 2, z0 = b.z - b.d / 2, z1 = b.z + b.d / 2;
+  let courses = 0, joints = 0;
+  for (let i = 0; i < cells.n; i++) {
+    const kind = cells.get(i, 7) & 7;
+    const px = cells.get(i, 0), py = cells.get(i, 1), pz = cells.get(i, 2), nz = cells.get(i, 4);
+    if (kind === CELL_KIND.wallKit) {
+      courses++;
+      const r = py / rowH;
+      expect(Math.abs(r - Math.round(r)) < 1e-4,
+        `course ${i} runs on a painted floor line (y ${py.toFixed(2)} = ${r.toFixed(3)} rows of ${rowH.toFixed(3)} m)`);
+    } else if (kind === CELL_KIND.joint) {
+      joints++;
+      // The bay grid starts at the face's start corner, which for this rect footprint is one of its two ends.
+      const a = Math.abs(nz) > 0.5 ? px : pz, lo = Math.abs(nz) > 0.5 ? x0 : z0, hi = Math.abs(nz) > 0.5 ? x1 : z1;
+      const cA = (a - lo) / bayW, cB = (hi - a) / bayW;
+      expect(Math.abs(cA - Math.round(cA)) < 1e-4 || Math.abs(cB - Math.round(cB)) < 1e-4,
+        `joint ${i} stands on a painted bay line (${cA.toFixed(3)} / ${cB.toFixed(3)} bays of ${bayW} m from the ends)`);
+    } else {
+      expect(false, `the kit list holds only courses and joints (got kind ${kind})`);
+    }
+  }
+  expect(courses === 3 && joints >= 6, `three side elevations carry a course and their joints (${courses} / ${joints})`);
 });
 
 test('BuildingGeometry: the roof cornice carries its own shadow line (a vertex ramp down the fillet)', () => {
@@ -514,6 +554,18 @@ test('contact blobs multiply the floor, and their opaque core clears the caster 
     `the blob multiplies the framebuffer (blending ${mat.blending}, src ${mat.blendSrc}, dst ${mat.blendDst})`);
   expect(mat.transparent && !mat.depthWrite && mat.opacity > 0.35,
     `the blob is a transparent, non-depth-writing darkener at opacity ${mat.opacity}`);
+  // 3. The per-instance SCALARS reach the fragment stage. Both the round shape term and the spawn / cull fade ride on
+  //    instanceColor, and the patch reads them behind an #ifdef. three r185 emits USE_INSTANCING_COLOR in the VERTEX
+  //    prefix only; the fragment prefix answers an instanceColor attribute with USE_COLOR, which is also the define
+  //    `color_pars_fragment` declares `vColor` under. Guarding the fragment half on the vertex-only define compiled
+  //    both scalars away in silence - every figure stood in a rounded RECTANGLE at full darkness, cull fade included,
+  //    and no CPU-side assertion could see it. Read the patched source, which is what the GPU is handed.
+  const compiled = { vertexShader: 'void main() {\n#include <common>\n#include <begin_vertex>\n}', fragmentShader: 'void main() {\n#include <common>\n#include <alphatest_fragment>\n}', uniforms: {} };
+  (mat.onBeforeCompile as (s: typeof compiled) => void)(compiled);
+  expect(!compiled.fragmentShader.includes('USE_INSTANCING_COLOR'),
+    'the blob FRAGMENT patch never guards on USE_INSTANCING_COLOR, a define three only emits for the vertex stage');
+  expect(compiled.fragmentShader.includes('#ifdef USE_COLOR') && compiled.fragmentShader.includes('vColor.r') && compiled.fragmentShader.includes('vColor.g'),
+    'the fragment patch reads the per-instance fade and roundness behind the define the fragment prefix actually gets');
   //
   //    That property is now a MINIMUM WORLD EXTENT rather than a fraction: `contactExtent` grows a caster's own
   //    footprint half-span by SHADOW_TUNING.spill of undiluted occlusion plus SHADOW_TUNING.penumbra of soft edge,

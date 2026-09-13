@@ -175,34 +175,21 @@ function acUnit(w: number, h: number): THREE.BufferGeometry {
 }
 
 /**
- * Blank-elevation kit for a face of unit width (x -0.5..0.5, scaled by the face length per instance, so band heights
- * and depths never stretch) standing on the wall foot: a plinth band, and on floor line `course` (0 = none) a string
- * course with a shaded soffit. The shade factors multiply the instance colour (the wall tint), so the plinth is a
- * darker value of the same wall and the course head a lighter one - the value step is the whole point, a contrasting
- * hue here reads as a decal.
+ * String course for a side elevation: a band of unit width (x -0.5..0.5, scaled by the face length per instance, so
+ * its height and depth never stretch) standing ON the unit's own origin, which BuildingGeometry.blankWallKit puts on
+ * a painted floor line. The shade factors multiply the instance colour (the wall tint) so the band is the same
+ * masonry a value apart - a contrasting hue here reads as a decal.
  */
-function wallKitUnit(variant: number): THREE.BufferGeometry {
+function wallKitUnit(): THREE.BufferGeometry {
   const u = new UnitBuilder();
   const K = WALL_KIT;
-  const course = variant & 15;
   const x0 = -0.5, x1 = 0.5;
-  if ((variant & 16) !== 0) {
-    // Plinth: front in a darker value, a lit top chamfer where it returns to the wall. Skipped on a wall that starts
-    // above a shop band - that band already gives the elevation its base.
-    u.setColor(0xffffff, 0.62);
-    u.box(x0, 0, 0, x1, K.plinthH, K.plinthOut, F.front);
-    u.setColor(0xffffff, 1.15);
-    u.box(x0, 0, 0, x1, K.plinthH, K.plinthOut, F.top);
-  }
-  if (course > 0) {
-    const y0 = course * K.floorH, y1 = y0 + K.courseH;
-    u.setColor(0xffffff, 0.98);
-    u.box(x0, y0, 0, x1, y1, K.courseOut, F.front | F.top);
-    // Soffit: the underside of a projecting course never sees the sky, and that dark line under a pale band is what
-    // makes it read as a moulding instead of a painted stripe.
-    u.setColor(0xffffff, 0.55);
-    u.box(x0, y0, 0, x1, y1, K.courseOut, F.bottom);
-  }
+  u.setColor(0xffffff, 0.98);
+  u.box(x0, 0, 0, x1, K.courseH, K.courseOut, F.front | F.top);
+  // Soffit: the underside of a projecting course never sees the sky, and that dark line under a pale band is what
+  // makes it read as a moulding instead of a painted stripe.
+  u.setColor(0xffffff, 0.55);
+  u.box(x0, 0, 0, x1, K.courseH, K.courseOut, F.bottom);
   return u.build();
 }
 
@@ -289,8 +276,8 @@ export class FacadeDetailRenderer {
       key = `ac:${Math.round(w * 100)}:${Math.round(h * 100)}`;
       make = () => acUnit(w, h);
     } else if (kind === CELL_KIND.wallKit) {
-      key = `wk:${variant}`;
-      make = () => wallKitUnit(variant);
+      key = 'wk';
+      make = () => wallKitUnit();
     } else if (kind === CELL_KIND.joint) {
       key = 'joint';
       make = () => jointUnit();

@@ -499,7 +499,11 @@ export class PedRenderer {
       if (sc > 0.01) {
         if (lying) {
           // A body on the ground is its own silhouette: keep the blob under it, aligned with the ped, not with the sun.
-          this.shadows.add(t.x, gy + R.shadowLift, t.z, R.shadowR * 1.7 * wide, R.shadowR * 0.75 * wide, t.yaw, sc, 1);
+          // rz is the extent ALONG `yaw` (ContactShadows.add composes the quad on a plane rotated by yaw, so local +Z
+          // is the yaw direction) and the body lies ALONG its yaw: the 'YXZ' pose above tips local +Y onto -Z BEFORE
+          // the yaw turn, so the figure points where it was walking. The two used to be the wrong way round, which
+          // put a 3 m wide pool across a 0.45 m corpse and left its head and feet on undarkened ground.
+          this.shadows.add(t.x, gy + R.shadowLift, t.z, R.shadowR * 0.75 * wide, R.shadowR * 1.7 * wide, t.yaw, sc, 1);
         } else {
           const gs = this.groundShadow;
           const rx = R.shadowR * R.shadowNarrow * wide;
