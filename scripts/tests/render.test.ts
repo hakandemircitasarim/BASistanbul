@@ -8,8 +8,9 @@ import { MeshStandardMaterial, Scene, ShaderChunk } from 'three';
 import type { BufferGeometry } from 'three';
 import { Random } from '../../src/game/core/Random';
 import { SHADOW_PENUMBRA, SHADOW_RADIUS, SKY_KEYS } from '../../src/game/render/SkySystem';
-import { ContactShadows, SHADOW_TUNING } from '../../src/game/render/ContactShadows';
+import { ContactShadows, SHADOW_TUNING, groundYAt } from '../../src/game/render/ContactShadows';
 import { BUDGET } from '../../src/game/core/Budget';
+import { BLOCK, CURB_H, PITCH, ROAD_W, SIDEWALK_W } from '../../src/game/city/CityConfig';
 import { Vehicle } from '../../src/game/entities/Vehicle';
 import { SPECS } from '../../src/game/entities/VehicleSpecs';
 import type { Building, Landmark } from '../../src/game/city/CityData';
@@ -479,4 +480,33 @@ test('contact shadow slices: the shared blob mesh covers every renderer that res
     total += n;
   }
   expect(SHADOW_TUNING.capacity >= total, `blob capacity ${SHADOW_TUNING.capacity} covers the ${total} reserved slots`);
+});
+
+test('groundYAt: the sidewalk apron reads as kerb height on ALL FOUR faces of every block, the carriageway as road', () => {
+  // The cell index folds the apron in (`+ SIDEWALK_W`). Without that, a point on the LOW-x / LOW-z apron floors into
+  // the PREVIOUS cell, whose rect test fails and answers 0 — so the pavement of two faces of every block read as
+  // carriageway. That silently flattened half the kerbside cars (CityRendererProps' kerbStance samples this under
+  // both wheel lines) and sank the player / peds 15 cm into those strips.
+  for (let col = 0; col < 3; col++) {
+    for (let row = 0; row < 3; row++) {
+      const bx = ROAD_W + col * PITCH, bz = ROAD_W + row * PITCH;
+      const midX = bx + BLOCK / 2, midZ = bz + BLOCK / 2;
+      const inset = SIDEWALK_W / 2; // mid-apron, where a parked car's kerb-side wheels stand
+      const faces: [string, number, number][] = [
+        ['low-x apron', bx - inset, midZ], ['high-x apron', bx + BLOCK + inset, midZ],
+        ['low-z apron', midX, bz - inset], ['high-z apron', midX, bz + BLOCK + inset],
+        ['block interior', midX, midZ],
+        ['low-x kerb line', bx - SIDEWALK_W + 0.01, midZ], ['low-z kerb line', midX, bz - SIDEWALK_W + 0.01],
+      ];
+      for (const [name, x, z] of faces) expect(groundYAt(x, z) === CURB_H, `${name} of block ${col},${row} is at CURB_H (got ${groundYAt(x, z)})`);
+      // The 14 m carriageway between two aprons stays at road level, including right against the kerb.
+      const road: [string, number, number][] = [
+        ['road centre -x', bx - ROAD_W / 2, midZ], ['road centre -z', midX, bz - ROAD_W / 2],
+        ['just off the low-x kerb', bx - SIDEWALK_W - 0.01, midZ], ['just off the high-x kerb', bx + BLOCK + SIDEWALK_W + 0.01, midZ],
+        ['just off the low-z kerb', midX, bz - SIDEWALK_W - 0.01], ['just off the high-z kerb', midX, bz + BLOCK + SIDEWALK_W + 0.01],
+      ];
+      for (const [name, x, z] of road) expect(groundYAt(x, z) === 0, `${name} of block ${col},${row} is at road level (got ${groundYAt(x, z)})`);
+    }
+  }
+  expect(groundYAt(-500, -500) === 0 && groundYAt(9e4, 9e4) === 0, 'outside the grid reads road level');
 });

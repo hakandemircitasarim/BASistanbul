@@ -5,7 +5,8 @@ import { PlayerMoveSystem } from '../../src/game/systems/PlayerMoveSystem';
 import { VehicleEntrySystem } from '../../src/game/systems/VehicleEntrySystem';
 import { VehiclePhysicsSystem } from '../../src/game/systems/VehiclePhysicsSystem';
 import { CollisionSystem } from '../../src/game/systems/CollisionSystem';
-import { TrafficSystem, TRAFFIC_TUNING, chooseNextWeighted } from '../../src/game/systems/TrafficSystem';
+import { TrafficSystem, TRAFFIC_TUNING, chooseNextWeighted, kerbSafeYieldOffset } from '../../src/game/systems/TrafficSystem';
+import { KERB_PARK } from '../../src/game/city/CityProps';
 import { PedestrianSystem } from '../../src/game/systems/PedestrianSystem';
 import { Vehicle, makeTrafficBrain } from '../../src/game/entities/Vehicle';
 import { SPECS } from '../../src/game/entities/VehicleSpecs';
@@ -141,4 +142,15 @@ test('reservation rule: a turning car waits for a car already inside the node', 
   expect(roads.canEnter(node.id, 902, 0, true), 'same-axis straight car may enter');
   roads.release(node.id, 900);
   expect(roads.canEnter(node.id, 901, 1, false), 'turn allowed once the node is empty');
+});
+
+test('siren yield never steers into the kerbside parking strip', () => {
+  // Two constants that have to agree: the parked strip stands in the OUTER lane, its flank KERB_PARK.laneClear short
+  // of the widest traffic body's envelope, while a siren yield pulls the pursuit target `yieldOffset` to the right.
+  // Un-clamped, the commanded envelope on the outer lane reaches yieldOffset - laneClear INSIDE a solid parked-car
+  // collider. Assert the relation so the two cannot drift apart again.
+  expect(kerbSafeYieldOffset(1) <= KERB_PARK.laneClear + 1e-9,
+    `outer-lane yield ${kerbSafeYieldOffset(1)} m stays inside the ${KERB_PARK.laneClear} m margin to a parked flank`);
+  expect(kerbSafeYieldOffset(0) === TRAFFIC_TUNING.yieldOffset, 'the inner lane keeps the full yield offset');
+  expect(KERB_PARK.laneClear > 0, 'there is a margin at all');
 });

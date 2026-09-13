@@ -4,7 +4,7 @@ import { generateCity, validateCity } from '../../src/game/city/CityGenerator';
 import type { GeneratedCity } from '../../src/game/city/CityGenerator';
 import { BUDGET } from '../../src/game/core/Budget';
 import { Random } from '../../src/game/core/Random';
-import { BLOCK, INTERSECTION_R, LANE_W, PITCH, ROAD_W, SIDEWALK_W } from '../../src/game/city/CityConfig';
+import { BLOCK, CURB_H, INTERSECTION_R, LANE_W, PITCH, ROAD_W, SIDEWALK_W } from '../../src/game/city/CityConfig';
 import { ASPHALT_HALF, colliderDistance, districtOf, onRoad } from '../../src/game/city/CityBuild';
 import { HEDGE, LOT_BAYS, lotLayout } from '../../src/game/city/CityLots';
 import { CAFE, CLUTTER_SPOT_CLEAR, DUMPSTER, KERB_PARK, POLE, ROADSIGN, TREE_CLEAR } from '../../src/game/city/CityProps';
@@ -13,6 +13,7 @@ const WHEEL_TRACK_W = 0.12;
 import type { Lot, ParkedCar } from '../../src/game/city/CityData';
 import { SPECS } from '../../src/game/entities/VehicleSpecs';
 import { parkedMidGeometry, parkedNearGeometry, parkedShellGeometry } from '../../src/game/render/VehicleRenderer';
+import { groundYAt } from '../../src/game/render/ContactShadows';
 import type { LanePos } from '../../src/game/city/RoadGraph';
 import { MINIMAP_BLIP_CAPACITY, MinimapRenderer, createMinimapSnapshot } from '../../src/game/minimap/MinimapRenderer';
 
@@ -491,6 +492,15 @@ test('kerbside parking: straddling the kerb into the kerb lane, clear of the tra
     // 11 m, not 3.5: the strip is in the kerb lane now, so a car parked beside a named point blocks the lane the
     // gameplay vehicle spawning there pulls out into.
     for (const [x, z] of pts) expect(dist(r, x, z) >= 11 - 1e-6, 'kerb car keeps 11 m from the named points');
+    // The renderer's stance (CityRendererProps' kerbStance) samples groundYAt under the two wheel lines and rolls the
+    // body by the difference. If both lines read the same height the car stands FLAT at road level with its kerb-side
+    // half buried 15 cm in the pavement - which is what happened on the low-x / low-z faces of every block while
+    // groundYAt indexed the grid without folding the sidewalk apron in.
+    const track = SPECS[p.spec].width * 0.5 - WHEEL_TRACK_W;
+    const rx = -Math.cos(p.yaw) * track, rz = Math.sin(p.yaw) * track;
+    const yRoad = groundYAt(p.x + rx, p.z + rz), yKerb = groundYAt(p.x - rx, p.z - rz);
+    expect(Math.min(yRoad, yKerb) === 0 && Math.max(yRoad, yKerb) === CURB_H,
+      `kerb car at (${p.x.toFixed(1)}, ${p.z.toFixed(1)}) straddles the kerb (wheel lines at ${yRoad} / ${yKerb})`);
     expect(hasCollider(p.x, p.z), 'kerb car has an AABB prop collider');
   }
   expect(sedans > kerb.length * 0.45 && sedans < kerb.length * 0.8, `sedans dominate the mix (${sedans}/${kerb.length})`);
@@ -733,4 +743,25 @@ test('parked car shells: the LOD ladder is cheaper at every rung and keeps one s
       expect(b.floor >= -1e-4 && b.floor < 0.03, `${key}/${name}: wheels reach the ground (floor ${b.floor.toFixed(3)})`);
     }
   }
+});
+
+test('validateCity keeps the strict lane rule for everything but the kerbside parking strip', () => {
+  // The collider-vs-lane rule (LANE_W / 2 from a lane centre line) is the only automated guard against generating
+  // something solid into a driving lane. The kerbside strip deliberately laps the kerb lane, so it - and ONLY it -
+  // is held to the widest traffic body's half width instead. Proof: a synthetic collider laid where a kerb car sits
+  // must be rejected the moment it is no longer one of the kerb cars.
+  const g = city();
+  expect(validateCity(g).length === 0, 'the generated city is clean');
+  const kerb = (g.city.parked ?? []).filter((p) => p.at === 'kerb');
+  expect(kerb.length > 0, 'there are kerb cars to test with');
+  const k = kerb[0];
+  const hw = SPECS[k.spec].width / 2, hl = SPECS[k.spec].length / 2;
+  const cs = Math.abs(Math.cos(k.yaw)), sn = Math.abs(Math.sin(k.yaw));
+  const ex = hw * cs + hl * sn, ez = hw * sn + hl * cs;
+  // Same rectangle, but with no ParkedCar at its centre: the exemption must not apply.
+  const clone = { id: 99999, shape: { kind: 'aabb' as const, minX: k.x - ex, minZ: k.z - ez, maxX: k.x + ex, maxZ: k.z + ez }, tag: 'prop' as const, height: 1.5, minX: k.x - ex, minZ: k.z - ez, maxX: k.x + ex, maxZ: k.z + ez, hashStamp: 0 };
+  const shifted = { ...clone, shape: { ...clone.shape, minX: clone.shape.minX + 0.37, maxX: clone.shape.maxX + 0.37 }, minX: clone.minX + 0.37, maxX: clone.maxX + 0.37 };
+  const probe = { ...g, city: { ...g.city, staticColliders: [...g.city.staticColliders, shifted] } };
+  const errs = validateCity(probe);
+  expect(errs.some((e) => e.includes('overlaps a lane')), `an unexempt collider on the kerb lane is flagged (got ${errs.length ? errs[0] : 'nothing'})`);
 });

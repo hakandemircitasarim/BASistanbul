@@ -6,7 +6,15 @@ import type { World } from '../world/World';
 import { clamp } from '../core/math';
 import type { TextureFactory } from './TextureFactory';
 
-export const FX_TUNING = { skidQuads: 3000, skidWidth: 0.3, skidY: 0.012, smokeMax: 400, sparkMax: 300, flashMax: 4, flashTime: 0.55, flashRadius: 13, smokeRise: 1.4, sparkGravity: 12, damageSmokeRate: 10 } as const;
+/**
+ * `sparkMinImpact`: below this closing speed a collision throws NO sparks at all. The burst count is
+ * `clamp(impactSpeed * 3, 4, 40)`, i.e. a 4-spark floor no matter how gentle the touch — and since the kerbside
+ * parking strip moved into the kerb lane, the AI's steering error brushes a parked flank at ~0.1 m/s several times a
+ * minute on a busy street. Those are impacts the player cannot see, hear (the audio gain is impactSpeed / 18) or feel,
+ * and a shower of sparks off a stationary parked car is the most conspicuous thing in the frame. 1.5 m/s is a slow
+ * nudge; anything above it is a real hit and keeps the floor.
+ */
+export const FX_TUNING = { skidQuads: 3000, skidWidth: 0.3, skidY: 0.012, smokeMax: 400, sparkMax: 300, flashMax: 4, flashTime: 0.55, flashRadius: 13, smokeRise: 1.4, sparkGravity: 12, damageSmokeRate: 10, sparkMinImpact: 1.5 } as const;
 
 const PVERT = `
 attribute float aLife; attribute float aSize; attribute vec3 aColor;
@@ -160,7 +168,7 @@ export class EffectsRenderer {
     }
     for (let i = 0; i < 64; i++) this.skidQueue.push({ id: 0, intensity: 0 });
     this.unsubs.push(events.on('fx:skid', (p) => this.queueSkid(p.vehicleId, p.intensity)));
-    this.unsubs.push(events.on('vehicle:collision', (p) => this.burstSparks(p.x, 0.5, p.z, clamp(p.impactSpeed * 3, 4, 40) | 0, 6)));
+    this.unsubs.push(events.on('vehicle:collision', (p) => { if (p.impactSpeed < FX_TUNING.sparkMinImpact) return; this.burstSparks(p.x, 0.5, p.z, clamp(p.impactSpeed * 3, 4, 40) | 0, 6); }));
     this.unsubs.push(events.on('vehicle:destroyed', (p) => this.explode(p.x, p.z)));
     this.unsubs.push(events.on('ped:hit', (p) => this.dust(p.x, p.z)));
   }

@@ -108,22 +108,32 @@ export function validateCity(g: GeneratedCity): string[] {
   }
   // Colliders (except water/boundary) never intrude on the space a car actually drives through.
   //
-  // The test is the BODY ENVELOPE of the widest traffic vehicle (KERB_PARK.bodyHalf), not the full lane half-width.
-  // The four 3.5 m lanes tile the whole 14 m carriageway, so a lane-half-width rule means "nothing may stand on the
-  // asphalt at all" - and the kerbside parking strip deliberately laps the kerb lane by KERB_PARK.roadLap, because a
-  // parked car standing entirely on the 3 m footway blocks the pavement and reads, from the street, as parked on the
-  // shop terrace. Everything else in the city stands at or behind the kerb line, 1.75 m from the outer lane centre,
-  // so it passes either rule unchanged; and the strip itself leaves KERB_PARK.laneClear on top of this envelope, so a
-  // parked flank is never a rounding error away from failing.
-  const bodyHalf = KERB_PARK.bodyHalf;
+  // Default rule, unchanged since round 1: nothing solid may stand within LANE_W / 2 of a lane centre line. The four
+  // 3.5 m lanes tile the whole 14 m carriageway, so that is "nothing on the asphalt at all", and it is the only
+  // automated guard that stops a future prop, landmark footprint, lot island or hedge run from being generated into
+  // a driving lane.
+  //
+  // The ONE exception is the kerbside parking strip, which deliberately laps the kerb lane by KERB_PARK.roadLap
+  // (a parked car standing entirely on the 3 m footway blocks the pavement and reads, from the street, as parked on
+  // the shop terrace). Those footprints carry the same 'prop' tag as everything else, so they are recognised by their
+  // centre: a collider is exempt only when a kerb ParkedCar stands exactly at its centre, and it is then held to the
+  // widest traffic body's half width instead. (The placement leaves exactly KERB_PARK.laneClear on top of that, which
+  // is asserted to the centimetre in scripts/tests/city.test.ts - testing it here too would be a boundary case.)
+  const kerbCentres = new Set<string>();
+  const parked = city.parked ?? [];
+  for (let i = 0; i < parked.length; i++) if (parked[i].at === 'kerb') kerbCentres.add(`${parked[i].x.toFixed(4)}|${parked[i].z.toFixed(4)}`);
+  const laneHalf = LANE_W / 2, kerbHalf = KERB_PARK.bodyHalf;
   for (let i = 0; i < city.staticColliders.length; i++) {
     const c = city.staticColliders[i];
     if (c.tag === 'water' || c.tag === 'boundary') continue;
     const s = c.shape;
     if (s.kind === 'circle') {
-      if (onRoad(roads, s.cx, s.cz, bodyHalf + s.r)) out.push(`collider ${i} (${c.tag}) overlaps a lane`);
+      if (onRoad(roads, s.cx, s.cz, laneHalf + s.r)) out.push(`collider ${i} (${c.tag}) overlaps a lane`);
     } else {
-      const bad = onRoad(roads, s.minX, s.minZ, bodyHalf) || onRoad(roads, s.maxX, s.minZ, bodyHalf) || onRoad(roads, s.minX, s.maxZ, bodyHalf) || onRoad(roads, s.maxX, s.maxZ, bodyHalf) || onRoad(roads, (s.minX + s.maxX) / 2, (s.minZ + s.maxZ) / 2, bodyHalf);
+      const cx = (s.minX + s.maxX) / 2, cz = (s.minZ + s.maxZ) / 2;
+      // A kerb car's footprint is the AABB of its body, so its centre is the car's own (x, z).
+      const half = kerbCentres.has(`${cx.toFixed(4)}|${cz.toFixed(4)}`) ? kerbHalf : laneHalf;
+      const bad = onRoad(roads, s.minX, s.minZ, half) || onRoad(roads, s.maxX, s.minZ, half) || onRoad(roads, s.minX, s.maxZ, half) || onRoad(roads, s.maxX, s.maxZ, half) || onRoad(roads, cx, cz, half);
       if (bad) out.push(`collider ${i} (${c.tag}) overlaps a lane`);
     }
   }

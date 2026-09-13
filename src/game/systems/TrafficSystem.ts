@@ -11,6 +11,7 @@ import type { TrafficBrain } from '../entities/Vehicle';
 import { SPECS, TRAFFIC_MIX } from '../entities/VehicleSpecs';
 import type { VehicleKey } from '../entities/VehicleSpecs';
 import { BUDGET } from '../core/Budget';
+import { KERB_PARK } from '../city/CityProps';
 import { angleDiff, clamp, yawFromDir } from '../core/math';
 
 export const TRAFFIC_TUNING = {
@@ -29,13 +30,25 @@ export const TRAFFIC_TUNING = {
   stopLineGap: 1.0,       // hold this far before the lane end
   turnSlowDist: 12,       // slow to turnSpeed within this distance of a non-straight turn
   laneReacquire: 7,       // lateral/behind distance after which the brain re-finds its lane
-  yieldTime: 1.2, yieldSpeed: 4, yieldOffset: 1.0,
+  yieldTime: 1.2, yieldSpeed: 4, yieldOffset: 1.0, // see kerbSafeYieldOffset: the outer lane gets less than this
   unstickAfter: 3,        // blocked seconds before a reverse/bypass manoeuvre
   reverseTicks: 60, bypassTicks: 240, bypassOffset: -2.8, bypassSpeed: 5,
   honkCooldownMin: 2.5, honkCooldownMax: 5,
   nightStart: 18.5, nightEnd: 6.5,
   prefillCount: 16, prefillMin: 45, prefillMax: 200, // one-off fill around the player at newGame/respawn (ignores the in-view rule)
 };
+
+/**
+ * Rightward lateral offset a siren yield may actually take on a lane of `index` (0 inner, 1 outer).
+ *
+ * The kerbside parking strip stands IN the outer lane (CityProps' KERB_PARK: the parked flank stops `laneClear`
+ * short of the widest traffic body's envelope). A full `yieldOffset` there commands the body 0.70 m INSIDE a solid
+ * parked-car collider, so a yielding car scrapes down the parked row, takes push-out and damage and can wedge itself
+ * against it. On the outer lane the yield is therefore capped at the margin that actually exists; the inner lane,
+ * which has a whole lane between it and the kerb, keeps the full metre.
+ */
+export const kerbSafeYieldOffset = (laneIndex: 0 | 1): number =>
+  laneIndex === 1 ? Math.min(TRAFFIC_TUNING.yieldOffset, KERB_PARK.laneClear) : TRAFFIC_TUNING.yieldOffset;
 
 /** Picks the successor lane id for a brain leaving `lane` (-1 = none). */
 export type ChooseNext = (b: TrafficBrain, lane: Lane, rng: Random) => number;
@@ -225,7 +238,7 @@ export class TrafficSystem implements System {
 
     // Lateral offsets: siren yield pulls right, callers may request a bypass offset.
     let offset = lateralOffset;
-    if (b.yieldTimer > 0) { b.yieldTimer -= dt; offset += T.yieldOffset; desired = Math.min(desired, T.yieldSpeed); }
+    if (b.yieldTimer > 0) { b.yieldTimer -= dt; offset += kerbSafeYieldOffset(lanes[b.lane].index); desired = Math.min(desired, T.yieldSpeed); }
     if (offset !== 0) {
       const d = lanes[b.lane].dir;
       target.x += -d.z * offset;

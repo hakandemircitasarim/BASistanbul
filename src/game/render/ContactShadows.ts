@@ -36,10 +36,16 @@ export const SHADOW_TUNING = {
 /**
  * Height of the walkable surface under a world point: block interiors and their sidewalks are raised to CURB_H,
  * the carriageway is at 0. O(1) grid math — a blob placed at road height would sink under the kerb otherwise.
+ *
+ * The cell index is taken with the sidewalk apron folded IN (`+ SIDEWALK_W`), not from the block origin: a block's
+ * raised surface runs [bx - SIDEWALK_W, bx + BLOCK + SIDEWALK_W], so a point on the apron on the LOW-x / LOW-z side
+ * used to floor into the PREVIOUS cell, whose rect test then failed and answered 0 — the pavement on two of every
+ * block's four faces read as carriageway. Shifting the index by the apron width maps every face of block c to cell c
+ * and still leaves the carriageway (which is ROAD_W - 2 * SIDEWALK_W = 14 m wide between two aprons) outside the rect.
  */
 export function groundYAt(x: number, z: number): number {
-  const col = Math.floor((x - ROAD_W) / PITCH);
-  const row = Math.floor((z - ROAD_W) / PITCH);
+  const col = Math.floor((x - ROAD_W + SIDEWALK_W) / PITCH);
+  const row = Math.floor((z - ROAD_W + SIDEWALK_W) / PITCH);
   if (col < 0 || col >= GRID_COLS || row < 0 || row >= GRID_ROWS) return 0;
   const bx = ROAD_W + col * PITCH, bz = ROAD_W + row * PITCH;
   const inX = x >= bx - SIDEWALK_W && x <= bx + BLOCK + SIDEWALK_W;
