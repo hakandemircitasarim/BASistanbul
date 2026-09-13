@@ -9,11 +9,20 @@ import { BLOCK, CURB_H, GRID_COLS, GRID_ROWS, PITCH, ROAD_W, SIDEWALK_W } from '
 
 export const SHADOW_TUNING = {
   /**
-   * Slots: every vehicle + every ped + the parked-car slice (CAR_SHADOWS.cap, 44) + the player + spare. The slices are
-   * reserved once at construction and clamped to what is left, so this must cover all of them or the last renderer to
-   * build silently gets fewer blobs than it asks for.
+   * Slots: every vehicle + every ped + the STATIC slices (CityRendererProps' parked cars and street furniture) + the
+   * player + margin. The slices are reserved once at construction and clamped to what is left, so this must cover all
+   * of them or the LAST renderer to build silently gets fewer blobs than it asks for - and it gets them with no error
+   * anywhere, which is the one failure in this file a screenshot cannot show.
+   *
+   * The old spare of 48 was sized for the parked-car slice (44) plus the player, i.e. 3 slots of real margin, and it
+   * only survived round 13's street-furniture slice (24 more) because VehicleRenderer asks for 96 rather than
+   * BUDGET.MAX_VEHICLES (128). Read off the running mesh: 44 + 1 + 96 + 96 = 237 reserved of 272 before the furniture
+   * slice existed, 261 of 272 with it. Raise the vehicle slice to the budget it is named after and the furniture
+   * slice - the last to build - would silently have got ZERO. 96 of margin covers that worst case (293) with room for
+   * one more static slice; the cost is two CPU-side buffers 48 slots longer (~24 KB) and nothing at all on the GPU,
+   * because `mesh.count` is the reserved cursor, not the capacity.
    */
-  capacity: BUDGET.MAX_VEHICLES + BUDGET.MAX_PEDS + 48,
+  capacity: BUDGET.MAX_VEHICLES + BUDGET.MAX_PEDS + 96,
   /**
    * How far the FULLY OPAQUE part of a blob reaches past the caster's own footprint, in metres, and how wide the
    * penumbra that fades it out is. Both are WORLD widths and both are honoured on all four sides of any blob

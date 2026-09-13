@@ -31,7 +31,7 @@ import type { Materials } from './Materials';
 import { LEAF_TILE_M } from './PropTextures';
 import { ContactShadows, contactExtent, groundYAt } from './ContactShadows';
 import { surface, tube, type Ring } from './PlayerRenderer';
-import { LOW_SUN_SHADOW, VEHICLE_RENDER, keyLightElevation, makeVehiclePaintMaterial, parkedMidGeometry, parkedNearGeometry, parkedShellGeometry, setPaintNight, shadowExtent } from './VehicleRenderer';
+import { COARSE_SHADOW_NIGHT, VEHICLE_RENDER, makeVehiclePaintMaterial, parkedMidGeometry, parkedNearGeometry, parkedShellGeometry, setPaintNight, shadowExtent } from './VehicleRenderer';
 
 export const PROP_DIMS = { palmTrunkH: 6.4, palmFrondLen: 4.4, palmFrondW: 2.3, lampH: 6.5, lampArm: 1.4, poolRadius: 5.5 } as const;
 
@@ -1278,7 +1278,6 @@ export class PropRenderer {
   private readonly geometries: THREE.BufferGeometry[] = [];
   private readonly groups: PropGroup[] = [];
   private readonly materials: Materials;
-  private readonly scene: THREE.Scene;
   private readonly glowMat: THREE.MeshBasicMaterial;
   private readonly paintMat: THREE.MeshPhysicalMaterial;
   /** Lamp placements (x, z, yaw) and the point lights parked on the nearest few of them. */
@@ -1311,7 +1310,7 @@ export class PropRenderer {
   private furnHL = new Float32Array(0);
   private furnCount = 0;
   private readonly furnShadows: ContactShadows;
-  /** Current state of the coarse / mid parked-shell sun-shadow gate (LOW_SUN_SHADOW). */
+  /** Current state of the coarse / mid parked-shell shadow gate (COARSE_SHADOW_NIGHT). */
   private carCast = true;
   private nearMesh: THREE.BatchedMesh | null = null;
   private midMesh: THREE.BatchedMesh | null = null;
@@ -1338,7 +1337,6 @@ export class PropRenderer {
 
   constructor(scene: THREE.Scene, props: Prop[], materials: Materials, parked: ParkedCar[] = [], lotProps: LotProp[] = []) {
     this.materials = materials;
-    this.scene = scene;
     this.carShadows = new ContactShadows(scene, CAR_SHADOWS.cap);
     this.furnShadows = new ContactShadows(scene, FURN_SHADOWS.cap);
     const counts: Record<Prop['kind'], number> = { palm: 0, lamp: 0, bench: 0, hydrant: 0, bin: 0, sign: 0, shelter: 0, bollard: 0, tree: 0, hedge: 0, pole: 0, roadsign: 0, dumpster: 0, table: 0 };
@@ -1643,11 +1641,12 @@ export class PropRenderer {
     // from a parked flank, and a mirror clearcoat turns that into a blown white disc (see CLEARCOAT_NIGHT).
     setPaintNight(this.paintMat, n);
     if (this.wireMat) this.wireMat.opacity = 0.85 - 0.35 * n;
-    // Sun-shadow gate for the two COARSE parked tiers (see LOW_SUN_SHADOW in VehicleRenderer). Measured at the budget's
-    // own worst camera (07:00, camera 1029.85/2.25/615.85, /rendertest so the count is deterministic): the coarse batch
-    // is 39,192 shadow-pass triangles and 1 draw, the mid batch 13,456 and 1 more. The near batch (3 cars inside 8 m)
-    // keeps casting at every hour. A boolean per frame; `castShadow` is read when the shadow pass is collected.
-    const carCast = n < LOW_SUN_SHADOW.maxNight && keyLightElevation(this.scene) >= LOW_SUN_SHADOW.minSunY;
+    // Shadow gate for the two COARSE parked tiers (see COARSE_SHADOW_NIGHT in VehicleRenderer). Measured at the
+    // budget's own worst camera (1029.85/2.25/615.85, /rendertest so the count is deterministic): the coarse batch is
+    // 39,192 shadow-pass triangles and 1 draw at 07:00, the mid batch 13,456 and 1 more; at 21:00 the pair is 45,572
+    // and 2. The near batch (the 3 cars inside 8 m) keeps casting at every hour, day and night. A boolean per frame;
+    // `castShadow` is read when the shadow pass is collected, so nothing is rebuilt.
+    const carCast = n < COARSE_SHADOW_NIGHT;
     if (carCast !== this.carCast) {
       this.carCast = carCast;
       if (this.coarseMesh) this.coarseMesh.castShadow = carCast;

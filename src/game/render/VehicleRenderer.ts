@@ -75,55 +75,29 @@ export function shadowExtent(half: number): number {
 }
 
 /**
- * When the COARSE car shells (the static parked batches past the near band, and the live mid-LOD band) are worth their
- * place in the sun shadow pass. Both numbers come off the phase-1 diagnosis, which measured what a car's cast shadow
- * is actually worth per hour rather than assuming it:
+ * Night factor at or above which the COARSE car shells — the static parked batches past the near band, and the live
+ * mid-LOD band — drop out of the shadow pass. SkySystem hands the key light over to the MOON at nightFactor > 0.9
+ * (colour `moonColor`, intensity 0.5 * lightUnits against the sun's 4.5 at noon), and CLAUDE.md's own note is that
+ * the moon shadow is almost nothing and the contact blob is the only thing holding a car on the road after dark.
  *
- * - `minSunY` — sine of the shadow-casting light's elevation. SkySystem clamps the key light's elevation at
- *   `ey = Math.max(ly, 0.28)`, so every hour whose real sun is lower reads back as y ~ 0.27 (07:00 0.270,
- *   08:00 0.278, 18:00 0.273, 19:00 0.270 — measured off the live light). At exactly those hours 96.9-99.5 % of the
- *   visible ground is already inside a BUILDING's shadow, and a car's cast shadow landing in one measured 4.99/255
- *   against the 8/255 visibility bar. The first hour whose ground is genuinely lit is 17:00 at y = 0.343, where the
- *   same car's shadow measures 16.96/255 and must keep casting — so the gate sits between them, at 0.30, and noon
- *   (0.759), 09:00 (0.431) and 15:00 (0.642) are untouched.
- * - `maxNight` — at full night the key light is the MOON at a third of the sun's intensity; SkySystem switches to it
- *   at nightFactor > 0.9, and its elevation is unrelated to the sun's (21:00 reads y = 0.469). CLAUDE.md's own note
- *   is that the moon shadow is almost nothing and the blob is the only thing holding a car on the road after dark.
+ * 0.9 and not lower, because a coarse-shell shadow is worth REAL contrast right up to the hand-over, and that is a
+ * measurement, not a guess. Base-vs-gated at the lot camera (965/2.2/493.8 looking at 965/1.2/500, /rendertest,
+ * 1280x720, quality=high, ao=0), pixels changed by more than 8/255:
+ *   18:00  17,718 px = 1.92 % of the frame, mean 23.40/255 — a row of long car shadows across lit lot asphalt
+ *   19:00   9,374 px = 1.02 %, mean 14.39/255
+ *   21:00     285 px = 0.03 %, mean 18.90/255
+ * The first two are the shadows the eye is there for. An ELEVATION gate cannot separate them from the hours where
+ * the same removal IS free: SkySystem clamps the light at `ey = Math.max(ly, 0.28)`, so 07:00 (y = 0.270), 08:00
+ * (0.278), 17:30 (0.278), 18:00 (0.273) and 19:00 (0.270) all read back the same elevation, while gating 07:00 at the
+ * budget camera costs 0.04 % of that frame and gating 18:00 at the lot costs 1.92 % of its own. What separates them is
+ * which way the city's own buildings fall — 96.9 to 99.5 % of the visible ground is in building shade at 07:00-08:00
+ * and 7 % of it at the 17:00 lot — and that is not a number either renderer can read. So the gate is the one band
+ * that measured free at every camera tried: night.
  *
- * The near parked tier (inside 8 m) and the full live body (inside 30 m) are deliberately NOT gated: those are the
- * cars the camera is standing next to, and a mesh that does not cast cannot shadow ITSELF either — at a raking sun
- * the roof's shadow across the far flank is most of a car's form.
+ * The near parked tier (inside 8 m) and the full live body (inside 30 m) are never gated at all: those are the cars
+ * the camera is standing next to, and a mesh that does not cast cannot shadow ITSELF either.
  */
-export const LOW_SUN_SHADOW = { minSunY: 0.30, maxNight: 0.9 } as const;
-
-const sunLights = new WeakMap<THREE.Scene, THREE.DirectionalLight>();
-const sunVec = new THREE.Vector3();
-let lightProbe: THREE.DirectionalLight | null = null;
-function probeDirectional(o: THREE.Object3D): void {
-  if (!lightProbe && (o as THREE.DirectionalLight).isDirectionalLight) lightProbe = o as THREE.DirectionalLight;
-}
-
-/**
- * Sine of the key light's elevation, read straight off the scene's directional light (SkySystem owns exactly one, and
- * it is the moon's direction at night). The renderers that have to decide whether to pay for a shadow are the ones
- * that submit the geometry, and neither of them is handed a sun direction: `PropRenderer.update` takes a camera
- * position and `VehicleRenderer.sync` a world, so the light itself is the only path to the number that does not run a
- * new argument through CityRenderer and Engine. Cached per scene; allocation-free after the first call, and it answers
- * 1 (i.e. "high sun, keep casting") for a scene with no directional light at all.
- */
-export function keyLightElevation(scene: THREE.Scene): number {
-  let light = sunLights.get(scene);
-  if (!light) {
-    lightProbe = null;
-    scene.traverse(probeDirectional);
-    if (!lightProbe) return 1;
-    light = lightProbe;
-    sunLights.set(scene, light);
-  }
-  sunVec.copy(light.position).sub(light.target.position);
-  const len = sunVec.length();
-  return len > 1e-6 ? sunVec.y / len : 1;
-}
+export const COARSE_SHADOW_NIGHT = 0.9;
 
 const KEYS: VehicleKey[] = ['sedan', 'sport', 'van', 'police', 'taxi'];
 /** Head / tail light quads are drawn a little smaller than their anchor so the lamp bezel and lens rim show around them. */
@@ -1673,7 +1647,7 @@ export class VehicleRenderer {
   private readonly euler = new THREE.Euler(0, 0, 0, 'YXZ');
   private readonly color = new THREE.Color();
   private nightFactor = 1;
-  /** Current state of the mid-LOD sun-shadow gate (LOW_SUN_SHADOW), so the flag is only written when it changes. */
+  /** Current state of the mid-LOD shadow gate (COARSE_SHADOW_NIGHT), so the flag is only written when it changes. */
   private midCast = true;
 
   constructor(scene: THREE.Scene) {
@@ -1707,8 +1681,8 @@ export class VehicleRenderer {
         lod.name = tier === 0 ? `veh:mid:${key}` : `veh:lod:${key}`;
         lod.count = 0;
         lod.frustumCulled = false;
-        // Mid tier casts (see bodyMidDist) while the sun is high enough for the shadow to land on lit ground; the far
-        // shell never does. `sync` re-evaluates the mid flag each frame (LOW_SUN_SHADOW).
+        // Mid tier casts (see bodyMidDist) while there is a sun to cast it; the far shell never does. `sync` drops the
+        // mid flag once the key light hands over to the moon (COARSE_SHADOW_NIGHT).
         lod.castShadow = tier === 0;
         lod.receiveShadow = true;
         lod.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -1785,10 +1759,10 @@ export class VehicleRenderer {
     let lightIdx = 0;
     const sirenPhase = Math.floor(time * R.sirenHz * 2) % 2;
     let spotsSet = false;
-    // Mid-LOD shadow gate (see LOW_SUN_SHADOW). A per-frame boolean on five meshes, not a rebuild: `castShadow` is
-    // read by WebGLShadowMap when it collects the pass, so flipping it here adds or removes the whole 30-70 m band
+    // Mid-LOD shadow gate (see COARSE_SHADOW_NIGHT). A per-frame boolean on five meshes, not a rebuild: `castShadow`
+    // is read by WebGLShadowMap when it collects the pass, so flipping it here adds or removes the whole 30-70 m band
     // from the shadow map with no recompile (the depth material is shared and cached by material, not by object).
-    const midCast = this.nightFactor < LOW_SUN_SHADOW.maxNight && keyLightElevation(this.scene) >= LOW_SUN_SHADOW.minSunY;
+    const midCast = this.nightFactor < COARSE_SHADOW_NIGHT;
     if (midCast !== this.midCast) {
       this.midCast = midCast;
       for (let i = 0; i < KEYS.length; i++) this.midBodies[KEYS[i]].castShadow = midCast;
