@@ -35,7 +35,16 @@ const SHADOW_LIFT = 0.03;
 /** Contact blob shape: `NARROW` of the old radius across the light direction, up to `STRETCH_MAX` along it. */
 const SHADOW_NARROW = 1.0;
 const SHADOW_STRETCH_MAX = 2.4;
+/** How far along the light direction the blob's centre is pushed, as a fraction of (length - width). */
+const SHADOW_ANCHOR = 0.5;
 const SHADOW_ELEV_FLOOR = 0.26;
+/** Second tone break in each garment (see `playerGeometry`): lit chest yoke, shaded back, lit thigh front, knee crease. */
+const SHIRT_YOKE = 1.13;
+const SHIRT_BACK = 0.88;
+const JEANS_FRONT = 1.08;
+const JEANS_CREASE = 0.12;
+/** Resting elbow angle ACROSS the body (radians): the forearms close back in under the shoulders' outward set. */
+const ELBOW_IN = 0.14;
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Shared sculpting helpers (also used by PedRenderer). All builders return non-indexed geometry with position, normal
@@ -392,16 +401,32 @@ export function hand(s: number, side: number, segs: number, rings: number): THRE
   const wrist = 0.79 * s;
   // A hand hanging at the side is a flat paddle: thin across the body (x), wide front to back (z), and it must be
   // WIDER than the wrist it hangs off or it reads as the rounded stub the critic saw. The wrist ring is 0.029 x 0.022,
-  // so the palm at 0.030 x 0.056 is a little thicker and two and a half times as deep - a mitten with a visible step
-  // at the cuff. The thumb bud stands out of the leading edge, which is what tells the eye which way the hand faces.
-  const palm = blob(0.030 * s, 0.068 * s, 0.056 * s, segs, rings);
+  // so the palm at 0.034 x 0.062 is a little thicker and nearly three times as deep - a mitten with a visible step at
+  // the cuff. The thumb bud stands out of the leading edge, which is what tells the eye which way the hand faces.
+  const palm = blob(0.034 * s, 0.062 * s, 0.062 * s, segs, rings);
   palm.rotateY(side * 0.22);
-  palm.translate(-side * 0.004 * s, wrist - 0.052 * s, 0.008 * s);
-  const thumb = blob(0.015 * s, 0.030 * s, 0.017 * s, Math.max(4, segs - 2), Math.max(3, rings - 2));
+  palm.translate(-side * 0.004 * s, wrist - 0.046 * s, 0.010 * s);
+  // Finger mass: a second, narrower lobe hanging off the palm and curled a little forward. Without it the hand ended
+  // at the palm and the arm read as a tube with a bud on it - the "rounded stub" of the critic's list. Twelve
+  // triangles a hand at the crowd's tessellation, twenty-four at the player's.
+  const fingers = blob(0.030 * s, 0.040 * s, 0.046 * s, Math.max(4, segs - 2), Math.max(3, rings - 2));
+  fingers.rotateX(-0.30);
+  fingers.rotateY(side * 0.22);
+  fingers.translate(-side * 0.006 * s, wrist - 0.106 * s, 0.020 * s);
+  const thumb = blob(0.016 * s, 0.032 * s, 0.018 * s, Math.max(4, segs - 2), Math.max(3, rings - 2));
   thumb.rotateZ(-side * 0.55);
-  thumb.translate(-side * 0.030 * s, wrist - 0.030 * s, 0.036 * s);
-  return fuseBare([palm, thumb]);
+  thumb.translate(-side * 0.032 * s, wrist - 0.032 * s, 0.040 * s);
+  return fuseBare([palm, fingers, thumb]);
 }
+
+/** Everything below this (in figure units, before `s`) is the hand rather than the forearm; see `HAND_TONE`. */
+export const HAND_Y = 0.77;
+/**
+ * The hand is painted a touch deeper and warmer than the forearm above it. Two masses the same flat skin value read as
+ * one tube however well they are sculpted; a 12 % value break at the wrist is what makes the hand a separate object at
+ * the six to ten metres the player is actually seen from.
+ */
+export const HAND_TONE = 0.88;
 
 /**
  * Ambient-occlusion bake for a standing figure scaled by `s`: multiplies existing vertex colours down in the crevices
@@ -430,7 +455,7 @@ export function bakeAO(g: THREE.BufferGeometry, s: number): THREE.BufferGeometry
     const rr = Math.sqrt(nx * nx + ny * ny + nz * nz);
     if (rr > 0.9 && rr < 1.06 && Math.abs(y - cy) < ry * 1.2) {
       const a = Math.atan2(nx, nz), f = (1 - Math.cos(a)) * 0.5;
-      const edge = f < 0.5 ? 1.1 + 0.6 * (f * 2) : 1.7 + 0.55 * ((f - 0.5) * 2);
+      const edge = f < 0.5 ? HAIR_FRONT * 0.95 + (1.7 - HAIR_FRONT * 0.95) * (f * 2) : 1.7 + 0.55 * ((f - 0.5) * 2);
       const th = Math.acos(clamp(ny / Math.max(1e-6, rr), -1, 1));
       ao *= 1 - 0.18 * (1 - smoothstep(edge - 0.02, edge + 0.32, th));
     }
@@ -489,19 +514,53 @@ export function headParts(s: number, segs: number, rings: number, hairRows: numb
   const nz = faceZ(0, cy - ry * 0.06, cy, rx, ry, rz, jaw);
   ns.translate(0, cy - ry * 0.08, nz + rz * 0.06);
   emit('skin', ns);
-  // Eyes: dark blocks set just proud of the face so the head has an unmistakable front.
+  // Eyes: dark blocks set just proud of the face so the head has an unmistakable front. They sit at `EYE_Y`, a third
+  // of a head radius LOWER than they used to: with the eyes at 0.12 and the brows at 0.30 the whole face furniture
+  // stood inside the fringe (the cap's lowest scalloped point was 0.23), so at any distance the eyes merged into the
+  // hair mass and what was left below was a blank oval — the mannequin the last critic read.
   for (const side of [-1, 1]) {
-    const ex = side * rx * 0.38, ey = cy + ry * 0.12;
+    const ex = side * rx * 0.38, ey = cy + ry * EYE_Y;
     const eye = block(rx * 0.27, ry * 0.15, rz * 0.14);
     eye.translate(ex, ey, faceZ(ex, ey, cy, rx, ry, rz, jaw) - rz * 0.04);
     emit('eye', eye);
-    const by = cy + ry * 0.3, bx = side * rx * 0.4;
+    const by = cy + ry * BROW_Y, bx = side * rx * 0.4;
     const brow = block(rx * 0.36, ry * 0.08, rz * 0.12);
     brow.rotateZ(side * 0.18);
     brow.translate(bx, by, faceZ(bx, by, cy, rx, ry, rz, jaw) - rz * 0.05);
     emit('brow', brow);
   }
-  emit('hair', hairCap(cy + ry * 0.02, rx * 1.075 + 0.003, ry * 1.09, rz * 1.075 + 0.003, segs, hairRows, 1.16, 1.76, 2.06, 0.15, 0.17));
+  // Mouth: one flat block on the centre line under the nose, a hair proud of the jaw. Twelve triangles, and it is the
+  // difference between a head with a front and a head with two dots on it.
+  const my = cy - ry * 0.42;
+  const mouth = block(rx * 0.30, ry * 0.055, rz * 0.10);
+  mouth.translate(0, my, faceZ(0, my, cy, rx, ry, rz, jaw) - rz * 0.045);
+  emit('brow', mouth);
+  // Hair: the fringe stops at HAIR_FRONT (a real forehead above the brows) and the nape keeps its long edge.
+  emit('hair', hairCap(cy + ry * 0.02, rx * 1.075 + 0.003, ry * 1.09, rz * 1.075 + 0.003, segs, hairRows, HAIR_FRONT, 1.76, 2.06, 0.15, 0.17));
+}
+
+/** Face furniture heights, in head radii about the skull centre: eyes, brows and the front hairline (polar, radians). */
+const EYE_Y = 0.02;
+const BROW_Y = 0.20;
+const HAIR_FRONT = 1.0;
+
+/**
+ * Lifts the crown of a hair cap and sinks its underside, multiplying whatever colour the caller painted it.
+ *
+ * A hair cap painted ONE value is a block of black plastic on top of the head — the "solid block cap" of the critic's
+ * list — because the two things that make hair read are a lit crown and a dark mass at the nape and behind the ears.
+ * One multiply per vertex, no triangles.
+ */
+export function hairShade(g: THREE.BufferGeometry, cy: number, ry: number): THREE.BufferGeometry {
+  const pos = g.attributes.position as THREE.BufferAttribute;
+  const col = g.attributes.color as THREE.BufferAttribute;
+  for (let i = 0; i < pos.count; i++) {
+    const t = clamp((pos.getY(i) - cy) / Math.max(1e-4, ry * 1.3), -1, 1);
+    // Crown up to 1.34, nape and the tuck behind the ears down to 0.62, with the break at the ear line.
+    const k = t > 0 ? 1 + 0.34 * t * t : 1 - 0.38 * t * t;
+    col.setXYZ(i, col.getX(i) * k, col.getY(i) * k, col.getZ(i) * k);
+  }
+  return g;
 }
 
 /**
@@ -600,11 +659,20 @@ function playerGeometry(): THREE.BufferGeometry {
   const P = PROFILE;
   const parts: THREE.BufferGeometry[] = [];
   // Torso: jeans below the belt, belt, shirt with a darker hem climbing to full colour at the chest, collar band.
-  const torso = paintFn(tube(torsoRings(1), RADIAL, true, true), (_x, y, _z, out) => {
-    if (y < P.beltLo) out.setHex(JEANS).multiplyScalar(0.96 + 0.04 * smoothstep(P.crotchY, P.beltLo, y));
+  // Two tone breaks in the shirt, not one: the hem-to-chest ramp it already had, plus a lit yoke across the chest and
+  // shoulders (`SHIRT_YOKE` from y 1.26 up) and a shaded panel down the back. A garment in ONE flat colour with a
+  // single vertical ramp is the thing that reads as a shop mannequin whatever the silhouette does; the yoke gives the
+  // chest a plane change and the back panel separates the figure from its own arms.
+  const torso = paintFn(tube(torsoRings(1), RADIAL, true, true), (_x, y, z, out) => {
+    // `face` is 0 at the back of the body and 1 at the front, eased over a few centimetres: a hard step at z = 0 draws
+    // a seam straight down the flank of every garment.
+    const face = smoothstep(-0.05, 0.05, z);
+    if (y < P.beltLo) out.setHex(JEANS).multiplyScalar((0.96 + 0.04 * smoothstep(P.crotchY, P.beltLo, y)) * (0.9 + 0.1 * face));
     else if (y < P.beltHi + 0.002) out.setHex(BELT);
-    else if (y < P.collarY) out.setHex(SHIRT).multiplyScalar(0.64 + 0.36 * smoothstep(P.beltHi, 1.24, y));
-    else out.setHex(COLLAR);
+    else if (y < P.collarY) {
+      const yoke = 1 + (SHIRT_YOKE - 1) * smoothstep(1.26, 1.38, y);
+      out.setHex(SHIRT).multiplyScalar((0.64 + 0.36 * smoothstep(P.beltHi, 1.24, y)) * yoke * (SHIRT_BACK + (1 - SHIRT_BACK) * face));
+    } else out.setHex(COLLAR);
   });
   parts.push(skin(torso, SPINE, HIPS, 0.98, 0.84));
   // Belt buckle: a brass plate on the centre line of the proud belt ring. Twelve triangles, and it is the one thing
@@ -615,18 +683,24 @@ function playerGeometry(): THREE.BufferGeometry {
   parts.push(skin(paint(tube(neckRings(1), 8, false, false), SKIN), HEAD, SPINE, 1.57, 1.47));
   headParts(1, 14, 10, 7, (role, g) => {
     const hex = role === 'skin' ? SKIN : role === 'eye' ? EYE : HAIR;
-    parts.push(skin(paint(g, hex), HEAD, HEAD, 0, 0));
+    const painted = paint(g, hex);
+    if (role === 'hair') hairShade(painted, P.headCY + P.headRY * 0.02, P.headRY);
+    parts.push(skin(painted, HEAD, HEAD, 0, 0));
   });
   for (const side of [-1, 1]) {
     // Arm tube plus the mitten hand at the wrist; the hand rides the elbow bone through the y-threshold weights.
     const arm = paintFn(fuse([tube(armRings(1, side), RADIAL, false, false), hand(1, side, 8, 6)]), (_x, y, _z, out) => {
       if (y >= P.sleeveY) out.setHex(SLEEVE).multiplyScalar(0.88 + 0.12 * smoothstep(P.sleeveY, 1.36, y));
-      else out.setHex(SKIN);
+      else out.setHex(SKIN).multiplyScalar(y < HAND_Y ? HAND_TONE : 1);
     });
     arm.translate(side * P.shoulderX, 0, 0);
     parts.push(skin(arm, side < 0 ? SH_L : SH_R, side < 0 ? EL_L : EL_R, 1.19, 1.09));
-    const leg = paintFn(tube(legRings(1, side), RADIAL, false, true), (_x, y, _z, out) => {
-      out.setHex(JEANS).multiplyScalar(0.86 + 0.14 * smoothstep(0.1, 0.5, y));
+    // Trousers get their second break here: the ramp up the shin, a lighter plane down the FRONT of the thigh and a
+    // shadow crease at the back of the knee, so the leg has a form instead of being one blue tube.
+    const leg = paintFn(tube(legRings(1, side), RADIAL, false, true), (_x, y, z, out) => {
+      const face = smoothstep(-0.045, 0.045, z);
+      const crease = 1 - JEANS_CREASE * (1 - smoothstep(0, 0.09, Math.abs(y - P.kneeY))) * (1 - 0.75 * face);
+      out.setHex(JEANS).multiplyScalar((0.86 + 0.14 * smoothstep(0.1, 0.5, y)) * (0.93 + (JEANS_FRONT - 0.93) * face) * crease);
     });
     leg.translate(side * P.hipX, 0, 0);
     parts.push(skin(leg, side < 0 ? HIP_L : HIP_R, side < 0 ? KNEE_L : KNEE_R, 0.52, 0.42));
@@ -737,7 +811,8 @@ export class PlayerRenderer {
     const gyS = this.groundY + SHADOW_LIFT;
     if (!p.alive) this.shadows.add(this.interp.x, gyS, this.interp.z, SHADOW_R, SHADOW_R * 1.8, this.interp.yaw, sc);
     else {
-      const rx = SHADOW_R * SHADOW_NARROW, rz = SHADOW_R * gs.stretch, push = rz - rx;
+      // See PED_RENDER.shadowAnchor: the full (rz - rx) offset walks the blob's opaque core away from the feet.
+      const rx = SHADOW_R * SHADOW_NARROW, rz = SHADOW_R * gs.stretch, push = (rz - rx) * SHADOW_ANCHOR;
       this.shadows.add(this.interp.x + gs.dirX * push, gyS, this.interp.z + gs.dirZ * push, rx, rz, Math.atan2(gs.dirX, gs.dirZ), sc);
     }
     this.shadows.end();
@@ -801,13 +876,19 @@ export class PlayerRenderer {
     // Arms: rest slightly forward of the hip line with a soft elbow, hang close to the body, swing opposite the legs
     // when moving, reach up in the air; a slow sway while idle keeps them from freezing.
     const swayA = 0.03 * Math.sin(t * 0.9 + 0.6) * idle;
-    const spread = 0.04 + 0.02 * Math.min(1, Math.abs(s) * 4) + 0.012 * breath;
+    // `spread` is 0.115 at rest, not 0.04. The elbow bend the arms already had is a rotation about X: it swings the
+    // forearm forward, which from the front or from behind - the two angles a third-person player is ever seen from -
+    // changes NOTHING in the silhouette, so the arms read as two straight lines hanging off the shoulders. Standing
+    // the upper arms off the ribs and closing the forearms back in (`ELBOW_IN` about Z) puts the bend where it shows.
+    const spread = 0.115 + 0.02 * Math.min(1, Math.abs(s) * 4) + 0.012 * breath;
     B[SH_L].rotation.x = (-0.05 - s * 0.8 + swayA) * ground - 2.4 * air;
     B[SH_R].rotation.x = (-0.05 + s * 0.8 - swayA) * ground - 2.4 * air;
     B[SH_L].rotation.z = -spread - 0.01 * shift;
     B[SH_R].rotation.z = spread - 0.01 * shift;
-    B[EL_L].rotation.x = -(0.25 + 0.45 * Math.max(0, s) + 0.03 * breath) * ground - 1.1 * air;
-    B[EL_R].rotation.x = -(0.25 + 0.45 * Math.max(0, -s) + 0.03 * breath) * ground - 1.1 * air;
+    B[EL_L].rotation.x = -(0.3 + 0.45 * Math.max(0, s) + 0.03 * breath) * ground - 1.1 * air;
+    B[EL_R].rotation.x = -(0.3 + 0.45 * Math.max(0, -s) + 0.03 * breath) * ground - 1.1 * air;
+    B[EL_L].rotation.z = (ELBOW_IN + 0.012 * breath) * ground;
+    B[EL_R].rotation.z = -(ELBOW_IN + 0.012 * breath) * ground;
     // Hips tilt and twist with the stride, shoulders counter-twist; a bounce at twice the stride frequency.
     // Idle weight shift: the pelvis tips and slides over the loaded leg, the spine leans back the other way.
     const hips = B[HIPS], spine = B[SPINE];

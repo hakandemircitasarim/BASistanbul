@@ -677,6 +677,18 @@ const ARCH_R = 1.12;
 const ARCH_SEG = 16;
 /** Arch lip face this far inside the spec width: 2 cm proud of the widest flank, a real fender flare. */
 const ARCH_INSET = 0.025;
+/**
+ * Outboard reach of the MID shell's arch fender from the hub line. The near arch stops at `hw - ARCH_INSET`, which is
+ * 4 mm short of the tyre's outer bead - fine there, because that arch also has the inward-facing well tube and the
+ * flank is cut back around a tyre the eye already reads as being inside the body. The mid arch has neither, so at the
+ * same reach the tyre stood PROUD of the fender and read as a disc bolted to the side of a plate. Reaching past the
+ * bead (half a tyre width plus 6 mm) puts a real flare over the whole wheel.
+ *
+ * It must not make the mid shell wider than the near one: the three shells hold ONE silhouette across the 8 m and
+ * 32 m band boundaries (scripts/tests/city.test.ts asserts the widths match), and the near shell's own widest points
+ * are its mirrors. Hub + this lands within a centimetre of the near shell's tyre line.
+ */
+const MID_ARCH_REACH = VEHICLE_RENDER.wheelWidth * 0.5 + 0.006;
 
 /**
  * Builds one arch fender: a painted open half-tube with an annular lip on the outboard end, a black inward-facing
@@ -705,24 +717,75 @@ function archGeometry(a: ArchDef, side: number): THREE.BufferGeometry[] {
 
 /** Arch segments of the mid parked shell: half the near loft's, which is still a smooth crescent at 20-32 m. */
 const MID_ARCH_SEG = 8;
+/**
+ * How dark the crown of the mid arch's fender tube is painted, relative to the body paint it carries. The mid shell
+ * has no inward-facing well tube (two sub-pixel rings at 20 m), so without this the arch is a slightly darker patch of
+ * the SAME hue as the flank it sits on and the eye reads no arch at all — a body plate with a disc beside it, which is
+ * exactly what the last critic saw. Shading the tube from the lip (1.0) to the crown (0.42) costs no triangles and
+ * puts a dark crescent over every tyre, which is the one thing that says "the wheel is let into the body".
+ */
+const MID_ARCH_CROWN = 0.42;
 
 /**
- * Cheap wheel arch for the mid parked shell: the painted half-tube of the fender (so the flank is cut back around the
- * wheel and the tyre sits INSIDE the body) over a black half-disc backing proud of the flank. No outboard lip ring and
- * no inward-facing well tube — at 20-32 m those are two sub-pixel rings — which is a quarter of the near arch's
- * triangles for the read that actually matters: a dark crescent over a tyre that is let into the body, not a black
- * disc stuck on a wedge.
+ * Wheel arch for the mid parked shell: the painted half-tube of the fender (so the flank is cut back around the wheel
+ * and the tyre sits INSIDE the body), shaded dark toward its crown, an annular lip closing its outboard end (without
+ * it the tucked-in tyre leaves the open end of the tube showing) and a black half-disc backing proud of the flank.
+ * No inward-facing well tube — at 20-32 m that is a sub-pixel ring the crown shading already stands in for — so this
+ * is still a third of the near arch's triangles.
  */
 function midArchGeometry(a: ArchDef, side: number): THREE.BufferGeometry[] {
   const y = VEHICLE_RENDER.wheelRadius;
-  const tube = new THREE.CylinderGeometry(a.r, a.r, a.w * 2, MID_ARCH_SEG, 1, true, 0, Math.PI);
+  const w = Math.max(a.w, MID_ARCH_REACH);
+  const tube = new THREE.CylinderGeometry(a.r, a.r, w * 2, MID_ARCH_SEG, 1, true, 0, Math.PI);
   tube.rotateZ(Math.PI / 2);
   tube.translate(side * a.x, y, a.z);
+  // Darkest at the crown of the arch (directly over the hub), back to full paint where the fender meets the flank.
+  const crown = (py: number, pz: number): number => {
+    const t = clamp((py - y) / Math.max(1e-4, a.r), 0, 1);
+    const along = 1 - clamp(Math.abs(pz - a.z) / Math.max(1e-4, a.r), 0, 1);
+    return 1 - (1 - MID_ARCH_CROWN) * t * (0.35 + 0.65 * along);
+  };
+  const lip = new THREE.RingGeometry(a.r * 0.84, a.r, MID_ARCH_SEG, 1, 0, Math.PI);
+  lip.rotateY(side > 0 ? Math.PI / 2 : -Math.PI / 2);
+  lip.translate(side * (a.x + w), y, a.z);
   const back = new THREE.CircleGeometry(a.r * 0.99, MID_ARCH_SEG, 0, Math.PI);
   back.rotateY(side > 0 ? Math.PI / 2 : -Math.PI / 2);
   back.translate(side * a.wellX, y, a.z);
-  return [decorate(tube, PAINT_DARK, 1), decorate(back, BLACK, MATTE_MIX)];
+  return [
+    shade(decorate(tube, PAINT_DARK, 1), (_px, py, pz) => crown(py, pz)),
+    shade(decorate(lip, PAINT_DARK, 1), (_px, py, pz) => crown(py, pz)),
+    decorate(back, BLACK, MATTE_MIX),
+  ];
 }
+
+/**
+ * Dark underbody box: the floor pan and the two rocker skirts, from just above the road up to the shell's own floor,
+ * inboard of the tyres and stopping short of the arches.
+ *
+ * The lofted shell closes its floor at `clearance` (25-30 cm), so from any camera below roof height the gap between
+ * the sill and the road is a window onto whatever is behind the car — bright pavement between two wheel discs, which
+ * is the "flat body plate hovering above the ground" read. A dozen triangles of matte near-black close it: the car keeps
+ * the ride height, but what shows under it is its own shadowed underside rather than the street.
+ */
+function underbodyGeometry(s: VehicleSpec, profile: VehicleProfile, seg: 'near' | 'coarse'): THREE.BufferGeometry {
+  const R = VEHICLE_RENDER;
+  // Inboard of the tyre's inner face so nothing z-fights the wheels, and short of the arches at both ends.
+  const hw = Math.max(0.2, s.width * 0.5 - R.wheelWidth - UNDER_CLEAR);
+  const hl = Math.max(0.4, s.length * 0.5 - UNDER_END);
+  const y1 = profile.floor + 0.02, y0 = Math.min(y1 - 0.04, UNDER_Y);
+  const g = new THREE.BoxGeometry(hw * 2, y1 - y0, hl * 2);
+  g.translate(0, (y0 + y1) * 0.5, 0);
+  const box = g.toNonIndexed();
+  g.dispose();
+  // A touch lighter on the coarse shells: past 30 m a pure black slab under a pale car reads as a hole, not as shade.
+  return decorate(box, seg === 'near' ? UNDERBODY : UNDERBODY_LOD, MATTE_MIX);
+}
+/** Underbody skirt: this far inboard of the tyre inner faces, this far short of the bumpers, and its floor height. */
+const UNDER_CLEAR = 0.03;
+const UNDER_END = 0.22;
+const UNDER_Y = 0.055;
+const UNDERBODY = 0x141518;
+const UNDERBODY_LOD = 0x24262a;
 
 /** Segment tones of the end faces and their wraps onto the flanks: a dark bezel above and below every lens cell. */
 // The `low` band (sill to lower flank) is the bumper: PAINT_SHADE, so it reads as a separate moulded part under the
@@ -1105,6 +1168,7 @@ export function bodyGeometry(s: VehicleSpec): THREE.BufferGeometry {
     geos.push(...archGeometry(a, 1), ...archGeometry(a, -1));
   }
   geos.push(exhaustGeometry(profile.exhaust.x, profile.exhaust.y, profile.exhaust.zFace));
+  geos.push(underbodyGeometry(s, profile, 'near'));
   const merged = mergeGeometries(geos, false);
   if (!merged) throw new Error('vehicle body merge failed (attribute mismatch)');
   for (let i = 0; i < geos.length; i++) geos[i].dispose();
@@ -1145,7 +1209,7 @@ export function parkedShellGeometry(s: VehicleSpec): THREE.BufferGeometry {
   const profile = profileFor(s);
   const stations: Station[] = [];
   for (let i = 0; i < profile.stations.length; i++) if (profile.stations[i].lod) stations.push(profile.stations[i]);
-  const geos: THREE.BufferGeometry[] = [loft(stations, LOD_RING)];
+  const geos: THREE.BufferGeometry[] = [loft(stations, LOD_RING), underbodyGeometry(s, profile, 'coarse')];
   bakedWheels(geos, s, profile, 8);
   const merged = mergeGeometries(geos, false);
   if (!merged) throw new Error('parked shell merge failed (attribute mismatch)');
@@ -1227,7 +1291,7 @@ export function parkedMidGeometry(s: VehicleSpec): THREE.BufferGeometry {
   const profile = profileFor(s);
   const stations: Station[] = [];
   for (let i = 0; i < profile.stations.length; i++) if (profile.stations[i].lod || profile.stations[i].mid) stations.push(profile.stations[i]);
-  const geos: THREE.BufferGeometry[] = [loft(stations, MID_RING)];
+  const geos: THREE.BufferGeometry[] = [loft(stations, MID_RING), underbodyGeometry(s, profile, 'coarse')];
   for (let i = 0; i < profile.arches.length; i++) {
     const a = profile.arches[i];
     geos.push(...midArchGeometry(a, 1), ...midArchGeometry(a, -1));
@@ -1260,6 +1324,7 @@ export function parkedNearGeometry(s: VehicleSpec): THREE.BufferGeometry {
     geos.push(...archGeometry(a, 1), ...archGeometry(a, -1));
   }
   geos.push(exhaustGeometry(profile.exhaust.x, profile.exhaust.y, profile.exhaust.zFace));
+  geos.push(underbodyGeometry(s, profile, 'near'));
   bakedWheels(geos, s, profile, 10, 'rim');
   const merged = mergeGeometries(geos, false);
   if (!merged) throw new Error('parked near shell merge failed (attribute mismatch)');
@@ -1343,6 +1408,24 @@ function wheelGeometry(): THREE.BufferGeometry {
 
 /** Paint look: a smooth metallic base under a hard clearcoat, plus the stylised view-angle rim toward the silhouette. */
 const PAINT_LOOK = { metalness: 0.45, roughness: 0.35, envMapIntensity: 1.2, clearcoat: 1.0, clearcoatRoughness: 0.08, rim: 0.32, rimPower: 3.0 } as const;
+/**
+ * Clearcoat roughness and specular ceiling for the PUNCTUAL lights AFTER DARK; the probe always keeps
+ * `PAINT_LOOK.clearcoatRoughness`, and by day so does the direct pass.
+ *
+ * A 0.08-rough coat is a mirror, which is exactly what the sky probe and the sun want (round 7 put the horizon crease
+ * and the sun disc on the bonnet with it). Against a street lamp it is a disaster: a lamp is a zero-area emitter 3 m
+ * from a parked car's flank, so the GGX peak ran to double digits and clipped to a hard white disc with a bloom halo
+ * — "a headlight switched on inside a parked car's flank", which is what the last critic read at night. After dark the
+ * direct lobe therefore widens to 0.40 (a ~25x lower peak) and the direct specular of both layers is capped well under
+ * the bloom threshold, measured by bisection: at a cap of 1.25 the flank still washed out, at 0 the cars went matte,
+ * and 0.32 leaves a sheen that reads as lacquer catching the lamp. `uNight` is the same 0..1 factor that drives the
+ * lens glow, so the DAY look — where the only punctual light is the sun and the lamps sit at intensity 0 — is
+ * untouched, glints and all.
+ */
+const CLEARCOAT_NIGHT = 0.40;
+const SPEC_CLAMP_NIGHT = 0.32;
+/** By day the ceiling is effectively off (a sun glint on a bonnet is meant to blow out and bloom). */
+const SPEC_CLAMP_DAY = 64;
 /** Lit-lens emissive: bright enough by day to read as "on", over the night bloom threshold (1.4) after dark. */
 const LENS_GLOW_DAY = 1.2;
 const LENS_GLOW_NIGHT = 2.6;
@@ -1362,9 +1445,12 @@ export function makeVehiclePaintMaterial(lensGlow = false): THREE.MeshPhysicalMa
     vertexColors: true, metalness: L.metalness, roughness: L.roughness, envMapIntensity: L.envMapIntensity, clearcoat: L.clearcoat, clearcoatRoughness: L.clearcoatRoughness,
   });
   const uLensGlow = { value: 0 };
+  const uNight = { value: 0 };
   m.userData.uLensGlow = uLensGlow;
+  m.userData.uNight = uNight;
   m.onBeforeCompile = (shader) => {
     shader.uniforms.uLensGlow = uLensGlow;
+    shader.uniforms.uNight = uNight;
     shader.uniforms.uRim = { value: L.rim };
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', [
@@ -1395,7 +1481,7 @@ export function makeVehiclePaintMaterial(lensGlow = false): THREE.MeshPhysicalMa
         '#endif',
       ].join('\n'));
     shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', '#include <common>\nuniform float uLensGlow;\nuniform float uRim;\nvarying float vPaint;\nvarying float vLens;\nvarying float vMatte;\nvarying float vGlass;')
+      .replace('#include <common>', '#include <common>\nuniform float uLensGlow;\nuniform float uRim;\nuniform float uNight;\nvarying float vPaint;\nvarying float vLens;\nvarying float vMatte;\nvarying float vGlass;')
       // Matte parts (MATTE_MIX): rough, non-metal, no clearcoat, so a wheel well or a baked wheel disc never flashes the sky.
       .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = mix( mix( roughnessFactor, 0.92, vMatte ), 0.11, vGlass );')
       // Glass: a dielectric mirror (metalness 0), so the clearcoat lobe and the probe carry it rather than the paint's
@@ -1407,6 +1493,23 @@ export function makeVehiclePaintMaterial(lensGlow = false): THREE.MeshPhysicalMa
       .replace('#include <lights_physical_fragment>', THREE.ShaderChunk.lights_physical_fragment.replace('material.clearcoat = clearcoat;', 'material.clearcoat = clearcoat * ( 1.0 - vMatte ) * ( 1.0 - 0.55 * vGlass );'))
       // Lit lens cells: emissive in their own (lens) colour.
       .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += vColor.rgb * vLens * uLensGlow;')
+      // After dark the punctual lights get a broad coat and a capped specular; the probe pass (maps + indirect) always
+      // gets the mirror coat back, and by day nothing changes at all.
+      .replace('#include <lights_fragment_begin>', [
+        '#ifdef USE_CLEARCOAT',
+        `material.clearcoatRoughness = mix( ${L.clearcoatRoughness.toFixed(2)}, ${CLEARCOAT_NIGHT.toFixed(2)}, uNight );`,
+        '#endif',
+        '#include <lights_fragment_begin>',
+      ].join('\n'))
+      .replace('#include <lights_fragment_maps>', [
+        `float vSpecMax = mix( ${SPEC_CLAMP_DAY.toFixed(1)}, ${SPEC_CLAMP_NIGHT.toFixed(2)}, uNight );`,
+        '#ifdef USE_CLEARCOAT',
+        'clearcoatSpecularDirect = min( clearcoatSpecularDirect, vec3( vSpecMax ) );',
+        `material.clearcoatRoughness = ${L.clearcoatRoughness.toFixed(2)};`,
+        '#endif',
+        'reflectedLight.directSpecular = min( reflectedLight.directSpecular, vec3( vSpecMax ) );',
+        '#include <lights_fragment_maps>',
+      ].join('\n'))
       // Fresnel rim on the paint only: view-angle brightening toward the silhouette, tinted a little toward white.
       .replace('#include <opaque_fragment>', [
         '{',
@@ -1417,8 +1520,17 @@ export function makeVehiclePaintMaterial(lensGlow = false): THREE.MeshPhysicalMa
         '#include <opaque_fragment>',
       ].join('\n'));
   };
-  m.customProgramCacheKey = () => (lensGlow ? 'vehiclePaintMixGlow3' : 'vehiclePaintMix3');
+  m.customProgramCacheKey = () => (lensGlow ? 'vehiclePaintMixGlow4' : 'vehiclePaintMix4');
   return m;
+}
+
+/**
+ * Feeds the 0..1 night factor to a paint material made by `makeVehiclePaintMaterial` (see CLEARCOAT_NIGHT). The
+ * vehicle bodies get it from `VehicleRenderer.setNightFactor`, the parked shells of the city from `PropRenderer`.
+ */
+export function setPaintNight(m: THREE.Material, night: number): void {
+  const u = m.userData.uNight as { value: number } | undefined;
+  if (u) u.value = night < 0 ? 0 : night > 1 ? 1 : night;
 }
 
 // ---------------------------------------------------------------------------------------------- renderer
@@ -1544,6 +1656,7 @@ export class VehicleRenderer {
     this.nightFactor = clamp(f, 0, 1);
     this.shadows.setNightFactor(this.nightFactor);
     (this.bodyMat.userData.uLensGlow as { value: number }).value = LENS_GLOW_DAY + (LENS_GLOW_NIGHT - LENS_GLOW_DAY) * this.nightFactor;
+    setPaintNight(this.bodyMat, this.nightFactor);
   }
 
   sync(world: World, alpha: number, time: number, camX: number, camZ: number): void {

@@ -7,7 +7,9 @@ import { Random } from '../../src/game/core/Random';
 import { BLOCK, INTERSECTION_R, LANE_W, PITCH, ROAD_W, SIDEWALK_W } from '../../src/game/city/CityConfig';
 import { ASPHALT_HALF, colliderDistance, districtOf, onRoad } from '../../src/game/city/CityBuild';
 import { HEDGE, LOT_BAYS, lotLayout } from '../../src/game/city/CityLots';
-import { CAFE, CLUTTER_SPOT_CLEAR, DUMPSTER, POLE, ROADSIGN, TREE_CLEAR } from '../../src/game/city/CityProps';
+import { CAFE, CLUTTER_SPOT_CLEAR, DUMPSTER, KERB_PARK, POLE, ROADSIGN, TREE_CLEAR } from '../../src/game/city/CityProps';
+/** Half the width of one tyre at the track line (VEHICLE_RENDER.wheelWidth / 2), for the kerb straddle assertions. */
+const WHEEL_TRACK_W = 0.12;
 import type { Lot, ParkedCar } from '../../src/game/city/CityData';
 import { SPECS } from '../../src/game/entities/VehicleSpecs';
 import { parkedMidGeometry, parkedNearGeometry, parkedShellGeometry } from '../../src/game/render/VehicleRenderer';
@@ -423,7 +425,7 @@ function faceOffset(c: { blocks: { x0: number; z0: number; x1: number; z1: numbe
   return null;
 }
 
-test('kerbside parking: on the pavement against the kerb, off every lane / intersection / crossing, clear of props, points and each other, with colliders, deterministic', () => {
+test('kerbside parking: straddling the kerb into the kerb lane, clear of the traffic lanes / intersections / crossings, props, points and each other, with colliders, deterministic', () => {
   const g = city();
   const c = g.city;
   const kerb = (c.parked ?? []).filter((p) => p.at === 'kerb');
@@ -444,7 +446,9 @@ test('kerbside parking: on the pavement against the kerb, off every lane / inter
   for (const m of c.points.missionStarts) pts.push([m.x, m.z]);
   const hydrants = c.props.filter((p) => p.kind === 'hydrant'), shelters = c.props.filter((p) => p.kind === 'shelter');
   const dist = (r: { x0: number; z0: number; x1: number; z1: number }, x: number, z: number): number => Math.hypot(Math.max(r.x0 - x, 0, x - r.x1), Math.max(r.z0 - z, 0, z - r.z1));
-  const halfW = LANE_W / 2;
+  // Lane test half-width: a parked corner must stay this far from any lane centre line (half the widest traffic body
+  // plus the margin), which is the same rule the placement is built on.
+  const halfW = KERB_PARK.bodyHalf + KERB_PARK.laneClear - 1e-3;
   let sedans = 0;
   for (const p of kerb) {
     expect(p.spec === 'sedan' || p.spec === 'sport' || p.spec === 'van', 'kerb spec valid');
@@ -457,15 +461,23 @@ test('kerbside parking: on the pavement against the kerb, off every lane / inter
     expect(f !== null, `kerb car at (${p.x.toFixed(1)}, ${p.z.toFixed(1)}) lies on a block face`);
     const hw = SPECS[p.spec].width / 2;
     const roadSide = f!.off + hw, blockSide = f!.off - hw;
-    expect(roadSide <= SIDEWALK_W - 0.05 + 1e-6 && roadSide >= SIDEWALK_W - 0.2, `road-side flank ${(ROAD_W / 2 - roadSide).toFixed(2)} m from the road centre (kerb at ${ASPHALT_HALF})`);
-    expect(blockSide >= 0.5, 'far flank leaves room on the pavement');
+    // The car laps the asphalt by KERB_PARK.roadLap: its road-side wheels stand on the carriageway and its kerb-side
+    // wheels up on the footway (the renderer rolls the body over the kerb). It used to stop 8 cm SHORT of the asphalt,
+    // i.e. stand with its whole width on the 3 m pavement.
+    approx(roadSide, SIDEWALK_W + KERB_PARK.roadLap, 1e-6, `road-side flank ${(ROAD_W / 2 - roadSide).toFixed(2)} m from the road centre (kerb at ${ASPHALT_HALF})`);
+    expect(roadSide - WHEEL_TRACK_W >= SIDEWALK_W, 'the whole road-side tyre width is on the asphalt');
+    expect(blockSide + WHEEL_TRACK_W <= SIDEWALK_W, 'the kerb-side tyre stays up on the footway');
+    expect(blockSide >= 1.0, 'the footway keeps a metre clear beside the car');
+    // Clear of the outer traffic lane's body envelope, so the AI never has to drive through a parked car.
+    expect(KERB_PARK.outerLaneOff - roadSide >= KERB_PARK.bodyHalf + KERB_PARK.laneClear - 1e-6,
+      `road-side flank clears the outer lane envelope (${(KERB_PARK.outerLaneOff - roadSide).toFixed(2)} m to the lane centre)`);
     // Nose along the edge, well clear of the block corners (intersection boxes + crossings).
     const alongX = f!.edge === 0 || f!.edge === 2;
     expect(alongX === (Math.abs(Math.sin(p.yaw)) > 0.5), 'kerb car noses along the street');
     const hl = SPECS[p.spec].length / 2;
     expect(f!.along - hl >= 5.9 && f!.along + hl <= BLOCK - 5.9, `kerb car stays ${6} m clear of the block corners (along ${f!.along.toFixed(1)})`);
     // Never on a lane or in an intersection (validator rule at every corner), and the yaw follows the adjacent lane.
-    for (const [x, z] of [[r.x0, r.z0], [r.x1, r.z0], [r.x0, r.z1], [r.x1, r.z1], [p.x, p.z]]) expect(!onRoad(g.roads, x, z, halfW), 'kerb car footprint off the road');
+    for (const [x, z] of [[r.x0, r.z0], [r.x1, r.z0], [r.x0, r.z1], [r.x1, r.z1], [p.x, p.z]]) expect(!onRoad(g.roads, x, z, halfW), 'kerb car footprint clear of every lane body and intersection box');
     const lp = { lane: 0, t: 0 };
     g.roads.nearestLane(p.x, p.z, lp);
     const d = g.roads.lanes[lp.lane].dir;
@@ -476,7 +488,9 @@ test('kerbside parking: on the pavement against the kerb, off every lane / inter
     rects.push(r);
     for (const h of hydrants) expect(dist(r, h.x, h.z) >= 1.5 - 1e-6, 'kerb car keeps 1.5 m from a hydrant');
     for (const h of shelters) expect(dist(r, h.x, h.z) >= 3.2 - 1e-6, 'kerb car keeps 3.2 m from a bus shelter');
-    for (const [x, z] of pts) expect(dist(r, x, z) >= 3.5 - 1e-6, 'kerb car keeps 3.5 m from the named points');
+    // 11 m, not 3.5: the strip is in the kerb lane now, so a car parked beside a named point blocks the lane the
+    // gameplay vehicle spawning there pulls out into.
+    for (const [x, z] of pts) expect(dist(r, x, z) >= 11 - 1e-6, 'kerb car keeps 11 m from the named points');
     expect(hasCollider(p.x, p.z), 'kerb car has an AABB prop collider');
   }
   expect(sedans > kerb.length * 0.45 && sedans < kerb.length * 0.8, `sedans dominate the mix (${sedans}/${kerb.length})`);

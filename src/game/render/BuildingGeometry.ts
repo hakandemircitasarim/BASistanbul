@@ -311,7 +311,8 @@ export class GeoBuilder {
       const s1 = k === n - 1 ? len : Math.min(len, Math.round((((k + 1) * len) / n) / bayW) * bayW);
       if (s1 <= s0 + 1e-6) continue;
       const key = segKey * 4 + face;
-      this.setColor(n === 1 ? wall : perturb(wall, (hash01(key * 31 + k) - 0.5) * (8 / 360), (hash01(key * 37 + k) - 0.5) * 0.1));
+      // Same gentle orientation tone the outline facades carry, so a landmark's four faces are not one albedo either.
+      this.setColor(n === 1 ? wall : perturb(wall, (hash01(key * 31 + k) - 0.5) * (8 / 360), (hash01(key * 37 + k) - 0.5) * 0.1), orientTone(nx, nz));
       const ax = sx + tx * s0, az = sz + tz * s0, bx = sx + tx * s1, bz = sz + tz * s1;
       this.quad(ax, y0, az, bx, y0, bz, bx, y1, bz, ax, y1, az, nx, 0, nz, ua + s0 / TW, va, ua + s1 / TW, va, ua + s1 / TW, vb, ua + s0 / TW, vb);
       s0 = s1;
@@ -987,6 +988,25 @@ function bandRows(y0: number, y1: number, rowH: number, th: number, key: number,
   return out;
 }
 
+/**
+ * Flat tone per facade ORIENTATION, multiplied into the wall tint of every windowed wall quad.
+ *
+ * Much gentler than FACE_SHADE (which is a 30 % swing, sized for crown facets read from 200 m): these are walls the
+ * player stands under, the sun moves round them during the day, and a hard baked shade would fight it at 17:00 when
+ * the west face is the lit one. 8 % between the brightest and the darkest is enough that the two faces of a corner
+ * never sit at one albedo - the previous critique's "a sunlit and a shaded face of the same block share one colour" -
+ * while staying inside the range the sky's own fill already varies by.
+ */
+const WALL_ORIENT = { pz: 1, px: 0.962, nz: 0.92, nx: 0.942 } as const;
+/** WALL_ORIENT for an arbitrary outward plan normal (chamfer edges run at 45 deg). */
+function orientTone(nx: number, nz: number): number {
+  const ax = Math.abs(nx), az = Math.abs(nz), t = ax + az;
+  if (t < 1e-9) return 1;
+  return ((nx >= 0 ? WALL_ORIENT.px : WALL_ORIENT.nx) * ax + (nz >= 0 ? WALL_ORIENT.pz : WALL_ORIENT.nz) * az) / t;
+}
+/** Peak-to-peak value drift between the vertical bands of one wall (bandRows), as a fraction of the wall tint. */
+const BAND_TONE_SPREAD = 0.07;
+
 const FACADE_MAX_LEN = 4096;
 /**
  * Windowed walls around an outline from y0 to y1 plus the flat roof cap: every edge is laid out into segments and
@@ -1006,15 +1026,19 @@ function facade(gb: GeoBuilder, b: Building, ol: Outline, y0: number, y1: number
     const key = b.id * 8 + i;
     const lay = f >= 0 ? layoutFace(fr.len, bayW, key, jog && street && fr.len > LONG_FACE, recess && street) : layoutFace(fr.len, fr.len, key, false, false);
     const bands = bandRows(y0, y1, rowH, th, key);
+    const orient = orientTone(fr.nx, fr.nz);
     const P = (s: number, o: number, y: number, out: number[]): number[] => { out[0] = fr.sx + fr.tx * s + fr.nx * o; out[1] = y; out[2] = fr.sz + fr.tz * s + fr.nz * o; return out; };
     const a = [0, 0, 0], c = [0, 0, 0], d = [0, 0, 0], e = [0, 0, 0];
     for (let p = 0; p < lay.n; p++) {
       const s0 = lay.s[p], s1 = lay.s[p + 1], dep = lay.depth[p], seg = lay.seg[p];
       const tg = lay.segTint[seg];
       const col = lay.nTint === 1 ? wall : perturb(wall, (hash01(key * 31 + tg) - 0.5) * (8 / 360), (hash01(key * 37 + tg) - 0.5) * 0.1);
-      gb.setColor(col);
       for (let j = 0; j < bands.n; j++) {
         const ya = bands.y[j], yb = bands.y[j + 1], kv = bands.kv[j];
+        // Orientation tone x a flat step per vertical band. The band split already exists (bandRows), so both are
+        // free: no extra vertex, no extra triangle, no extra draw. The band step is what stops a tower reading as one
+        // extruded colour from the pavement up - the storey-scale ladder is painted into the window tile itself.
+        gb.setColor(col, orient * (1 + (hash01(key * 41 + j * 7 + 3) - 0.5) * BAND_TONE_SPREAD));
         const uc = hashU(key * 17 + seg * 5 + j * 3) % 4;
         const u0 = uc / 4 + s0 / tw, u1 = uc / 4 + s1 / tw, v0 = (ya + kv * rowH) / th, v1 = (yb + kv * rowH) / th;
         P(s0, dep, ya, a); P(s1, dep, ya, c); P(s1, dep, yb, d); P(s0, dep, yb, e);

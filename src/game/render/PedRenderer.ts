@@ -11,9 +11,9 @@ import { createTransform, lerpTransform } from '../core/Transform';
 import { BUDGET } from '../core/Budget';
 import { clamp, damp, smoothstep } from '../core/math';
 import {
-  PROFILE, RIM_FRAGMENT, armRings, bakeAO, block, fillAttr, fuse, hairCap, hand, headParts, legRings, makeRimUniforms,
-  makeGroundShadow, neckRings, nightFromHour, paintFn, paintShoe, ringAt, setRimNight, shoe, surface, torsoRings, tube,
-  updateGroundShadow, type Ring, type RimUniforms,
+  HAND_TONE, HAND_Y, PROFILE, RIM_FRAGMENT, armRings, bakeAO, block, fillAttr, fuse, hairCap, hairShade, hand,
+  headParts, legRings, makeGroundShadow, makeRimUniforms, neckRings, nightFromHour, paintFn, paintShoe, ringAt,
+  setRimNight, shoe, surface, torsoRings, tube, updateGroundShadow, type Ring, type RimUniforms,
 } from './PlayerRenderer';
 
 export const PED_RENDER = {
@@ -41,12 +41,15 @@ export const PED_RENDER = {
    * nowhere, so it read as a detached disc lying beside the feet rather than as a shadow. Now it is an ellipse aligned
    * with the direction the scene's own shadow light casts (see PlayerRenderer.GroundShadow, so it agrees with the
    * shadow map and follows the swap to moon shadows), `shadowNarrow` x shadowR across that direction and up to
-   * `shadowStretchMax` x shadowR along it as the light drops, pushed out by the difference so its near end stays
-   * under the shoes and the far end runs away from the light. `shadowElevFloor` caps how long a very low sun makes it.
+   * `shadowStretchMax` x shadowR along it as the light drops, pushed `shadowAnchor` of the way out along it so the
+   * dark part stays under the shoes and the tail runs away from the light. `shadowElevFloor` caps how long a very low
+   * sun makes it.
    */
-  shadowNarrow: 1.0, shadowStretchMax: 2.4, shadowElevFloor: 0.26,
+  shadowNarrow: 1.0, shadowStretchMax: 2.4, shadowElevFloor: 0.26, shadowAnchor: 0.5,
   /** Height and width multipliers per ped span 1 +- spread/2 (fixed by the id). */
   heightSpread: 0.2, widthSpread: 0.2,
+  /** Resting set of the arms across the body (radians): upper arm out from the ribs, forearm back in under it. */
+  armOut: 0.11, elbowIn: 0.15,
   /** Joint folds (radians): the knee folds while the leg swings forward, the elbow rests soft and deepens on the reach. */
   kneeFold: 1.0, kneeSoft: 0.05, elbowRest: 0.25, elbowReach: 0.4, jointBlend: 0.05,
   /** Torso lean into the stride and the head's share of it. */
@@ -64,6 +67,8 @@ const V_PLAIN = 1, V_HAT = 2, V_TAIL = 4, V_BALD = 8, V_ALL = 15;
 /** Vertex-colour multipliers layered under the per-instance colour (absCol = 0); absolute colours use absCol = 1. */
 const TINT_HAIR = 0.3, TINT_BROW = 0.26;
 const HAT = 0x24304e, BAG = 0x5a3a24, SHOE = 0x1f1c1c, SOLE = 0x4d4a4a, EYE = 0x1a1410;
+/** Second garment tone break (see bodyGeometry / legGeometry): lit yoke, shaded back, lit thigh front. */
+const GARMENT_YOKE = 1.13, GARMENT_BACK = 0.88, GARMENT_FRONT = 1.08;
 
 function tint(g: THREE.BufferGeometry, k: number, mask: number): THREE.BufferGeometry {
   paintFn(g, (_x, _y, _z, out) => out.setRGB(k, k, k));
@@ -96,17 +101,46 @@ function jointAttr(g: THREE.BufferGeometry, pivotY: number, blend: number): THRE
 
 const scratchRing: Ring = { y: 0, rx: 0, rz: 0, x: 0, z: 0 };
 
+/**
+ * Rotates everything below `pivotY` about the Z axis through (0, pivotY, 0), easing in over `blend` metres. The Z-axis
+ * twin of PlayerRenderer's `bendBelow` (which turns about X): this is the one that shows in a silhouette seen from the
+ * front or the back, which is every angle a pedestrian is ever seen from.
+ */
+function leanAcross(g: THREE.BufferGeometry, pivotY: number, angle: number, blend: number): THREE.BufferGeometry {
+  const pos = g.attributes.position as THREE.BufferAttribute;
+  const nor = g.attributes.normal as THREE.BufferAttribute;
+  for (let i = 0; i < pos.count; i++) {
+    const y = pos.getY(i);
+    if (y >= pivotY + blend) continue;
+    const t = clamp((pivotY + blend - y) / (blend * 2), 0, 1);
+    const th = angle * t, c = Math.cos(th), sn = Math.sin(th);
+    const dy = y - pivotY, dx = pos.getX(i);
+    pos.setX(i, dx * c - dy * sn);
+    pos.setY(i, pivotY + dx * sn + dy * c);
+    const nx = nor.getX(i), ny = nor.getY(i);
+    nor.setX(i, nx * c - ny * sn);
+    nor.setY(i, nx * sn + ny * c);
+  }
+  return g;
+}
+
 /** Torso with hem gradient, belt and collar bands (shirt instance colour), plus the shoulder bag for two variants. Pivot at the hips. */
 function bodyGeometry(): THREE.BufferGeometry {
   const R = PED_RENDER, s = R.scale, P = PROFILE;
   const rings = torsoRings(s);
   const beltLo = P.beltLo * s, beltHi = P.beltHi * s, collar = P.collarY * s;
   const torso = tube(rings, R.radial, true, true);
-  paintFn(torso, (_x, y, _z, out) => {
-    if (y < beltLo) out.setRGB(0.46, 0.44, 0.47);
+  paintFn(torso, (_x, y, z, out) => {
+    // Second tone break, matching the player's: a lit yoke across the chest and shoulders over a shaded back, eased
+    // across z so it is a plane change and not a seam drawn down the flank. One flat garment colour with a single
+    // vertical ramp is what makes a crowd read as shop mannequins.
+    const face = GARMENT_BACK + (1 - GARMENT_BACK) * smoothstep(-0.05 * s, 0.05 * s, z);
+    if (y < beltLo) out.setRGB(0.46, 0.44, 0.47).multiplyScalar(0.93 + 0.07 * face);
     else if (y < beltHi + 0.002) out.setRGB(0.16, 0.15, 0.17);
-    else if (y < collar) { const k = 0.64 + 0.36 * smoothstep(beltHi, 1.24 * s, y); out.setRGB(k, k, k); }
-    else out.setRGB(0.78, 0.76, 0.8);
+    else if (y < collar) {
+      const k = (0.64 + 0.36 * smoothstep(beltHi, 1.24 * s, y)) * (1 + (GARMENT_YOKE - 1) * smoothstep(1.26 * s, 1.38 * s, y)) * face;
+      out.setRGB(k, k, k);
+    } else out.setRGB(0.78, 0.76, 0.8);
   });
   fillAttr(torso, 'absCol', 0);
   fillAttr(torso, 'partMask', V_ALL);
@@ -137,7 +171,7 @@ function headGeometry(): THREE.BufferGeometry {
     if (role === 'skin') parts.push(tint(g, 1, V_ALL));
     else if (role === 'eye') parts.push(solid(g, EYE, V_ALL));
     else if (role === 'brow') parts.push(tint(g, TINT_BROW, V_ALL));
-    else parts.push(tint(g, TINT_HAIR, V_PLAIN | V_HAT | V_TAIL));
+    else parts.push(hairShade(tint(g, TINT_HAIR, V_PLAIN | V_HAT | V_TAIL), (P.headCY + P.headRY * 0.02) * s, P.headRY * s));
   });
   parts.push(tint(tube(neckRings(s), 8, false, false), 1, V_ALL));
   const cy = P.headCY * s, rx = P.headRX * s, ry = P.headRY * s, rz = P.headRZ * s;
@@ -167,7 +201,12 @@ function headGeometry(): THREE.BufferGeometry {
 function legGeometry(side: number): THREE.BufferGeometry {
   const R = PED_RENDER, s = R.scale, P = PROFILE;
   const leg = tube(legRings(s, side), R.radial, false, false); // the shoe hides the ankle end
-  paintFn(leg, (_x, y, _z, out) => { const k = 0.84 + 0.16 * smoothstep(0.1, 0.5, y / s); out.setRGB(k, k, k); });
+  paintFn(leg, (_x, y, z, out) => {
+    const face = smoothstep(-0.045 * s, 0.045 * s, z);
+    const crease = 1 - 0.12 * (1 - smoothstep(0, 0.09 * s, Math.abs(y - P.kneeY * s))) * (1 - 0.75 * face);
+    const k = (0.84 + 0.16 * smoothstep(0.1, 0.5, y / s)) * (0.93 + (GARMENT_FRONT - 0.93) * face) * crease;
+    out.setRGB(k, k, k);
+  });
   fillAttr(leg, 'absCol', 0);
   fillAttr(leg, 'partMask', V_ALL);
   // Six-sided shoe: the crowd is the one part of the scene that pays its triangles 26 times over (and twice again in
@@ -196,13 +235,19 @@ function armGeometry(side: number): THREE.BufferGeometry {
   fillAttr(sleeve, 'partMask', V_ALL);
   // Forearm and hand: absCol = 2 selects the per-instance skin colour instead of the shirt instance colour.
   const fore = fuse([tube(rings.filter((r) => r.y <= sleeveY), R.radial, true, false), hand(s, side, 6, 4)]);
-  paintFn(fore, (_x, _y, _z, out) => out.setRGB(1, 1, 1));
+  // The hand is a shade deeper than the forearm (see HAND_TONE), or the two masses read as one tube at crowd distance.
+  paintFn(fore, (_x, y, _z, out) => { const k = y < HAND_Y * s ? HAND_TONE : 1; out.setRGB(k, k, k); });
   fillAttr(fore, 'absCol', 2);
   fillAttr(fore, 'partMask', V_ALL);
   const g = fuse([sleeve, fore]);
   g.translate(side * P.shoulderX * s, 0, 0);
   bakeAO(g, s);
   g.translate(-side * P.shoulderX * s, -P.shoulderY * s, 0);
+  // The shader's elbow fold turns the forearm about X, which does nothing to the silhouette seen head-on: a crowd of
+  // straight vertical arms is what makes the peds read as mannequins. Leaning the whole arm out from the shoulder and
+  // the forearm back in ACROSS the body puts a real bend in the outline, in geometry, for no per-frame cost.
+  leanAcross(g, 0, side * R.armOut, 0.28 * s);
+  leanAcross(g, (P.elbowY - P.shoulderY) * s, -side * (R.armOut + R.elbowIn), R.jointBlend * 3);
   return jointAttr(g, (P.elbowY - P.shoulderY) * s, R.jointBlend);
 }
 
@@ -449,7 +494,12 @@ export class PedRenderer {
           const gs = this.groundShadow;
           const rx = R.shadowR * R.shadowNarrow * wide;
           const rz = R.shadowR * gs.stretch * wide;
-          const push = rz - rx;
+          // Only `shadowAnchor` of the way out, not the full (rz - rx). Pushing the ellipse until its near RIM sat
+          // under the shoes left its opaque core — the blob texture is solid only inside SHADOW_TUNING.core — the best
+          // part of a metre downlight of the figure, which is exactly the "detached blob lying beside the feet" read
+          // the stretch was added to cure. Half the offset keeps the dark part under the ped and still runs the tail
+          // away from the light.
+          const push = (rz - rx) * R.shadowAnchor;
           this.shadows.add(t.x + gs.dirX * push, gy + R.shadowLift, t.z + gs.dirZ * push, rx, rz,
             Math.atan2(gs.dirX, gs.dirZ), sc);
         }

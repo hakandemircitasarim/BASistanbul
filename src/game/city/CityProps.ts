@@ -1,5 +1,5 @@
 // Landmarks, water/boundary colliders, plaza/park furnishing, street props (lamps, palms, trees, hydrants), kerbside parking, parked spots and named points. Track A.
-import { BEACH_X0, BLOCK, CITY_MAX_X, CITY_MAX_Z, CITY_MIN_X, CITY_MIN_Z, LAMP_SPACING, LANDMARK_BLOCKS, LANE_W, OCEAN_SIZE, OCEAN_X0, PALMS_PER_BLOCK_EDGE, PLAZA_BLOCKS, ROAD_W, SIDEWALK_W } from './CityConfig';
+import { BEACH_X0, BLOCK, CITY_MAX_X, CITY_MAX_Z, CITY_MIN_X, CITY_MIN_Z, LAMP_SPACING, LANDMARK_BLOCKS, LANES_PER_DIR, LANE_W, OCEAN_SIZE, OCEAN_X0, PALMS_PER_BLOCK_EDGE, PLAZA_BLOCKS, ROAD_W, SIDEWALK_W } from './CityConfig';
 import { BUDGET } from '../core/Budget';
 import type { Block, CityData, District, Landmark, Lot, NamedPoint, ParkedSpec } from './CityData';
 import { ASPHALT_HALF, addAabb, addCircle, addParkedCar, addProp, addPropBox, blockIndex, clearance, distToNearestRoadNode, districtOf, nearestLaneYaw, onRoad, rectClear, spotTooClose } from './CityBuild';
@@ -69,12 +69,34 @@ const TREE = {
 /** Crown clearance contract of the sidewalk trees, exported for the placement test. */
 export const TREE_CLEAR = { crownR: TREE.crownR, facadeGap: TREE.facadeGap } as const;
 /**
- * Kerbside parking: cars stand on the pavement strip hard against the kerb (their road-side flank `kerbGap` off the
- * asphalt edge, i.e. wholly outside the outer lane), noses along the adjacent lane's direction of travel, in runs
- * between the street furniture. `endClear` keeps them off the corner boxes and crossings, the fill share varies by
- * district, and hydrants / bus shelters / named points get their own no-parking clearances.
+ * Kerbside parking: cars stand in the KERB LANE, straddling the kerb, noses along the adjacent lane's direction of
+ * travel, in runs between the street furniture. `endClear` keeps them off the corner boxes and crossings, the fill
+ * share varies by district, and hydrants / bus shelters / named points get their own no-parking clearances.
+ *
+ * `roadLap` is how far inside the asphalt the road-side flank sits, measured from the kerb line (SIDEWALK_W out from
+ * the block edge). It used to be -0.08: the flank stopped 8 cm SHORT of the asphalt, so a 1.8 m car stood with its
+ * whole width on the 3 m footway — blocking the pavement the crowd walks on and reading, from the street, as a car
+ * parked on the shopfront terrace. The carriageway is only 14 m wide and its four 3.5 m lanes use every metre of it,
+ * so there is no parking lane to move into: the outer lane's centre line is 4.75 m out from the block edge and the
+ * widest traffic body (the 2.0 m van) reaches 1.0 m either side of it. `roadLap` is set so the parked flank stops
+ * `KERB_PARK.laneClear` short of that envelope, which lands the car's two road-side wheels on the asphalt and its two
+ * kerb-side wheels up on the pavement — the renderer rolls the body over the kerb (CityRendererProps' `kerbStance`).
+ * The footway keeps ~1.6 m clear.
+ *
+ * `pointClear` is 11 m, not the 3.5 it was while the strip stood on the pavement: a dressing car in the kerb lane
+ * within a couple of car lengths of a named point stands in the lane the gameplay vehicle that spawns at that point
+ * has to pull out into (scripts/tests/physics.test.ts drives out of the player spawn and measures the run-up).
  */
-const KERB = { kerbGap: 0.08, endClear: 6, gapMin: 0.7, gapMax: 1.8, pad: 0.3, hydrantClear: 1.5, shelterClear: 3.2, pointClear: 3.5, height: 1.5 } as const;
+const KERB = { roadLap: 0.45, endClear: 6, gapMin: 0.7, gapMax: 1.8, pad: 0.3, hydrantClear: 1.5, shelterClear: 3.2, pointClear: 11, height: 1.5 } as const;
+/**
+ * The kerb-lane geometry the parking strip is fitted to, exported so `scripts/tests/city.test.ts` asserts the same
+ * numbers the generator uses: half the widest traffic body, the outer lane's centre line measured out from the block
+ * edge, the margin left between a parked flank and that body envelope, and how far a parked flank laps the asphalt.
+ */
+export const KERB_PARK = {
+  roadLap: KERB.roadLap, laneClear: 0.30, bodyHalf: 1.0,
+  outerLaneOff: ROAD_W / 2 - (LANES_PER_DIR - 0.5) * LANE_W,
+} as const;
 
 /**
  * Street clutter (all placed after the lamps, trees and hydrants and before the kerbside cars, so the cars leave gaps
@@ -460,7 +482,9 @@ export function addKerbsideParking(ctx: GenContext, rng: Random): void {
     if (p.kind === 'hydrant') avoid.push({ x: p.x, z: p.z, r: KERB.hydrantClear });
     else if (p.kind === 'shelter') avoid.push({ x: p.x, z: p.z, r: KERB.shelterClear });
   }
-  const kerbOff = SIDEWALK_W - KERB.kerbGap; // road-side flank this far outside the block edge (0.08 m off the asphalt)
+  // Road-side flank this far outside the block edge: inside the asphalt by KERB.roadLap, and clear of the outer
+  // traffic lane's body envelope by at least KERB.laneClear (asserted by scripts/tests/city.test.ts).
+  const kerbOff = SIDEWALK_W + KERB.roadLap;
   for (let bi = 0; bi < ctx.blocks.length; bi++) {
     const b = ctx.blocks[bi];
     const fill = KERB_FILL[districtOf(b.col, b.row)];
@@ -595,4 +619,3 @@ export function spawnSpotCount(ctx: GenContext, spawn: NamedPoint): number {
 }
 
 void CITY_MAX_X;
-void ROAD_W;

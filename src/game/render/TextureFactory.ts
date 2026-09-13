@@ -246,32 +246,73 @@ export class TextureFactory {
     const n = W * H;
     const filled = new Uint8Array(n);
     for (let i = 0; i < n; i++) filled[i] = d[i * 4 + 3] > 0 ? 1 : 0;
-    const added: number[] = [];
-    for (let p = 0; p < passes; p++) {
-      added.length = 0;
-      for (let y = 0; y < H; y++) {
-        for (let x = 0; x < W; x++) {
-          const k = y * W + x;
-          if (filled[k]) continue;
-          let r = 0, g = 0, b = 0, c = 0;
-          for (let oy = -1; oy <= 1; oy++) {
-            const yy = y + oy;
-            if (yy < 0 || yy >= H) continue;
-            for (let ox = -1; ox <= 1; ox++) {
-              const xx = x + ox;
-              if (xx < 0 || xx >= W) continue;
-              const j = yy * W + xx;
-              if (!filled[j]) continue;
-              r += d[j * 4]; g += d[j * 4 + 1]; b += d[j * 4 + 2]; c++;
-            }
+    // Frontier walk, not a full re-scan per pass: only the ring of empty pixels touching the filled set can gain a
+    // colour in a given pass, and that ring is the shape's perimeter, not its bounding box. The old full scan was
+    // passes x W x H x 9, which is 7 M operations on the 256 px frond sheet and 450 M once a sheet is 1024 px - the
+    // difference between 10 ms and several seconds of boot.
+    let frontier: number[] = [];
+    let next: number[] = [];
+    const queued = new Uint8Array(n);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const k = y * W + x;
+        if (!filled[k] || queued[k]) continue;
+        for (let oy = -1; oy <= 1; oy++) {
+          const yy = y + oy;
+          if (yy < 0 || yy >= H) continue;
+          for (let ox = -1; ox <= 1; ox++) {
+            const xx = x + ox;
+            if (xx < 0 || xx >= W) continue;
+            const j = yy * W + xx;
+            if (filled[j] || queued[j]) continue;
+            queued[j] = 1;
+            frontier.push(j);
           }
-          if (!c) continue;
-          d[k * 4] = r / c; d[k * 4 + 1] = g / c; d[k * 4 + 2] = b / c;
-          added.push(k);
         }
       }
+    }
+    const added: number[] = [];
+    for (let p = 0; p < passes && frontier.length; p++) {
+      added.length = 0;
+      for (let i = 0; i < frontier.length; i++) {
+        const k = frontier[i];
+        const x = k % W, y = (k - x) / W;
+        let r = 0, g = 0, b = 0, c = 0;
+        for (let oy = -1; oy <= 1; oy++) {
+          const yy = y + oy;
+          if (yy < 0 || yy >= H) continue;
+          for (let ox = -1; ox <= 1; ox++) {
+            const xx = x + ox;
+            if (xx < 0 || xx >= W) continue;
+            const j = yy * W + xx;
+            if (!filled[j]) continue;
+            r += d[j * 4]; g += d[j * 4 + 1]; b += d[j * 4 + 2]; c++;
+          }
+        }
+        if (!c) continue;
+        d[k * 4] = r / c; d[k * 4 + 1] = g / c; d[k * 4 + 2] = b / c;
+        added.push(k);
+      }
       if (!added.length) break;
-      for (let i = 0; i < added.length; i++) filled[added[i]] = 1;
+      next.length = 0;
+      for (let i = 0; i < added.length; i++) {
+        const k = added[i];
+        filled[k] = 1;
+        const x = k % W, y = (k - x) / W;
+        for (let oy = -1; oy <= 1; oy++) {
+          const yy = y + oy;
+          if (yy < 0 || yy >= H) continue;
+          for (let ox = -1; ox <= 1; ox++) {
+            const xx = x + ox;
+            if (xx < 0 || xx >= W) continue;
+            const j = yy * W + xx;
+            if (filled[j] || queued[j]) continue;
+            queued[j] = 1;
+            next.push(j);
+          }
+        }
+      }
+      const swap = frontier; frontier = next; next = swap;
     }
     ctx.putImageData(img, 0, 0);
   }
@@ -761,12 +802,37 @@ export class TextureFactory {
     capWash.addColorStop(1, rgba(58, 52, 43, 0));
     m.ctx.fillStyle = capWash;
     m.ctx.fillRect(0, top, W, rh * 0.6);
-    // Colour-temperature banding every 3-4 floors (a change of contractor, a later extension), faint and broad.
-    const bandRows = 3 + (seed % 2);
+    // Storey tone ladder. Round 9 had this as a +-5 % colour-TEMPERATURE band every 3-4 floors, which is a hue shift
+    // of about one grey level: at 12 m the wall between the windows still read as one flat RGB fill, which was the
+    // single loudest note in the last critique of the facades. It is now a VALUE ladder - four flat steps spanning
+    // about 9 % of the wall's lightness, one per storey, in a 4-long order picked by the seed so neighbouring
+    // buildings do not stripe in step and the pattern does not read as a regular zebra. Flat steps, hard edges: a
+    // stylised facade is painted in bands, and a gradient here would just be the blurred wash it replaces.
+    const LADDER: readonly number[][] = [[0, -0.055, 0.03, -0.025], [0.035, -0.02, -0.06, 0.015], [-0.045, 0.025, 0, -0.03]];
+    const ladder = LADDER[seed % LADDER.length];
     for (let row = 0; row < rows; row++) {
-      const warmBand = Math.floor((row + seed) / bandRows) % 2 === 0;
-      m.ctx.fillStyle = warmBand ? rgba(255, 222, 182, 0.05) : rgba(192, 206, 234, 0.045);
+      const v = ladder[row % ladder.length];
+      // A warm/cool tilt rides on top of the value step, so a run of storeys still changes temperature as well as tone.
+      const warm = ((row + seed) & 2) === 0;
+      if (v !== 0) {
+        m.ctx.fillStyle = v < 0 ? rgba(38, 34, 30, -v) : rgba(255, 250, 240, v);
+        m.ctx.fillRect(0, top + row * rh, W, rh);
+      }
+      m.ctx.fillStyle = warm ? rgba(255, 222, 182, 0.045) : rgba(192, 206, 234, 0.04);
       m.ctx.fillRect(0, top + row * rh, W, rh);
+      // The storey line itself: the floor slab edge, a 2-design-px dark rule with a lit lip under it. Thin, hard and
+      // horizontal - it survives to 25 m where a tonal band alone would average out, and it is what makes a wall read
+      // as stacked floors rather than as one extrusion.
+      m.ctx.fillStyle = rgba(24, 22, 20, 0.20);
+      m.ctx.fillRect(0, top + row * rh, W, 2 * P);
+      m.ctx.fillStyle = rgba(255, 252, 245, 0.09);
+      m.ctx.fillRect(0, top + row * rh + 2 * P, W, 1.5 * P);
+      // Soiling below it: what the storey above sheds, over the top eighth of the band.
+      const soil = m.ctx.createLinearGradient(0, top + row * rh, 0, top + row * rh + rh * 0.16);
+      soil.addColorStop(0, rgba(52, 46, 38, 0.13));
+      soil.addColorStop(1, rgba(52, 46, 38, 0));
+      m.ctx.fillStyle = soil;
+      m.ctx.fillRect(0, top + row * rh, W, rh * 0.16);
     }
     // Style structure drawn before the glazing: flat pilasters between the art deco columns, panel joints on precast.
     if (style === 'artdeco') {
@@ -2466,10 +2532,30 @@ export class TextureFactory {
   private tyreBand(ctx: CanvasRenderingContext2D, S: number, px: number, cu: number, w: number, alpha: number): void {
     const x0 = cu * px - (w / 2) * px, x1 = cu * px + (w / 2) * px;
     const g = ctx.createLinearGradient(x0, 0, x1, 0);
+    // Flat-topped, not a bell. The band holds its value across 80 % of its width and turns over in the last tenth, so
+    // at 3 m it reads as a painted tone band with an edge rather than as one more soft blotch - which is what the
+    // 0.3/0.7 bell it replaces became once the mip chain and the aggregate wash had been through it.
     g.addColorStop(0, rgba(236, 233, 222, 0));
-    g.addColorStop(0.3, rgba(236, 233, 222, alpha));
-    g.addColorStop(0.7, rgba(236, 233, 222, alpha));
+    g.addColorStop(0.1, rgba(236, 233, 222, alpha));
+    g.addColorStop(0.9, rgba(236, 233, 222, alpha));
     g.addColorStop(1, rgba(236, 233, 222, 0));
+    ctx.fillStyle = g;
+    ctx.fillRect(x0, 0, x1 - x0, S);
+  }
+
+  /**
+   * The dark counterpart of a wheel path: the strip BETWEEN a lane's two tracks, where nothing burnishes the chippings
+   * and the grit, oil and rubber crumb collect. Real carriageways alternate pale-dark-pale across every lane, and it
+   * is that alternation - not the aggregate - that tells the eye at 3 m that a road is driven along rather than
+   * poured. Same flat-topped profile as tyreBand.
+   */
+  private crownBand(ctx: CanvasRenderingContext2D, S: number, px: number, cu: number, w: number, alpha: number): void {
+    const x0 = cu * px - (w / 2) * px, x1 = cu * px + (w / 2) * px;
+    const g = ctx.createLinearGradient(x0, 0, x1, 0);
+    g.addColorStop(0, rgba(20, 20, 23, 0));
+    g.addColorStop(0.16, rgba(20, 20, 23, alpha));
+    g.addColorStop(0.84, rgba(20, 20, 23, alpha));
+    g.addColorStop(1, rgba(20, 20, 23, 0));
     ctx.fillStyle = g;
     ctx.fillRect(x0, 0, x1 - x0, S);
   }
@@ -2489,15 +2575,28 @@ export class TextureFactory {
       const w = rng.range(1.6, 4.2) * px, h = rng.range(1.1, 2.6) * px;
       const x = rng.range(0.6 * px, S - w - 0.6 * px), y = rng.range(0, S - h);
       const dark = rng.chance(0.55);
-      // The fill: a shade off the surrounding bitumen either way, never more than a few per cent.
-      ctx.fillStyle = dark ? rgba(18, 19, 22, rng.range(0.16, 0.28)) : rgba(126, 124, 117, rng.range(0.1, 0.17));
+      // The FILL is now a whisper - a third of what it was. At 0.16-0.28 alpha a dark quad is a 12 % tone step, and a
+      // step that size bounded by four straight lines is exactly the "straight-edged lighter or darker rectangle
+      // mid-road with no geometric justification" the last pass flagged: the eye reads the boundary, not the patch.
+      // What actually says "this was dug up and re-laid" is the SEAM, so the seam stays at full strength and the
+      // fill only has to be a different shade of the same bitumen.
+      ctx.fillStyle = dark ? rgba(18, 19, 22, rng.range(0.05, 0.10)) : rgba(126, 124, 117, rng.range(0.035, 0.065));
       ctx.beginPath();
-      // Irregular quad: a rectangle with each corner pulled in or out by up to 0.25 m, the way a saw cut wanders.
-      const j = (): number => rng.range(-0.25, 0.25) * px;
-      ctx.moveTo(x + j(), y + j());
-      ctx.lineTo(x + w + j(), y + j());
-      ctx.lineTo(x + w + j(), y + h + j());
-      ctx.lineTo(x + j(), y + h + j());
+      // A saw cut wanders: each side gets three intermediate points as well as its corners, jittered along and across,
+      // so no edge of the patch is a straight line more than a metre long.
+      const j = (): number => rng.range(-0.22, 0.22) * px;
+      const side = (ax: number, ay: number, bx: number, by: number): void => {
+        for (let t = 1; t <= 4; t++) {
+          const u = t / 4;
+          ctx.lineTo(ax + (bx - ax) * u + (t < 4 ? j() : 0), ay + (by - ay) * u + (t < 4 ? j() : 0));
+        }
+      };
+      const cx0 = x + j(), cy0 = y + j(), cx1 = x + w + j(), cy1 = y + j(), cx2 = x + w + j(), cy2 = y + h + j(), cx3 = x + j(), cy3 = y + h + j();
+      ctx.moveTo(cx0, cy0);
+      side(cx0, cy0, cx1, cy1);
+      side(cx1, cy1, cx2, cy2);
+      side(cx2, cy2, cx3, cy3);
+      side(cx3, cy3, cx0, cy0);
       ctx.closePath();
       ctx.fill();
       // Its seam: one thin line at the contrast of the fill - visible at 3 m, a tone edge by 20.
@@ -2544,16 +2643,24 @@ export class TextureFactory {
     // strongest tonal event a street has across its width. Steep on purpose - a broad, gentle fall reads as vignette.
     across([[0, 0.3], [0.017, 0.2], [0.043, 0.075], [0.12, 0.02], [0.3, 0], [0.46, 0.05], [0.54, 0.05], [0.7, 0],
       [0.88, 0.02], [0.957, 0.075], [0.983, 0.2], [1, 0.3]], false);
-    // Gutter line: the channel the water runs in, 0.13 m of grit-dark bitumen 0.22 m off each kerb.
-    for (const side of [0.22, ROAD_TILE_M - 0.35]) {
-      ctx.fillStyle = rgba(16, 16, 18, 0.3);
-      ctx.fillRect(side * px, 0, 0.13 * px, S);
-      ctx.fillStyle = rgba(150, 148, 140, 0.05);
-      ctx.fillRect((side + 0.13) * px, 0, 0.06 * px, S);
+    // Gutter: the channel the water runs in. A defined three-step section, not one faint line - 0.10 m of silt at the
+    // kerb face, 0.18 m of grit-dark bitumen, then a pale lip where the channel turns back up into the carriageway.
+    // A gutter is the one edge condition a pedestrian is always within two metres of, and at 0.05 alpha its lip was
+    // invisible from the pavement.
+    for (const side of [0.22, ROAD_TILE_M - 0.4]) {
+      ctx.fillStyle = rgba(92, 88, 78, 0.14);
+      ctx.fillRect((side - 0.1) * px, 0, 0.1 * px, S);
+      ctx.fillStyle = rgba(16, 16, 18, 0.38);
+      ctx.fillRect(side * px, 0, 0.18 * px, S);
+      ctx.fillStyle = rgba(168, 165, 156, 0.12);
+      ctx.fillRect((side + 0.18) * px, 0, 0.09 * px, S);
     }
-    // Two polished tyre bands per lane (lane centres at +-1.75 and +-5.25 m, track gauge 1.56 m), and nothing pale
-    // over the crown or the gutters: that alternation is what makes a carriageway read as driven along.
-    for (const cu of [0.95, 2.53, 4.47, 6.05, 7.95, 9.53, 11.47, 13.05]) this.tyreBand(ctx, S, px, cu, 0.62, 0.075);
+    // Two polished tyre bands per lane (lane centres at +-1.75 and +-5.25 m, track gauge 1.56 m) with the grit strip
+    // between them: that pale-dark-pale alternation across every lane is what makes a carriageway read as driven
+    // along. Raised from 0.075 - by the time the de-dither blur, the aggregate wash and mip 0's own magnification at
+    // 3 m had been through it, a 7 % band on bitumen was below the threshold where anything reads as a band at all.
+    for (const cu of [0.95, 2.53, 4.47, 6.05, 7.95, 9.53, 11.47, 13.05]) this.tyreBand(ctx, S, px, cu, 0.62, 0.115);
+    for (const cu of [1.74, 5.26, 8.74, 12.26]) this.crownBand(ctx, S, px, cu, 0.82, 0.085);
     // Reinstatements and the joints between paving runs; the joints sit just outside the lane lines.
     this.asphaltPatches(ctx, S, px, rng, 4, [0.253, 0.747]);
     across([[0, 0], [0.13, 0], [0.26, 0.03], [0.47, 0], [0.53, 0], [0.74, 0.03], [0.87, 0], [1, 0]], true);
@@ -2690,32 +2797,40 @@ export class TextureFactory {
     const key = 'roadMarks';
     const c = this.cache.get(key) as THREE.CanvasTexture | undefined;
     if (c) return c;
-    const S = 256, half = S / 2;
+    // 512, not the old 256. A lane arrow is a 2.4 x 4.4 m decal mapped to ONE cell of this 2 x 2 atlas, so at 256 its
+    // cell carried 53 x 29 px per metre against the road tile's own 73: the arrow's alpha edge was a 3.4 cm ramp,
+    // which at 2 m from the eye is a 20 px feather, while the dashed lane line printed INTO the road tile 20 m away
+    // stayed hard. That mismatch - blurry paint in the near field, crisp paint in the far - was the bug. 512 puts the
+    // cell at 107 x 58 px/m and the edge at 1.9 cm, and a 2560 x 1440 crop of the road from 2 m cannot be told from
+    // the same crop at 1024 (measured: both read as hard-edged paint), so the extra 4 MB that 1024 costs buys
+    // nothing. +1.0 MB against the ~113 MB texture budget.
+    const S = 512, half = S / 2, q = S / 256;
     const { canvas, ctx } = this.canvas(S, S);
     ctx.clearRect(0, 0, S, S);
     const paint = 'rgba(232,232,222,0.92)';
-    // Cell origin (ox, oy) in canvas space; the arrow points toward canvas -y (= +v).
+    // Cell origin (ox, oy) in canvas space; the arrow points toward canvas -y (= +v). All numbers are in the original
+    // 256 px design space, scaled by q.
     const arrow = (ox: number, oy: number, side: 0 | -1 | 1): void => {
       ctx.fillStyle = paint;
       const cx = ox + half / 2;
-      ctx.fillRect(cx - 8, oy + 40, 16, half - 52);
+      ctx.fillRect(cx - 8 * q, oy + 40 * q, 16 * q, half - 52 * q);
       ctx.beginPath();
-      ctx.moveTo(cx, oy + 12);
-      ctx.lineTo(cx + 26, oy + 52);
-      ctx.lineTo(cx + 9, oy + 52);
-      ctx.lineTo(cx + 9, oy + 62);
-      ctx.lineTo(cx - 9, oy + 62);
-      ctx.lineTo(cx - 9, oy + 52);
-      ctx.lineTo(cx - 26, oy + 52);
+      ctx.moveTo(cx, oy + 12 * q);
+      ctx.lineTo(cx + 26 * q, oy + 52 * q);
+      ctx.lineTo(cx + 9 * q, oy + 52 * q);
+      ctx.lineTo(cx + 9 * q, oy + 62 * q);
+      ctx.lineTo(cx - 9 * q, oy + 62 * q);
+      ctx.lineTo(cx - 9 * q, oy + 52 * q);
+      ctx.lineTo(cx - 26 * q, oy + 52 * q);
       ctx.closePath();
       ctx.fill();
       if (side !== 0) {
-        const sx = cx + side * 30;
-        ctx.fillRect(cx - 8, oy + half - 46, side > 0 ? 34 : -34, 14);
+        const sx = cx + side * 30 * q;
+        ctx.fillRect(cx - 8 * q, oy + half - 46 * q, side > 0 ? 34 * q : -34 * q, 14 * q);
         ctx.beginPath();
-        ctx.moveTo(sx + side * 14, oy + half - 39);
-        ctx.lineTo(sx - side * 4, oy + half - 60);
-        ctx.lineTo(sx - side * 4, oy + half - 18);
+        ctx.moveTo(sx + side * 14 * q, oy + half - 39 * q);
+        ctx.lineTo(sx - side * 4 * q, oy + half - 60 * q);
+        ctx.lineTo(sx - side * 4 * q, oy + half - 18 * q);
         ctx.closePath();
         ctx.fill();
       }
@@ -2724,8 +2839,8 @@ export class TextureFactory {
     arrow(half, 0, -1);      // top-right    -> MARK_UV.left
     arrow(0, half, 1);       // bottom-left  -> MARK_UV.right
     ctx.fillStyle = paint;   // bottom-right -> MARK_UV.bar
-    ctx.fillRect(half + 3, half + 3, half - 6, half - 6);
-    this.bleedAlpha(ctx, S, S, 12);
+    ctx.fillRect(half + 3 * q, half + 3 * q, half - 6 * q, half - 6 * q);
+    this.bleedAlpha(ctx, S, S, 12 * q);
     const t = this.finish(key, canvas, true, false);
     // Per-CELL mip chain. The atlas is a 2 x 2 grid and a decal quad maps exactly one cell, so every level the GPU
     // builds by a plain box filter over the whole image folds the neighbouring cells into this one's edges: by mip 3

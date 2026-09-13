@@ -7,7 +7,7 @@ import { FACADE_RANGE, FacadeDetailRenderer } from '../../src/game/render/Facade
 import { MeshStandardMaterial, Scene, ShaderChunk } from 'three';
 import type { BufferGeometry } from 'three';
 import { Random } from '../../src/game/core/Random';
-import { SKY_KEYS } from '../../src/game/render/SkySystem';
+import { SHADOW_PENUMBRA, SHADOW_RADIUS, SKY_KEYS } from '../../src/game/render/SkySystem';
 import { ContactShadows, SHADOW_TUNING } from '../../src/game/render/ContactShadows';
 import { BUDGET } from '../../src/game/core/Budget';
 import { Vehicle } from '../../src/game/entities/Vehicle';
@@ -422,6 +422,16 @@ test('SkySystem: the shadow chunk is patched for both a soft penumbra and the bo
   expect(!!weight, 'the tap sum carries a scale');
   expect(Math.abs(taps * Number(weight?.[1]) - 1) < 1e-4, `taps x scale = 1 (got ${taps} x ${weight?.[1]})`);
   expect(chunk.includes('edgeT'), 'edge fade patch still applied (round 8 shadow-box border)');
+  // Round 10: the NEAR rung of the blocker ladder is what decides whether a person, a car or a palm casts a shadow
+  // you can name or a grey smear. The box is 132 m over 2048 texels, so a texel is 6.45 cm; keep the near disk at or
+  // under ~0.1 m or every caster within a few metres of the ground dissolves again (round 9 ran it at 0.45 m).
+  const nearTexels = SHADOW_RADIUS * SHADOW_PENUMBRA.near;
+  expect(nearTexels <= 1.6, `the near rung of the penumbra ladder is <= 1.6 texels (got ${nearTexels.toFixed(2)})`);
+  expect(SHADOW_PENUMBRA.nearM > 2, `the near rung reaches past a standing figure's height (got ${SHADOW_PENUMBRA.nearM} m)`);
+  // Two dz thresholds = a three-rung ladder. One threshold is what round 9 had, and a single step at 1.5 m put every
+  // caster taller than a kerb straight into the widest disk.
+  const probes = (chunk.match(/shadowCoord\.z - 0\./g) || []).length;
+  expect(probes === 4, `the ladder takes four blocker probes, two per rung (got ${probes})`);
 });
 
 test('BuildingGeometry: the roof cornice carries its own shadow line (a vertex ramp down the fillet)', () => {

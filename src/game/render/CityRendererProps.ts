@@ -24,12 +24,14 @@ import type { LotProp, ParkedCar, ParkedSpec, Prop } from '../city/CityData';
 import { CURB_H } from '../city/CityConfig';
 import { HEDGE } from '../city/CityLots';
 import { SPECS } from '../entities/VehicleSpecs';
+import type { VehicleSpec } from '../entities/VehicleSpecs';
+import { clamp } from '../core/math';
 import { Random } from '../core/Random';
 import type { Materials } from './Materials';
 import { LEAF_TILE_M } from './PropTextures';
-import { ContactShadows } from './ContactShadows';
+import { ContactShadows, groundYAt } from './ContactShadows';
 import { surface, tube, type Ring } from './PlayerRenderer';
-import { makeVehiclePaintMaterial, parkedMidGeometry, parkedNearGeometry, parkedShellGeometry } from './VehicleRenderer';
+import { VEHICLE_RENDER, makeVehiclePaintMaterial, parkedMidGeometry, parkedNearGeometry, parkedShellGeometry, setPaintNight } from './VehicleRenderer';
 
 export const PROP_DIMS = { palmTrunkH: 6.4, palmFrondLen: 4.4, palmFrondW: 2.3, lampH: 6.5, lampArm: 1.4, poolRadius: 5.5 } as const;
 
@@ -1101,13 +1103,48 @@ interface PropGroup {
   inst: THREE.InstancedMesh[];
 }
 
-/** Composes the placement matrix into `mat`. */
-function placementMatrix(x: number, z: number, yaw: number, scale: number, y: number): THREE.Matrix4 {
+/**
+ * Composes the placement matrix into `mat`. `roll` tips the placement about its own long axis (the model's local z,
+ * applied INSIDE the yaw by the YXZ order), which is what lets a kerbside car stand with two wheels on the asphalt
+ * and two up on the pavement instead of levitating over one surface or sinking into the other.
+ */
+function placementMatrix(x: number, z: number, yaw: number, scale: number, y: number, roll = 0): THREE.Matrix4 {
   dummy.position.set(x, y, z);
-  dummy.rotation.set(0, yaw, 0);
+  dummy.rotation.order = 'YXZ';
+  dummy.rotation.set(0, yaw, roll);
   dummy.scale.set(scale, scale, scale);
   dummy.updateMatrix();
   return mat.copy(dummy.matrix);
+}
+
+/**
+ * Stance of one static parked car: the height its body sits at, the roll that lands all four wheels on the ground and
+ * the height its contact blob lies at.
+ *
+ * A kerbside bay is half asphalt, half footway (see CityProps' KERB.roadLap: the carriageway has no spare parking
+ * lane, so a parked car straddles the kerb with its road-side wheels down and its kerb-side wheels up). Sampling the
+ * cosmetic ground under the two wheel lines and rolling the body by the difference turns what would be a car
+ * levitating 15 cm over one half of its footprint into a deliberate two-wheels-on-the-pavement stance. The blob stays
+ * on the HIGHER of the two surfaces: at the few degrees of view a blob is seen from, the parallax of the road-side
+ * third of it hovering a kerb height up is a couple of centimetres, while dropping it to road level would bury two
+ * thirds of it under the pavement.
+ */
+interface CarStance { y: number; roll: number; shadowY: number }
+const carStance: CarStance = { y: 0, roll: 0, shadowY: 0 };
+function flatStance(y: number): CarStance {
+  carStance.y = y; carStance.roll = 0; carStance.shadowY = y;
+  return carStance;
+}
+function kerbStance(x: number, z: number, yaw: number, spec: VehicleSpec): CarStance {
+  // right2D(forward(yaw)) = (-cos yaw, sin yaw); the wheel lines sit `track` either side of the centre line.
+  const track = spec.width * 0.5 - VEHICLE_RENDER.wheelWidth * 0.5;
+  const rx = -Math.cos(yaw) * track, rz = Math.sin(yaw) * track;
+  const yRight = groundYAt(x + rx, z + rz), yLeft = groundYAt(x - rx, z - rz);
+  carStance.y = (yLeft + yRight) * 0.5;
+  // The model's local +x maps to world -right2D, i.e. the LEFT flank, and a positive roll about local z lifts it.
+  carStance.roll = Math.asin(clamp((yLeft - yRight) / (2 * track), -0.5, 0.5));
+  carStance.shadowY = Math.max(yLeft, yRight);
+  return carStance;
 }
 
 /**
@@ -1206,6 +1243,9 @@ export class PropRenderer {
   private carZ = new Float32Array(0);
   private carYaw = new Float32Array(0);
   private carY = new Float32Array(0);
+  /** Roll about the car's own long axis (kerb cars straddle the kerb) and the height its contact blob lies at. */
+  private carRoll = new Float32Array(0);
+  private carShadowY = new Float32Array(0);
   private carColour = new Int32Array(0);
   private carGeo = new Int32Array(0);
   private carCoarse = new Int32Array(0);
@@ -1351,9 +1391,9 @@ export class PropRenderer {
 
     // --- groups ------------------------------------------------------------------------------------------------
     const target = (b: Batch, n: number): BatchTarget => ({ mesh: b.mesh, ids: new Int32Array(Math.max(1, n)).fill(-1) });
-    const add = (b: Batch, geo: number, x: number, z: number, yaw: number, scale: number, y: number, tint: THREE.Color | null): number => {
+    const add = (b: Batch, geo: number, x: number, z: number, yaw: number, scale: number, y: number, tint: THREE.Color | null, roll = 0): number => {
       const id = b.mesh.addInstance(geo);
-      b.mesh.setMatrixAt(id, placementMatrix(x, z, yaw, scale, y));
+      b.mesh.setMatrixAt(id, placementMatrix(x, z, yaw, scale, y, roll));
       if (tint) b.mesh.setColorAt(id, tint);
       return id;
     };
@@ -1440,19 +1480,24 @@ export class PropRenderer {
     this.carZ = new Float32Array(Math.max(1, parked.length));
     this.carYaw = new Float32Array(Math.max(1, parked.length));
     this.carY = new Float32Array(Math.max(1, parked.length));
+    this.carRoll = new Float32Array(Math.max(1, parked.length));
+    this.carShadowY = new Float32Array(Math.max(1, parked.length));
     this.carColour = new Int32Array(Math.max(1, parked.length));
     this.carGeo = new Int32Array(Math.max(1, parked.length));
     this.carCoarse = new Int32Array(Math.max(1, parked.length));
     for (let i = 0; i < parked.length; i++) {
       const p = parked[i];
       const lot = p.at === 'lot';
-      const g = lot ? lotCarG : kerbCarG, y = lot ? LOT_FLOOR_Y : CURB_H;
-      const k = push(g, p.x, p.z, p.yaw, 1, y);
+      const g = lot ? lotCarG : kerbCarG;
       const spec = PARKED_SPECS.indexOf(p.spec);
-      const id = add(parkedB, parkedB.geo[spec], p.x, p.z, p.yaw, 1, y, scratchColor.setHex(p.colour));
+      const stance = lot ? flatStance(LOT_FLOOR_Y) : kerbStance(p.x, p.z, p.yaw, SPECS[PARKED_SPECS[spec]]);
+      const y = stance.y, roll = stance.roll;
+      const k = push(g, p.x, p.z, p.yaw, 1, y);
+      const id = add(parkedB, parkedB.geo[spec], p.x, p.z, p.yaw, 1, y, scratchColor.setHex(p.colour), roll);
       g.batched[0].ids[k] = id;
       const c = this.carCount++;
       this.carX[c] = p.x; this.carZ[c] = p.z; this.carYaw[c] = p.yaw; this.carY[c] = y;
+      this.carRoll[c] = roll; this.carShadowY[c] = stance.shadowY;
       this.carColour[c] = p.colour; this.carGeo[c] = spec; this.carCoarse[c] = id;
     }
     this.lampX = new Float32Array(Math.max(1, lampXs.length));
@@ -1495,6 +1540,9 @@ export class PropRenderer {
   update(camX: number, camZ: number): void {
     const n = this.materials.nightFactor;
     this.glowMat.opacity = n * GLOW_OPACITY;
+    // The parked shells' paint needs the night factor for its own reason: a street lamp is a point light three metres
+    // from a parked flank, and a mirror clearcoat turns that into a blown white disc (see CLEARCOAT_NIGHT).
+    setPaintNight(this.paintMat, n);
     if (this.wireMat) this.wireMat.opacity = 0.85 - 0.35 * n;
     this.aimLampLights(camX, camZ, n);
     const tdx = camX - this.tierX, tdz = camZ - this.tierZ;
@@ -1599,7 +1647,7 @@ export class PropRenderer {
     for (let k = 0; k < picked; k++) {
       const i = this.pickIdx[k];
       mesh.setGeometryIdAt(k, geo[this.carGeo[i]]);
-      mesh.setMatrixAt(k, placementMatrix(this.carX[i], this.carZ[i], this.carYaw[i], 1, this.carY[i]));
+      mesh.setMatrixAt(k, placementMatrix(this.carX[i], this.carZ[i], this.carYaw[i], 1, this.carY[i], this.carRoll[i]));
       mesh.setColorAt(k, scratchColor.setHex(this.carColour[i]));
       mesh.setVisibleAt(k, true);
       coarse.setVisibleAt(this.carCoarse[i], false);
@@ -1643,7 +1691,7 @@ export class PropRenderer {
     for (let k = 0; k < picked; k++) {
       const i = this.pickIdx[k];
       const spec = SPECS[PARKED_SPECS[this.carGeo[i]]];
-      this.carShadows.add(this.carX[i], this.carY[i] + CAR_SHADOWS.lift, this.carZ[i],
+      this.carShadows.add(this.carX[i], this.carShadowY[i] + CAR_SHADOWS.lift, this.carZ[i],
         spec.width * 0.5 * CAR_SHADOWS.w, spec.length * 0.5 * CAR_SHADOWS.l, this.carYaw[i], 1);
     }
     this.carShadows.end();

@@ -3,6 +3,7 @@ import { BUDGET } from '../core/Budget';
 import { BLOCK, GRID_COLS, GRID_ROWS, INTERSECTION_R, LANE_W, PLAZA_BLOCKS } from './CityConfig';
 import type { GeneratedCity } from './CityGenerator';
 import { colliderDistance, distToNearestRoadNode, onRoad } from './CityBuild';
+import { KERB_PARK } from './CityProps';
 import type { CityData } from './CityData';
 
 const POINT_CLEARANCE = 0.6;
@@ -105,15 +106,24 @@ export function validateCity(g: GeneratedCity): string[] {
     const pr = city.props[i];
     if (onRoad(roads, pr.x, pr.z, LANE_W / 2)) out.push(`prop ${i} (${pr.kind}) is on a lane`);
   }
-  // Colliders (except water/boundary) never intrude on lanes or intersections.
+  // Colliders (except water/boundary) never intrude on the space a car actually drives through.
+  //
+  // The test is the BODY ENVELOPE of the widest traffic vehicle (KERB_PARK.bodyHalf), not the full lane half-width.
+  // The four 3.5 m lanes tile the whole 14 m carriageway, so a lane-half-width rule means "nothing may stand on the
+  // asphalt at all" - and the kerbside parking strip deliberately laps the kerb lane by KERB_PARK.roadLap, because a
+  // parked car standing entirely on the 3 m footway blocks the pavement and reads, from the street, as parked on the
+  // shop terrace. Everything else in the city stands at or behind the kerb line, 1.75 m from the outer lane centre,
+  // so it passes either rule unchanged; and the strip itself leaves KERB_PARK.laneClear on top of this envelope, so a
+  // parked flank is never a rounding error away from failing.
+  const bodyHalf = KERB_PARK.bodyHalf;
   for (let i = 0; i < city.staticColliders.length; i++) {
     const c = city.staticColliders[i];
     if (c.tag === 'water' || c.tag === 'boundary') continue;
     const s = c.shape;
     if (s.kind === 'circle') {
-      if (onRoad(roads, s.cx, s.cz, LANE_W / 2 + s.r)) out.push(`collider ${i} (${c.tag}) overlaps a lane`);
+      if (onRoad(roads, s.cx, s.cz, bodyHalf + s.r)) out.push(`collider ${i} (${c.tag}) overlaps a lane`);
     } else {
-      const bad = onRoad(roads, s.minX, s.minZ, LANE_W / 2) || onRoad(roads, s.maxX, s.minZ, LANE_W / 2) || onRoad(roads, s.minX, s.maxZ, LANE_W / 2) || onRoad(roads, s.maxX, s.maxZ, LANE_W / 2) || onRoad(roads, (s.minX + s.maxX) / 2, (s.minZ + s.maxZ) / 2, LANE_W / 2);
+      const bad = onRoad(roads, s.minX, s.minZ, bodyHalf) || onRoad(roads, s.maxX, s.minZ, bodyHalf) || onRoad(roads, s.minX, s.maxZ, bodyHalf) || onRoad(roads, s.maxX, s.maxZ, bodyHalf) || onRoad(roads, (s.minX + s.maxX) / 2, (s.minZ + s.maxZ) / 2, bodyHalf);
       if (bad) out.push(`collider ${i} (${c.tag}) overlaps a lane`);
     }
   }

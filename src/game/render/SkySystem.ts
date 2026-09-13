@@ -46,26 +46,46 @@ const SHADOW_FADE = 0.1;
  * getPointShadow tails work in cube space, where there is no border to fade.
  */
 /**
- * Penumbra of the sun / moon shadow, in shadow-map texels of the widest disk (see patchShadowPenumbra). The box is
- * 132 m over 2048 texels, so a texel is 6.45 cm and 7 of them is a 0.45 m soft edge: enough that a facade shadow
- * thrown 30 m down a street stops being a one-pixel stencil cut, and not so much that a kerb loses its contact.
+ * WIDEST penumbra of the sun / moon shadow, in shadow-map texels: the disk a blocker tens of metres up gets. The box
+ * is 132 m over 2048 texels, so a texel is 6.45 cm and 6 of them is a 0.39 m soft edge.
+ *
+ * This is a ceiling, not the usual case. Round 9 applied ~7 texels to nearly everything, which is 0.45 m of blur: a
+ * person is 0.45 m wide, so a standing figure, a car and a palm crown all dissolved into a featureless grey smear on
+ * sunlit ground - measured by sweeping the radius at runtime (radius 1 turned the noon blob on the spawn pavement
+ * into a recognisable palm; radius 24 erased it altogether). The uniform DOES reach the fragment shader in r185:
+ * WebGLLights copies shadow.radius into directionalLightShadows[i].shadowRadius and getShadow multiplies it by the
+ * texel size.
+ *
+ * The sun's angular diameter is 0.53 deg, so the real penumbra is 0.0093 x the blocker's distance: 1.6 cm under a
+ * person, 7 cm under a palm crown, 28 cm under a facade parapet 30 m up. That is the shape SHADOW_PENUMBRA below
+ * approximates - crisp by default, soft only where the caster really is far.
  */
-const SHADOW_RADIUS = 7;
+export const SHADOW_RADIUS = 6;
 /**
  * Taps on that disk. Three takes 5, which is fine for its own 1-texel default but dithers into a visible Vogel
- * rosette once the disk is 7 texels wide; 9 is smooth everywhere and cost 13 of the 40 fps the software-GL harness
- * has at the worst-case frame, which is a third of the frame for a difference no screenshot could show. 7 is the
- * measured knee: no rosette on a hard noon shadow, ~5 fps.
+ * rosette once the disk is several texels wide; 9 is smooth everywhere and cost 13 of the 40 fps the software-GL
+ * harness has at the worst-case frame. 7 is the measured knee: no rosette on a hard noon shadow, ~5 fps.
  */
 const SHADOW_TAPS = 7;
 /**
- * Contact hardening. `dz` is the light-space depth, in the shadow camera's [0, 1] range, at which a blocker counts as
- * FAR: the ortho camera spans far - near = 360 m, so 0.0042 is 1.5 m. A fragment whose blocker is nearer than that
- * (a kerb, a wheel, a bollard) gets `min` of the disk and keeps a crisp contact shadow; one whose blocker is further
- * (a parapet, a facade up the street) opens to the full disk. The probe is taken at both ends of the disk's own
- * diameter so a fragment on the LIT side of a penumbra still finds the blocker and softens symmetrically.
+ * Blocker-distance ladder, the thing that decides how wide the disk actually gets (see patchShadowPenumbra).
+ *
+ * `nearM` / `midM` are blocker separations in metres, converted to light-space depth against the shadow camera's
+ * far - near = 360 m span. `near` / `mid` are the fractions of SHADOW_RADIUS used below nearM and between nearM and
+ * midM; beyond midM the full disk applies. At 6 texels that is 1.1 texels (7 cm) for anything within 3.5 m - a
+ * figure, a wheel, a kerb, a bollard, a hedge - 2.5 texels (16 cm) for palm crowns and first-floor parapets, and
+ * 6 texels (39 cm) for a facade thrown down the street. Round 9's single step sat at 1.5 m, which is SHORTER than a
+ * person, so every caster taller than a kerb landed in the wide bucket: that, not the shadow pass, is why nothing
+ * read as a shape.
  */
-const SHADOW_CONTACT = { dz: 0.0042, min: 0.26 } as const;
+export const SHADOW_PENUMBRA = { nearM: 3.5, midM: 14, near: 0.18, mid: 0.42 } as const;
+/**
+ * Light-space depth span of the sun's shadow camera (far - near) and its near plane. SHADOW_PENUMBRA's metres are
+ * converted against the span, so the two must be set here rather than inline at the camera: a changed far plane
+ * silently rescales the whole blocker ladder otherwise.
+ */
+export const SHADOW_DEPTH_SPAN = 360;
+const SHADOW_CAM_NEAR = 60;
 
 /**
  * Widens three's PCF shadow lookup into a SHADOW_TAPS-tap Vogel disk whose radius is scaled by how far in front of the receiver
@@ -73,14 +93,15 @@ const SHADOW_CONTACT = { dz: 0.0042, min: 0.26 } as const;
  *
  * Stock r185 takes 5 hardware-PCF taps on a disk of shadowRadius texels, and with the default radius of 1 that is a
  * 6 cm filter at this box size - i.e. no penumbra at all, so a shadow edge 30 m from its caster was as hard as one
- * at its foot. Two things are wrong with just raising the radius: 5 taps over a 7-texel disk dither into a visible
- * Vogel rosette, and a uniform 0.45 m penumbra takes the contact shadow off everything small. Hence more taps, and
- * a radius driven by a blocker-distance estimate.
+ * at its foot. Two things are wrong with just raising the radius: 5 taps over a wide disk dither into a visible
+ * Vogel rosette, and a uniform 0.4 m penumbra takes the contact shadow off everything small. Hence more taps, and a
+ * radius driven by a blocker-distance estimate.
  *
- * The estimate costs two taps and no extra sampler: a sampler2DShadow fetch at a z pulled SHADOW_CONTACT.dz toward
- * the light answers 0 only where something stands at least that far in front of this fragment, which is exactly the
- * blocker-separation test PCSS does with a depth read. The two probes sit at opposite ends of the disk so the test
- * works on both sides of an edge.
+ * The estimate costs four taps and no extra sampler: a sampler2DShadow fetch at a z pulled dz toward the light
+ * answers 0 only where something stands at least that far in front of this fragment, which is exactly the
+ * blocker-separation test PCSS does with a depth read. Two dz thresholds give a three-rung ladder (near / mid /
+ * far), and each rung probes both ends of the disk's diameter so a fragment on the LIT side of a penumbra still
+ * finds its blocker and softens symmetrically.
  */
 function patchShadowPenumbra(): void {
   const stock = `				shadow = (
@@ -92,11 +113,18 @@ function patchShadowPenumbra(): void {
 				) * 0.2;`;
   const taps: string[] = [];
   for (let i = 0; i < SHADOW_TAPS; i++) taps.push(`					texture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( ${i}, ${SHADOW_TAPS}, phi ) * softRadius, shadowCoord.z ) )`);
+  const dzNear = (SHADOW_PENUMBRA.nearM / SHADOW_DEPTH_SPAN).toFixed(6);
+  const dzMid = (SHADOW_PENUMBRA.midM / SHADOW_DEPTH_SPAN).toFixed(6);
   const wide = `				vec2 probeDir = vec2( cos( phi ), sin( phi ) ) * radius;
+				float blockerNear = max(
+					1.0 - texture( shadowMap, vec3( shadowCoord.xy + probeDir, shadowCoord.z - ${dzNear} ) ),
+					1.0 - texture( shadowMap, vec3( shadowCoord.xy - probeDir, shadowCoord.z - ${dzNear} ) ) );
 				float blockerFar = max(
-					1.0 - texture( shadowMap, vec3( shadowCoord.xy + probeDir, shadowCoord.z - ${SHADOW_CONTACT.dz.toFixed(5)} ) ),
-					1.0 - texture( shadowMap, vec3( shadowCoord.xy - probeDir, shadowCoord.z - ${SHADOW_CONTACT.dz.toFixed(5)} ) ) );
-				float softRadius = radius * mix( ${SHADOW_CONTACT.min.toFixed(3)}, 1.0, blockerFar );
+					1.0 - texture( shadowMap, vec3( shadowCoord.xy + probeDir, shadowCoord.z - ${dzMid} ) ),
+					1.0 - texture( shadowMap, vec3( shadowCoord.xy - probeDir, shadowCoord.z - ${dzMid} ) ) );
+				float softRadius = radius * ( ${SHADOW_PENUMBRA.near.toFixed(3)}
+					+ blockerNear * ${(SHADOW_PENUMBRA.mid - SHADOW_PENUMBRA.near).toFixed(3)}
+					+ blockerFar * ${(1 - SHADOW_PENUMBRA.mid).toFixed(3)} );
 
 				shadow = (
 ${taps.join(' +\n')}
@@ -330,12 +358,14 @@ export class SkySystem {
     const half = SKY_TUNING.shadowBox / 2;
     const sc = this.sun.shadow.camera;
     // The light sits 220 m from the box centre: a tight near/far keeps depth precision for contact-hugging shadows.
-    sc.left = -half; sc.right = half; sc.top = half; sc.bottom = -half; sc.near = 60; sc.far = 420;
-    this.sun.shadow.bias = -0.0006;
-    // A soft filter needs a smaller normal offset, not a bigger one: the 9-tap disk reaches 7 texels out, and at
-    // 0.16 m the offset was pushing the lookup of a wall fragment far enough off the surface to erase the contact
-    // shadow of anything shallower than the offset itself (the cornice oversail, a sill, a bay recess).
-    this.sun.shadow.normalBias = 0.09;
+    sc.left = -half; sc.right = half; sc.top = half; sc.bottom = -half;
+    sc.near = SHADOW_CAM_NEAR; sc.far = SHADOW_CAM_NEAR + SHADOW_DEPTH_SPAN;
+    this.sun.shadow.bias = -0.00045;
+    // The normal offset scales with the filter, and the filter is now ~1.1 texels (7 cm) under anything close: at
+    // 0.09 m the offset was wider than the filter itself, pushing the lookup of a wall fragment off the surface far
+    // enough to erase the contact shadow of anything shallower (the cornice oversail, a sill, a bay recess) and
+    // lifting a figure's shadow off its own shoes.
+    this.sun.shadow.normalBias = 0.05;
     this.sun.shadow.radius = SHADOW_RADIUS;
     scene.add(this.sun);
     scene.add(this.sun.target);
