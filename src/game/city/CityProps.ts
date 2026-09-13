@@ -378,7 +378,12 @@ export function makePoints(ctx: GenContext): CityData['points'] {
   for (let i = 0; i < PLAZA_BLOCKS.length; i++) missionStarts.push(pointAt(ctx, loopOf(PLAZA_BLOCKS[i][0], PLAZA_BLOCKS[i][1])[8], 0));
   const prom = ctx.sidewalks.nearestNode(PROMENADE_X, PIER_Z);
   const points: CityData['points'] = {
-    playerSpawn: pointAt(ctx, loopOf(SPAWN_BLOCK[0], SPAWN_BLOCK[1])[4], Math.PI / 2),
+    // Spawn yaw PI/4, not PI/2: facing the shop row square-on filled the frame with a flat frontal elevation and
+    // ~40 % foreground pavement. Quartering it rakes the same row away in perspective, puts the street, the palms
+    // and the parked line in shot, and measured CHEAPER at the binding budget frame (20 m north 634,171/109 vs
+    // 645,430/112 at 07:00) because a wall 20 m away no longer occludes nothing. The yaw feeds only player.reset:
+    // every other playerSpawn reader (CityLots, CityGenerator, CityValidate, Engine, World, missions) takes x/z.
+    playerSpawn: pointAt(ctx, loopOf(SPAWN_BLOCK[0], SPAWN_BLOCK[1])[4], Math.PI / 4),
     hospital: pointAt(ctx, loopOf(LANDMARK_BLOCKS.hospital[0], LANDMARK_BLOCKS.hospital[1])[8], 0),
     policeStation: pointAt(ctx, loopOf(LANDMARK_BLOCKS.police[0], LANDMARK_BLOCKS.police[1])[8], 0),
     pier: { x: PIER_X0 + 3, z: PIER_Z, yaw: Math.PI / 2 },

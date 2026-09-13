@@ -234,10 +234,14 @@ test('points and parked spots are clear of colliders and lanes', () => {
     expect(Math.hypot(a.x - b.x, a.z - b.z) >= 9, 'spots >= 9 m apart');
   }
   for (const s of c.parkedSpots) { const n = g.roads.nearestNode(s.x, s.z); expect(Math.hypot(n.x - s.x, n.z - s.z) >= 18, 'spot >= 18 m from nodes'); }
-  // Spawn is the east mid node of block (8,5) facing +X.
+  // Spawn is the east mid node of block (8,5) and must face the road (+X) - but the exact angle is an
+  // art-direction choice, not a contract: square-on (PI/2) filled the opening frame with a flat frontal shop
+  // elevation, so round 13 quartered it to PI/4 to rake the row away in perspective. What must hold is that the
+  // player never opens the game facing a wall, i.e. the yaw stays within 45 deg of the road normal.
   const blk = c.blocks[5 * 10 + 8];
   approx(sp.x, blk.x1 + 1.5, 1e-6, 'spawn on the east sidewalk of block (8,5)');
-  approx(sp.yaw, Math.PI / 2, 1e-9, 'spawn faces the road');
+  const offRoad = Math.abs(Math.atan2(Math.sin(sp.yaw - Math.PI / 2), Math.cos(sp.yaw - Math.PI / 2)));
+  expect(offRoad <= Math.PI / 4 + 1e-9, `spawn faces the road (off the road normal by ${offRoad.toFixed(4)} rad)`);
   expect(c.points.pier.x < 1276 && Math.abs(c.points.pier.z - 590) < 1e-6, 'pier point at the deck start');
 });
 
