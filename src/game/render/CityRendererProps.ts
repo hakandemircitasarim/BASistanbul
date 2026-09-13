@@ -29,9 +29,9 @@ import { clamp } from '../core/math';
 import { Random } from '../core/Random';
 import type { Materials } from './Materials';
 import { LEAF_TILE_M } from './PropTextures';
-import { ContactShadows, groundYAt } from './ContactShadows';
+import { ContactShadows, contactExtent, groundYAt } from './ContactShadows';
 import { surface, tube, type Ring } from './PlayerRenderer';
-import { VEHICLE_RENDER, makeVehiclePaintMaterial, parkedMidGeometry, parkedNearGeometry, parkedShellGeometry, setPaintNight, shadowExtent } from './VehicleRenderer';
+import { LOW_SUN_SHADOW, VEHICLE_RENDER, keyLightElevation, makeVehiclePaintMaterial, parkedMidGeometry, parkedNearGeometry, parkedShellGeometry, setPaintNight, shadowExtent } from './VehicleRenderer';
 
 export const PROP_DIMS = { palmTrunkH: 6.4, palmFrondLen: 4.4, palmFrondW: 2.3, lampH: 6.5, lampArm: 1.4, poolRadius: 5.5 } as const;
 
@@ -1051,7 +1051,55 @@ const CAR_TIER_MOVE = 1.5;
  * SHADOW_TUNING.penumbra of soft edge. Computed off the spec, not off the loft's own hw / hl, which sit inboard of
  * the tyres and short of the bumpers - blobs sized from those never got their dark part out from under the car.
  */
-const CAR_SHADOWS = { cap: 44, range: 46, lift: 0.045 } as const;
+const CAR_SHADOWS = {
+  cap: 44, range: 46, lift: 0.045,
+  /**
+   * Where the blob starts fading out. It used to be nowhere: every picked car got `fade` 1 and the 46 m range cut the
+   * pool off mid-strength, so on pale lot asphalt a row of cars crossed a line and became stickers in one step (and
+   * the whole row flipped together, because a lot's bays stand at the same distance). `add`'s fade both shrinks the
+   * quad and scales its occlusion, so ramping it over the last 10 m ends the pool where it is already a few pixels.
+   */
+  fadeFrom: 36,
+} as const;
+
+/**
+ * Contact blobs for the street furniture that stands ON the pavement. Hedges, planters, bins, benches, dumpsters and
+ * café tables had none at all: a parked car, a pedestrian and the player were each grounded by a blob and a hedge
+ * beside them was not, which is the "pasted on" read the round-12 critic logged at close range. They are static, so
+ * they are re-picked on the car tier's own 1.5 m cadence and cost no draw call — the blob field is one instanced quad
+ * shared by every renderer, and 2 triangles an instance.
+ *
+ * `cap` is small on purpose: the shared field's spare capacity is what is left after the vehicle, crowd, player and
+ * parked-car slices have reserved theirs (SHADOW_TUNING.capacity), and a slice that asks for more than is left is
+ * silently clamped. 24 covers everything inside `range` on a dressed pavement; past that a missing pool is a few
+ * pixels wide.
+ */
+const FURN_SHADOWS = { cap: 24, range: 30, fadeFrom: 22, lift: 0.012 } as const;
+
+/**
+ * Footprint half-extents of one furniture geometry, measured from the vertices in the bottom `FOOT_BAND` of it rather
+ * than from the whole bounding box: a café table's box is its parasol and a hedge's is its widest foliage, and a pool
+ * the size of either is a decal. The band is the part that actually meets the floor - a bench's four feet, a pot's
+ * base, a bin's foot ring - so the blob is the contact patch plus SHADOW_TUNING's spill and penumbra.
+ */
+const FOOT_BAND = 0.3;
+
+function footprint(g: THREE.BufferGeometry, out: { hw: number; hl: number }): void {
+  const pos = g.attributes.position as THREE.BufferAttribute;
+  let minY = Infinity;
+  for (let i = 0; i < pos.count; i++) minY = Math.min(minY, pos.getY(i));
+  let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+  for (let i = 0; i < pos.count; i++) {
+    if (pos.getY(i) > minY + FOOT_BAND) continue;
+    const x = pos.getX(i), z = pos.getZ(i);
+    if (x < x0) x0 = x;
+    if (x > x1) x1 = x;
+    if (z < z0) z0 = z;
+    if (z > z1) z1 = z;
+  }
+  out.hw = x1 > x0 ? (x1 - x0) * 0.5 : 0.2;
+  out.hl = z1 > z0 ? (z1 - z0) * 0.5 : 0.2;
+}
 
 /**
  * Real lamp light: a fixed pool of point lights created once and re-aimed at the nearest lamp heads every frame, so
@@ -1230,6 +1278,7 @@ export class PropRenderer {
   private readonly geometries: THREE.BufferGeometry[] = [];
   private readonly groups: PropGroup[] = [];
   private readonly materials: Materials;
+  private readonly scene: THREE.Scene;
   private readonly glowMat: THREE.MeshBasicMaterial;
   private readonly paintMat: THREE.MeshPhysicalMaterial;
   /** Lamp placements (x, z, yaw) and the point lights parked on the nearest few of them. */
@@ -1253,6 +1302,17 @@ export class PropRenderer {
   private carCoarse = new Int32Array(0);
   private carCount = 0;
   private readonly carShadows: ContactShadows;
+  /** Grounded street furniture: placement, yaw and the footprint half-extents its blob is sized from. */
+  private furnX = new Float32Array(0);
+  private furnZ = new Float32Array(0);
+  private furnYaw = new Float32Array(0);
+  private furnY = new Float32Array(0);
+  private furnHW = new Float32Array(0);
+  private furnHL = new Float32Array(0);
+  private furnCount = 0;
+  private readonly furnShadows: ContactShadows;
+  /** Current state of the coarse / mid parked-shell sun-shadow gate (LOW_SUN_SHADOW). */
+  private carCast = true;
   private nearMesh: THREE.BatchedMesh | null = null;
   private midMesh: THREE.BatchedMesh | null = null;
   private coarseMesh: THREE.BatchedMesh | null = null;
@@ -1266,7 +1326,7 @@ export class PropRenderer {
   private midPickedN = 0;
   private tierX = Infinity;
   private tierZ = Infinity;
-  private static readonly PICK_CAP = Math.max(NEAR_CARS.cap, MID_CARS.cap, LAMP_LIGHTS.count, CAR_SHADOWS.cap);
+  private static readonly PICK_CAP = Math.max(NEAR_CARS.cap, MID_CARS.cap, LAMP_LIGHTS.count, CAR_SHADOWS.cap, FURN_SHADOWS.cap);
   private readonly pickIdx = new Int32Array(PropRenderer.PICK_CAP);
   private readonly pickD2 = new Float32Array(PropRenderer.PICK_CAP);
   /** Catenary wire spans and the line mesh they are packed into by range. */
@@ -1278,7 +1338,9 @@ export class PropRenderer {
 
   constructor(scene: THREE.Scene, props: Prop[], materials: Materials, parked: ParkedCar[] = [], lotProps: LotProp[] = []) {
     this.materials = materials;
+    this.scene = scene;
     this.carShadows = new ContactShadows(scene, CAR_SHADOWS.cap);
+    this.furnShadows = new ContactShadows(scene, FURN_SHADOWS.cap);
     const counts: Record<Prop['kind'], number> = { palm: 0, lamp: 0, bench: 0, hydrant: 0, bin: 0, sign: 0, shelter: 0, bollard: 0, tree: 0, hedge: 0, pole: 0, roadsign: 0, dumpster: 0, table: 0 };
     for (let i = 0; i < props.length; i++) counts[props[i].kind]++;
     const lotCounts: Record<LotProp['kind'], number> = { island: 0, planter: 0, booth: 0 };
@@ -1299,11 +1361,23 @@ export class PropRenderer {
     // --- batches: one per material -------------------------------------------------------------------------------
     const furnitureCount = counts.bench + counts.hydrant + counts.bin + counts.sign + counts.shelter + counts.bollard
       + counts.pole + counts.roadsign + counts.dumpster + counts.table + lotCounts.island + lotCounts.planter;
-    const furniture = this.batch(scene, 'furniture', [
+    const furnGeos = [
       benchGeometry(), hydrantGeometry(), binGeometry(), signGeometry(), shelterGeometry(), bollardGeometry(), islandGeometry(), planterGeometry(),
       utilityPoleGeometry(), roadSignGeometry(), dumpsterGeometry(), cafeTableGeometry(),
-    ], materials.furniture, furnitureCount, true);
+    ];
+    // Footprints have to be taken here: `batch` disposes every part once it is copied into the BatchedMesh.
+    const foot = { hw: 0, hl: 0 };
+    const furnFoot: { hw: number; hl: number }[] = [];
+    for (let i = 0; i < furnGeos.length; i++) {
+      footprint(furnGeos[i], foot);
+      furnFoot.push({ hw: foot.hw, hl: foot.hl });
+    }
+    const furniture = this.batch(scene, 'furniture', furnGeos, materials.furniture, furnitureCount, true);
     const FG = { bench: 0, hydrant: 1, bin: 2, sign: 3, shelter: 4, bollard: 5, island: 6, planter: 7, pole: 8, roadsign: 9, dumpster: 10, table: 11 } as const;
+    /** Kinds that get a contact blob: the things with a real footprint on the floor (see FURN_SHADOWS). Posts, poles,
+     * signs, hydrants and bollards are excluded — a 10 cm stem under a 1 m pool reads as a stain, not as contact — and
+     * so is the bus shelter, whose floor is open and lit. */
+    const GROUNDED: Partial<Record<Prop['kind'] | LotProp['kind'], true>> = { bench: true, bin: true, dumpster: true, table: true, hedge: true, planter: true };
     // Every part of the foliage batch goes through leafSurface: the leaf albedo's UVs (the material carries the map),
     // the per-facet value jitter and the `leafMix` mask that keeps the map and the translucency emissive off the bark
     // these geometries also carry (trunks, limbs, boles - see leafMixAttr). The batch's attribute set comes from the
@@ -1311,7 +1385,13 @@ export class PropRenderer {
     const foliageGeos = [leafSurface(farPalmGeometry(PALM_SEEDS[0]), PALM_SEEDS[0], 0.04)];
     for (let i = 0; i < TREE_SEEDS.length; i++) foliageGeos.push(leafSurface(treeGeometry(TREE_SEEDS[i]), TREE_SEEDS[i]));
     for (let i = 0; i < CYPRESS_SEEDS.length; i++) foliageGeos.push(leafSurface(cypressGeometry(CYPRESS_SEEDS[i]), CYPRESS_SEEDS[i]));
-    for (let i = 0; i < HEDGE_SEEDS.length; i++) foliageGeos.push(leafSurface(hedgeGeometry(HEDGE_SEEDS[i]), HEDGE_SEEDS[i]));
+    const hedgeFoot: { hw: number; hl: number }[] = [];
+    for (let i = 0; i < HEDGE_SEEDS.length; i++) {
+      const g = leafSurface(hedgeGeometry(HEDGE_SEEDS[i]), HEDGE_SEEDS[i]);
+      footprint(g, foot);
+      hedgeFoot.push({ hw: foot.hw, hl: foot.hl });
+      foliageGeos.push(g);
+    }
     // Far palms cast nothing on their own (past 60 m they never enter the shadow box); sharing the batch with the
     // trees and hedges means the odd one at the box corner does, which is harmless.
     const foliage = this.batch(scene, 'foliage', foliageGeos, materials.foliage, counts.palm + counts.tree + counts.hedge, true);
@@ -1430,6 +1510,19 @@ export class PropRenderer {
     lampG.inst.push(poleM, headM);
     // The glow quad is filled by repackLampGlow instead (one disc per in-range lamp).
     this.lampGlowMesh = glowM;
+    // Grounded furniture registry (see FURN_SHADOWS): flat arrays in placement order, filled as the props are placed.
+    const groundedN = counts.bench + counts.bin + counts.dumpster + counts.table + counts.hedge + lotCounts.planter;
+    this.furnX = new Float32Array(Math.max(1, groundedN));
+    this.furnZ = new Float32Array(Math.max(1, groundedN));
+    this.furnYaw = new Float32Array(Math.max(1, groundedN));
+    this.furnY = new Float32Array(Math.max(1, groundedN));
+    this.furnHW = new Float32Array(Math.max(1, groundedN));
+    this.furnHL = new Float32Array(Math.max(1, groundedN));
+    const ground = (x: number, z: number, yaw: number, y: number, scale: number, f: { hw: number; hl: number }): void => {
+      const i = this.furnCount++;
+      this.furnX[i] = x; this.furnZ[i] = z; this.furnYaw[i] = yaw; this.furnY[i] = y;
+      this.furnHW[i] = f.hw * scale; this.furnHL[i] = f.hl * scale;
+    };
     let palmIdx = 0;
     const lampXs: number[] = [], lampZs: number[] = [], lampYaws: number[] = [];
     for (let i = 0; i < props.length; i++) {
@@ -1449,8 +1542,10 @@ export class PropRenderer {
         const k = push(treeG, p.x, p.z, p.yaw, sc, CURB_H);
         treeG.batched[0].ids[k] = add(foliage, foliage.geo[gi], p.x, p.z, p.yaw, sc, CURB_H, foliageTint(rng, 0.5, scratchColor));
       } else if (p.kind === 'hedge') {
+        const v = rng.int(0, HEDGE_SEEDS.length - 1);
         const k = push(hedgeG, p.x, p.z, p.yaw, p.scale, CURB_H);
-        hedgeG.batched[0].ids[k] = add(foliage, foliage.geo[FOL_HEDGE + rng.int(0, HEDGE_SEEDS.length - 1)], p.x, p.z, p.yaw, p.scale, CURB_H, foliageTint(rng, 0.35, scratchColor));
+        hedgeG.batched[0].ids[k] = add(foliage, foliage.geo[FOL_HEDGE + v], p.x, p.z, p.yaw, p.scale, CURB_H, foliageTint(rng, 0.35, scratchColor));
+        ground(p.x, p.z, p.yaw, CURB_H, p.scale, hedgeFoot[v]);
       } else if (p.kind === 'lamp') {
         push(lampG, p.x, p.z, p.yaw, p.scale, CURB_H);
         lampXs.push(p.x); lampZs.push(p.z); lampYaws.push(p.yaw);
@@ -1458,6 +1553,7 @@ export class PropRenderer {
         const g = furnG[p.kind]!;
         const k = push(g, p.x, p.z, p.yaw, p.scale, CURB_H);
         g.batched[0].ids[k] = add(furniture, furniture.geo[FG[p.kind]], p.x, p.z, p.yaw, p.scale, CURB_H, null);
+        if (GROUNDED[p.kind]) ground(p.x, p.z, p.yaw, CURB_H, p.scale, furnFoot[FG[p.kind]]);
       }
     }
     // Lot dressing stands on the lot floor.
@@ -1470,6 +1566,7 @@ export class PropRenderer {
       const g = p.kind === 'island' ? islandG : planterG;
       const k = push(g, p.x, p.z, p.yaw, 1, LOT_FLOOR_Y);
       g.batched[0].ids[k] = add(furniture, furniture.geo[FG[p.kind]], p.x, p.z, p.yaw, 1, LOT_FLOOR_Y, null);
+      if (GROUNDED[p.kind]) ground(p.x, p.z, p.yaw, LOT_FLOOR_Y, 1, furnFoot[FG[p.kind]]);
     }
     // Parked cars: the lot bays (lot floor, short range) and the kerbs (pavement, longer range) as two groups of the
     // parked batch, each instance on its spec's shell in its own paint.
@@ -1546,6 +1643,16 @@ export class PropRenderer {
     // from a parked flank, and a mirror clearcoat turns that into a blown white disc (see CLEARCOAT_NIGHT).
     setPaintNight(this.paintMat, n);
     if (this.wireMat) this.wireMat.opacity = 0.85 - 0.35 * n;
+    // Sun-shadow gate for the two COARSE parked tiers (see LOW_SUN_SHADOW in VehicleRenderer). Measured at the budget's
+    // own worst camera (07:00, camera 1029.85/2.25/615.85, /rendertest so the count is deterministic): the coarse batch
+    // is 39,192 shadow-pass triangles and 1 draw, the mid batch 13,456 and 1 more. The near batch (3 cars inside 8 m)
+    // keeps casting at every hour. A boolean per frame; `castShadow` is read when the shadow pass is collected.
+    const carCast = n < LOW_SUN_SHADOW.maxNight && keyLightElevation(this.scene) >= LOW_SUN_SHADOW.minSunY;
+    if (carCast !== this.carCast) {
+      this.carCast = carCast;
+      if (this.coarseMesh) this.coarseMesh.castShadow = carCast;
+      if (this.midMesh) this.midMesh.castShadow = carCast;
+    }
     this.aimLampLights(camX, camZ, n);
     const tdx = camX - this.tierX, tdz = camZ - this.tierZ;
     if (tdx * tdx + tdz * tdz >= CAR_TIER_MOVE * CAR_TIER_MOVE) this.repackNearCars(camX, camZ);
@@ -1677,9 +1784,16 @@ export class PropRenderer {
     this.nearPickedN = this.fillCarTier(near, this.nearGeo, NEAR_CARS.cap, NEAR_CARS.range, camX, camZ, this.nearPicked, 0, this.nearPicked);
     this.midPickedN = this.fillCarTier(mid, this.midGeo, MID_CARS.cap, MID_CARS.range, camX, camZ, this.nearPicked, this.nearPickedN, this.midPicked);
     this.repackCarShadows(camX, camZ);
+    this.repackFurnitureShadows(camX, camZ);
   }
 
-  /** Blobs under the `CAR_SHADOWS.cap` nearest static parked cars, re-picked with the fidelity bands. No allocation. */
+  /**
+   * Blobs under the `CAR_SHADOWS.cap` nearest static parked cars, re-picked with the fidelity bands. No allocation.
+   *
+   * The pool is ramped out over the last `range - fadeFrom` metres instead of being cut at the range: `add`'s fade
+   * scales the occlusion as well as the quad, so a car leaving the set now dims away over 10 m of camera travel
+   * rather than losing a half-strength pool in one frame.
+   */
   private repackCarShadows(camX: number, camZ: number): void {
     const r2 = CAR_SHADOWS.range * CAR_SHADOWS.range;
     let picked = 0;
@@ -1690,13 +1804,41 @@ export class PropRenderer {
       picked = PropRenderer.insertNearest(this.pickIdx, this.pickD2, picked, CAR_SHADOWS.cap, i, d2);
     }
     this.carShadows.begin();
+    const span = CAR_SHADOWS.range - CAR_SHADOWS.fadeFrom;
     for (let k = 0; k < picked; k++) {
       const i = this.pickIdx[k];
       const spec = SPECS[PARKED_SPECS[this.carGeo[i]]];
+      const fade = clamp((CAR_SHADOWS.range - Math.sqrt(this.pickD2[k])) / span, 0, 1);
       this.carShadows.add(this.carX[i], this.carShadowY[i] + CAR_SHADOWS.lift, this.carZ[i],
-        shadowExtent(spec.width * 0.5), shadowExtent(spec.length * 0.5), this.carYaw[i], 1);
+        shadowExtent(spec.width * 0.5), shadowExtent(spec.length * 0.5), this.carYaw[i], fade);
     }
     this.carShadows.end();
+  }
+
+  /** Blobs under the nearest grounded street furniture (see FURN_SHADOWS), on the car tier's cadence. No allocation. */
+  private repackFurnitureShadows(camX: number, camZ: number): void {
+    const r2 = FURN_SHADOWS.range * FURN_SHADOWS.range;
+    let picked = 0;
+    for (let i = 0; i < this.furnCount; i++) {
+      const dx = this.furnX[i] - camX, dz = this.furnZ[i] - camZ;
+      const d2 = dx * dx + dz * dz;
+      if (d2 > r2) continue;
+      picked = PropRenderer.insertNearest(this.pickIdx, this.pickD2, picked, FURN_SHADOWS.cap, i, d2);
+    }
+    this.furnShadows.begin();
+    const span = FURN_SHADOWS.range - FURN_SHADOWS.fadeFrom;
+    for (let k = 0; k < picked; k++) {
+      const i = this.pickIdx[k];
+      const hw = this.furnHW[i], hl = this.furnHL[i];
+      const fade = clamp((FURN_SHADOWS.range - Math.sqrt(this.pickD2[k])) / span, 0, 1);
+      // Shape from the footprint's own aspect: a bin, a planter and a café table are round on the floor and want the
+      // blob's ellipse, a hedge, a bench and a dumpster are boxes and want its rounded rectangle. A round caster given
+      // the rectangle stands in a visible rounded square, which is the one shape that reads as a decal.
+      const round = Math.min(hw, hl) / Math.max(hw, hl) > 0.8 ? 1 : 0;
+      this.furnShadows.add(this.furnX[i], this.furnY[i] + FURN_SHADOWS.lift, this.furnZ[i],
+        contactExtent(hw), contactExtent(hl), this.furnYaw[i], fade, round);
+    }
+    this.furnShadows.end();
   }
 
   /** Copies the wire spans within range into the line mesh's buffer and sets its draw range. */
@@ -1762,6 +1904,7 @@ export class PropRenderer {
 
   dispose(): void {
     this.carShadows.dispose();
+    this.furnShadows.dispose();
     for (let i = 0; i < this.meshes.length; i++) {
       const m = this.meshes[i];
       if (m.parent) m.parent.remove(m);

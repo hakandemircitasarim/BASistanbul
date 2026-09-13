@@ -126,21 +126,89 @@ const MIP_DETAIL = 0.34;
 const GROUND_ANISO = 8;
 /**
  * Exposed chippings on the asphalt tiles (see chipBed). Sizes are METRES, resolved against the tile's own px/m, so
- * the bed stays the same physical size whatever resolution the tile is drawn at. 4.0-7.8 cm is 3-6 texels at the
- * road's 73 px/m: coarse for real chippings and deliberately so, because anything finer is one texel and one texel
- * is static. 1.35 clusters per square metre of 51 stones each is ~13,400 stones over the 14 m tile covering ~14 % of
- * it, so most of what the eye lands on is still plain bitumen with beds of stone scattered through it.
+ * the bed stays the same physical size whatever resolution the tile is drawn at.
+ *
+ * TWO SIZE CLASSES, because one cannot do both jobs. The `fine` class (4.0-7.8 cm, 3-6 texels at the road's 73 px/m)
+ * is the surface a driver's eye lands on at two metres; it is gone by mip 2 and that is correct, because at 8 m a
+ * 4 cm stone is a third of a screen pixel and anything still drawing it there is drawing static. The `coarse` class
+ * (6.5-13 cm, 5-9.5 texels) is the one that has to SURVIVE the mip chain: mip 1 still holds two to five texels of it
+ * and mip 2 one to two, so it is still a stone at 10 m where the fine bed has averaged to flat tone. That is the
+ * whole reason round 10's single-class bed measured as an untextured plane at ten metres.
+ *
+ * THREE DEFINITE TONES, never a ramp: a pale stone, a mid stone and a dark one, each drawn flat. A continuous value
+ * distribution at this scale is photo speckle, which this project does not do; a small deck of definite tones with a
+ * definite edge is aggregate. The mid tone carries most of the population and is the one that stops the bed reading
+ * as white pebbles scattered on tarmac - with only the pale and dark tones, the pale stones are the only ones that
+ * register against 46-level bitumen (a dark chip can only take it down 10 levels; a pale one lifts it 35) and the
+ * surface reads as gravel, not as a wearing course.
+ *
+ * Coarse stones are ANGULAR: a crushed chipping is a polyhedron with flat faces and sharp arrises, and at 5-8 texels
+ * the difference between a rounded blob and a jittered hexagon is the difference between a pebble and crushed rock.
+ * The fine class stays elliptical - at 3-5 texels a polygon is only its own aliasing. Each coarse stone also gets a
+ * SHADE down one side (never a highlight: a baked highlight is a lighting decision and the sun in this game moves,
+ * whereas the dark side of a stone sitting proud of the bitumen is just occlusion).
+ *
+ * Contrast: a pale stone (alpha 0.085-0.23) lifts mid bitumen by 11-31/255, a mid one by 6-16 and a dark one
+ * (alpha 0.15-0.35) drops it by 5-11 - two to three times round 10's bed, which measured 74 levels of rendered luma
+ * range on lit asphalt at 2.5 m against the pavement's 158 in the same frame (44..117 against 17..175, 12:00,
+ * 1280x720). The ceiling on this is the ground normal map, which is a high-pass of THIS canvas (Materials asks
+ * groundNormal('road', 3.0) at normalScale 0.45): every chip is also a bump, so the low-sun frames are the ones
+ * that decide how far this can go.
  */
 const CHIP = {
-  min: 0.040, max: 0.078,
-  perM2: 1.35, rMin: 0.18, rMax: 0.78, density: 62,
-  pale: [176, 168, 152], dark: [16, 15, 13],
-  paleA: [0.03, 0.075], darkA: [0.055, 0.135], darkShare: 0.52,
+  fine: {
+    min: 0.038, max: 0.072, perM2: 1.35, rMin: 0.18, rMax: 0.78, density: 88,
+    alpha: [0.085, 0.17] as const, shares: [0.24, 0.44] as const, rim: 0, sides: 0,
+  },
+  coarse: {
+    min: 0.055, max: 0.105, perM2: 0.62, rMin: 0.26, rMax: 0.95, density: 30,
+    alpha: [0.115, 0.23] as const, shares: [0.28, 0.42] as const, rim: 0.26, sides: 6,
+  },
+  /** The tone deck. `shares` above splits the population pale / mid / rest-is-dark. */
+  pale: [186, 179, 163], mid: [118, 114, 104], dark: [14, 13, 11],
 } as const;
+/** One size class of the asphalt chip bed (CHIP.fine / CHIP.coarse). Sizes and cluster radii are metres. */
+type ChipClass = {
+  readonly min: number; readonly max: number; readonly perM2: number; readonly rMin: number; readonly rMax: number;
+  readonly density: number; readonly alpha: readonly [number, number]; readonly shares: readonly [number, number];
+  readonly rim: number; readonly sides: number;
+};
 
 /** Ground albedo families that carry a derived relief / roughness map (see groundNormal, groundRough). */
 type GroundMap = 'sidewalk' | 'plaza' | 'road' | 'lotAsphalt' | 'crosswalk';
 
+/** sRGB relative luminance (0..255) of an [r, g, b] triple. */
+function luma(c: readonly number[]): number {
+  return 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
+}
+/**
+ * The contrast rule every shop fascia obeys: the lettering's composited luminance is at least this many times the
+ * board's, or at most this fraction of it, whichever side it started on.
+ *
+ * A RATIO and not a difference, because a fascia band is painted in VALUE here and tinted by the geometry
+ * (BuildingGeometry.fasciaPalette deals each building two or three hues, one of them a charcoal neutral). A tint is a
+ * multiply, so it preserves ratios and destroys differences: the vacant unit's ghost sign was 196 on a 164 board -
+ * 32 levels apart, which is plenty on the white atlas and 10 levels apart once a dark fascia hue has multiplied both,
+ * which is the "MANAV is dark grey on a dark grey band and unreadable at 5 m" defect. At 2.3 the same sign survives
+ * any tint the palette can deal it. 2.3 is also what the three WORKING signs already had (the lit box 8.4, the
+ * painted board 2.6), so this is the rule they were following unwritten.
+ */
+const FASCIA_MIN_RATIO = 2.3;
+/**
+ * Lettering colour for a shop fascia, pushed away from the board until it meets FASCIA_MIN_RATIO. `alpha` is the
+ * alpha the text is drawn at, so a deliberately faded sign is judged on what actually lands on the board rather
+ * than on the ink it was authored with. The direction is whatever the author chose - light letters stay light,
+ * a ghost stays darker than its board - this only ever increases the separation.
+ */
+function fasciaInk(board: readonly number[], ink: readonly number[], alpha = 1): string {
+  const lb = Math.max(1, luma(board));
+  const li = luma(ink);
+  const eff = alpha * li + (1 - alpha) * lb;
+  const want = eff >= lb ? lb * FASCIA_MIN_RATIO : lb / FASCIA_MIN_RATIO;
+  if (eff >= lb ? eff >= want : eff <= want) return rgba(ink[0], ink[1], ink[2], alpha);
+  const k = ((want - (1 - alpha) * lb) / alpha) / Math.max(1, li);
+  return rgba(Math.min(255, ink[0] * k), Math.min(255, ink[1] * k), Math.min(255, ink[2] * k), alpha);
+}
 /** Mixes toward white (k > 0) for texture-side highlights. */
 function tint(c: number, k: number): string {
   const r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
@@ -474,6 +542,24 @@ export class TextureFactory {
     }
   }
 
+  /**
+   * Scales a finished albedo canvas by `k` in LINEAR light, not in sRGB: `map` is sampled as sRGB and the renderer
+   * decodes it before lighting, so "half as bright a surface" is a factor on the decoded value. A plain 0.5 multiply
+   * on the sRGB bytes is a factor of 0.19 in light, which is why this is a pixel pass and not a composite.
+   */
+  private scaleLinear(ctx: CanvasRenderingContext2D, W: number, H: number, k: number): void {
+    const img = ctx.getImageData(0, 0, W, H);
+    const d = img.data;
+    const lut = new Uint8ClampedArray(256);
+    for (let v = 0; v < 256; v++) {
+      const s = v / 255;
+      const lin = (s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4)) * k;
+      lut[v] = Math.round(255 * (lin <= 0.0031308 ? lin * 12.92 : 1.055 * Math.pow(lin, 1 / 2.4) - 0.055));
+    }
+    for (let i = 0; i < d.length; i += 4) { d[i] = lut[d[i]]; d[i + 1] = lut[d[i + 1]]; d[i + 2] = lut[d[i + 2]]; }
+    ctx.putImageData(img, 0, 0);
+  }
+
   /** In-place wrapping 3 x 3 box blur of a canvas (softens 1 px flecks into aggregate). */
   private blur3(ctx: CanvasRenderingContext2D, W: number, H: number): void {
     const img = ctx.getImageData(0, 0, W, H);
@@ -722,6 +808,71 @@ export class TextureFactory {
     c.globalAlpha = a;
     c.fillRect(x, y, w, h);
     c.globalAlpha = 1;
+  }
+
+  /**
+   * What one window pane reflects, drawn as a straight-edged SHAPE inside the pane rect (see windows()).
+   *
+   * A real pane does not carry a soft sky-to-slate wash - it carries the hard edge between the sky and whatever
+   * stands opposite it, and at 12 m that edge is the only cue in the frame that says glass rather than painted
+   * panel. What it also is not is the SAME hard edge on every opening: a street reflects a different thing into
+   * every window on it, so this deals one of six figures per pane from `h`, in one of six sky tints, at an alpha
+   * that varies by a factor of two, and leaves roughly a sixth of the panes with no sky in them at all (the ones
+   * looking at the dark mass across the road). The head catch - the bright line where the glass meets the frame -
+   * is on three panes in four and is 2 to 4 px, because it was the single most repetitive mark on the old facade.
+   *
+   * `skyA` is the family's base strength (curtain walls take less: their glass is darker and there is far more of
+   * it per square metre of wall).
+   */
+  private paneReflection(ctx: CanvasRenderingContext2D, gx: number, gy: number, gw: number, gh: number, h: number, skyA: number): void {
+    const TINTS = [[206, 232, 248], [226, 238, 250], [184, 206, 230], [238, 241, 244], [196, 222, 246], [170, 190, 214]];
+    const kind = h % 6;
+    const t = TINTS[(h >>> 3) % TINTS.length];
+    const a = skyA * (0.6 + 0.6 * (((h >>> 6) & 7) / 7));
+    const flip = ((h >>> 9) & 1) === 1;
+    const L = flip ? gx : gx + gw, R = flip ? gx + gw : gx;   // L = the side the figure is anchored to
+    const hi = gh * (0.26 + 0.34 * (((h >>> 10) & 3) / 3));
+    const lean = gw * (0.3 + 0.55 * (((h >>> 12) & 3) / 3));
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(gx, gy, gw, gh);
+    ctx.clip();
+    ctx.fillStyle = rgba(t[0], t[1], t[2], a);
+    ctx.beginPath();
+    if (kind === 0) {
+      // Sky across the head, dipping toward one side: a low building or an open street opposite.
+      ctx.moveTo(R, gy); ctx.lineTo(L, gy); ctx.lineTo(L, gy + hi * 0.35);
+      ctx.lineTo(flip ? gx + lean : gx + gw - lean, gy + hi); ctx.lineTo(R, gy + hi);
+    } else if (kind === 1) {
+      // A tall block opposite with sky beside it: one steep full-height diagonal, sky on the open side.
+      ctx.moveTo(L, gy); ctx.lineTo(flip ? gx + lean : gx + gw - lean, gy);
+      ctx.lineTo(flip ? gx + lean * 0.45 : gx + gw - lean * 0.45, gy + gh); ctx.lineTo(L, gy + gh);
+    } else if (kind === 2) {
+      // A rendered wall opposite catching the sun low down: the PALE half is at the foot, not the head.
+      ctx.moveTo(gx, gy + gh); ctx.lineTo(gx + gw, gy + gh); ctx.lineTo(gx + gw, gy + gh - hi * 0.8);
+      ctx.lineTo(gx, gy + gh - hi * (flip ? 0.45 : 1.1));
+    } else if (kind === 3) {
+      // Nothing but the dark mass opposite: no sky figure at all.
+      ctx.restore();
+      return;
+    } else if (kind === 4) {
+      // The gap between two blocks opposite: a full-height sliver of sky down one edge.
+      const w = gw * (0.16 + 0.22 * (((h >>> 14) & 3) / 3));
+      ctx.moveTo(L, gy); ctx.lineTo(flip ? gx + w : gx + gw - w, gy);
+      ctx.lineTo(flip ? gx + w * 1.5 : gx + gw - w * 1.5, gy + gh); ctx.lineTo(L, gy + gh);
+    } else {
+      // A horizon: the roof line of a long low terrace, straight across at its own height.
+      const y = gy + gh * (0.3 + 0.3 * (((h >>> 14) & 3) / 3));
+      ctx.moveTo(gx, gy); ctx.lineTo(gx + gw, gy); ctx.lineTo(gx + gw, y);
+      ctx.lineTo(gx, y + gh * (flip ? 0.08 : -0.08));
+    }
+    ctx.closePath();
+    ctx.fill();
+    if (kind !== 2 && ((h >>> 16) & 3) !== 0) {
+      ctx.fillStyle = rgba(236, 248, 255, a * (0.6 + 0.4 * (((h >>> 18) & 1))));
+      ctx.fillRect(gx, gy, gw, 2 + ((h >>> 19) & 1) * 2);
+    }
+    ctx.restore();
   }
 
   /** In-place wrapping 1 px soften ([1 2 1] / 4, separable) of a canvas' RGB, alpha untouched: every edge then sits between texels and mips average instead of sparkling. */
@@ -1031,14 +1182,25 @@ export class TextureFactory {
         const wc = ground && style !== 'glass' ? groundCell : cell;
         const gx = x0 + wc.wx * cw, gy = y0 + wc.wy * rh, gw = wc.ww * cw, gh = wc.wh * rh;
         if (style === 'glass') {
-          // Curtain wall pane: a random tone (blue / teal / grey) under a sky-to-slate gradient.
+          // Curtain wall pane: a random tone (blue / teal / grey) under a sky-to-slate gradient whose HORIZON, and
+          // how much sky and how much slate sit either side of it, are per pane. One fixed gradient here - 0.6 alpha
+          // of sky over the top half of every pane in the city - was the strongest single mark on a curtain wall and
+          // the same mark thirty-two times per tile, which is what made a tower read as one painted sheet and what
+          // buried the reflection deck below it.
+          const gk = cellHash(row + 613, c * 17 + 3);
+          const hz = 0.22 + 0.5 * (((gk >>> 2) & 7) / 7);
+          const up = 0.34 + 0.38 * (((gk >>> 5) & 7) / 7), dn = 0.16 + 0.36 * (((gk >>> 8) & 7) / 7);
+          // A third of the panes are INVERTED - dark above a bright foot. That is a real curtain wall: the panes on
+          // the lower floors reflect the sunlit render of the block opposite, not the sky, and without a share of
+          // them every pane in the city keeps the same pale-top / dark-foot ramp however much its horizon moves.
+          const inv = ((gk >>> 11) % 3) === 0;
           m.ctx.fillStyle = GLASS_TONES[rng.int(0, 2)];
           m.ctx.fillRect(gx, gy, gw, gh);
-          const sky = m.ctx.createLinearGradient(0, gy, 0, gy + gh);
-          sky.addColorStop(0, rgba(200, 240, 250, 0.6));
-          sky.addColorStop(0.5, rgba(200, 240, 250, 0));
-          sky.addColorStop(0.55, rgba(40, 52, 66, 0));
-          sky.addColorStop(1, rgba(40, 52, 66, 0.4));
+          const sky = m.ctx.createLinearGradient(0, inv ? gy + gh : gy, 0, inv ? gy : gy + gh);
+          sky.addColorStop(0, rgba(200, 240, 250, up));
+          sky.addColorStop(hz - 0.02, rgba(200, 240, 250, up * 0.18));
+          sky.addColorStop(hz, rgba(40, 52, 66, 0));
+          sky.addColorStop(1, rgba(40, 52, 66, dn));
           m.ctx.fillStyle = sky;
           m.ctx.fillRect(gx, gy, gw, gh);
         } else {
@@ -1115,42 +1277,24 @@ export class TextureFactory {
           m.ctx.fillStyle = rgba(238, 236, 228, 0.5);
           m.ctx.fillRect(((ch >>> 20) & 1) === 0 ? gx : gx + gw - nw, gy, nw, gh);
         }
-        // Sky IN the glass, as a SHAPE rather than a wash. The old pane carried a soft vertical sky-to-slate
-        // gradient, which is what a painted cloud looks like, not what glass looks like: a real pane reflects the
-        // hard edge between the sky and whatever stands opposite it, and at 12 m that edge is the only cue that
-        // says glass. So each pane gets a straight-edged reflection wedge across its head (the sky), a bright
-        // 2 px catch along the very top of it, and a short dark street reflection at its foot. The wedge's slope,
-        // its depth and which corner it leans out of come off the cell hash, so a floor of eight panes shows eight
-        // reflections and never one repeated gradient.
-        const refl = (ch >>> 24) & 255;
-        const flip = (refl & 1) === 1;
-        const hi = gh * (0.3 + 0.24 * (((refl >>> 1) & 3) / 3));
-        const lean = gw * (0.35 + 0.5 * (((refl >>> 3) & 3) / 3));
-        const skyA = style === 'glass' ? 0.3 : 0.42;
-        m.ctx.save();
-        m.ctx.beginPath();
-        m.ctx.rect(gx, gy, gw, gh);
-        m.ctx.clip();
-        m.ctx.fillStyle = rgba(206, 232, 248, skyA);
-        m.ctx.beginPath();
-        m.ctx.moveTo(flip ? gx : gx + gw, gy);
-        m.ctx.lineTo(flip ? gx + gw : gx, gy);
-        m.ctx.lineTo(flip ? gx + gw : gx, gy + hi * 0.35);
-        m.ctx.lineTo(flip ? gx + lean : gx + gw - lean, gy + hi);
-        m.ctx.lineTo(flip ? gx : gx + gw, gy + hi);
-        m.ctx.closePath();
-        m.ctx.fill();
-        // The catch along the head: a thin hard highlight where the pane meets its frame.
-        m.ctx.fillStyle = rgba(236, 248, 255, skyA * 0.85);
-        m.ctx.fillRect(gx, gy, gw, 3);
-        m.ctx.restore();
-        // Street reflection at the foot: short, dark, and hard-topped for the same reason.
-        const foot = m.ctx.createLinearGradient(0, gy + gh - gh * 0.3, 0, gy + gh);
-        foot.addColorStop(0, rgba(24, 33, 44, 0.04));
-        foot.addColorStop(0.45, rgba(24, 33, 44, 0.14));
-        foot.addColorStop(1, rgba(20, 28, 38, 0.26));
-        m.ctx.fillStyle = foot;
-        m.ctx.fillRect(gx, gy + gh - gh * 0.3, gw, gh * 0.3);
+        // Sky IN the glass, as a SHAPE rather than a wash (see paneReflection). The reflection deck is keyed off its
+        // OWN hash: `ch`'s low twenty-two bits are already spent on the pane's luminance, warmth and curtain draw,
+        // and the eight bits that were left gave every pane in the city the same figure - a pale wedge across the
+        // head, same tint, same 3 px catch, varying only in how deep it dipped - which is exactly the "identical
+        // painted diagonal highlight in the same corner across twenty panes" this round was asked to kill.
+        const rk = cellHash(row + 977, c * 31 + 7);
+        this.paneReflection(m.ctx, gx, gy, gw, gh, rk, style === 'glass' ? 0.3 : 0.42);
+        // Street reflection at the foot: short, dark, and hard-topped for the same reason - but not on every pane
+        // and not always the same depth. A fixed foot on all thirty-two cells is one more mark the eye can count.
+        if (((rk >>> 21) & 7) !== 0) {
+          const fd = gh * (0.18 + 0.26 * (((rk >>> 24) & 3) / 3)), fa = 0.45 + 0.85 * (((rk >>> 26) & 3) / 3);
+          const foot = m.ctx.createLinearGradient(0, gy + gh - fd, 0, gy + gh);
+          foot.addColorStop(0, rgba(24, 33, 44, 0.04 * fa));
+          foot.addColorStop(0.45, rgba(24, 33, 44, 0.14 * fa));
+          foot.addColorStop(1, rgba(20, 28, 38, 0.26 * fa));
+          m.ctx.fillStyle = foot;
+          m.ctx.fillRect(gx, gy + gh - fd, gw, fd);
+        }
         // Glazing is glass whatever sits behind it, and far smoother than the render around it: that split (0.15 on
         // the pane against 0.92 on the wall) is what makes a window catch the sky at all. The .r channel marks the
         // pane so Materials can lift the sky probe on it and keep the plaster grain off it.
@@ -2014,14 +2158,21 @@ export class TextureFactory {
         const ty = (Y(SHOP_BAND_H - 0.32) + fy1) / 2 + 2;
         m.ctx.letterSpacing = '3px';
         if (bay.sign === 'none') {
-          m.ctx.fillStyle = '#a4a4a0';
+          // A ghost sign is the SHADOW of lettering that has been taken down, not a faint copy of it: the board
+          // behind the letters kept its paint while the rest of it bleached, so the mark is DARKER than the board
+          // and has a hard edge. Drawn as a pale-bleached board with dark ghost letters through the contrast rule,
+          // so it still reads as a ghost after the geometry has tinted the band. The word is deliberately not one
+          // any live bay carries - the old text was 'MANAV', which put an unreadable MANAV next to a readable one
+          // in the same shop run and read as a broken sign rather than as an empty unit.
+          const board = [178, 176, 168];
+          m.ctx.fillStyle = rgba(board[0], board[1], board[2], 1);
           m.ctx.fillRect(fx0, fy0, fw, fy1 - fy0);
           this.softRect(m.ctx, fx0, fy1 - 6, fw, 6, '#000', 0.25);
           m.ctx.font = fasciaFont;
           m.ctx.textAlign = 'center';
           m.ctx.textBaseline = 'middle';
-          m.ctx.fillStyle = rgba(255, 252, 240, 0.35);
-          m.ctx.fillText('MANAV', (bx0 + bx1) / 2, ty, fw - 40);
+          m.ctx.fillStyle = fasciaInk(board, [92, 88, 80], 0.8);
+          m.ctx.fillText('TUHAFİYE', (bx0 + bx1) / 2, ty, fw - 40);
           // Rust tears from the old bracket holes.
           for (let k = 0; k < 4; k++) {
             const hx = fx0 + fw * (0.14 + k * 0.24);
@@ -2051,7 +2202,7 @@ export class TextureFactory {
             c.font = fasciaFont;
             c.textAlign = 'center';
             c.textBaseline = 'middle';
-            c.fillStyle = c === m.ctx ? '#1c1c20' : '#000';
+            c.fillStyle = c === m.ctx ? fasciaInk([236, 236, 234], [28, 28, 32]) : '#000';
             c.fillText(bay.name, (bx0 + bx1) / 2, ty, fw - 44);
           }
           n.ctx.fillStyle = grey(0.6);
@@ -2060,7 +2211,10 @@ export class TextureFactory {
           r.ctx.fillRect(fx0 + 5, fy0 + 5, fw - 10, fy1 - fy0 - 10);
         } else if (bay.sign === 'wood') {
           // Timber board: grain lines, a bevelled edge, light serif lettering with a drop shadow, a spotlight wash.
-          m.ctx.fillStyle = '#767472';
+          // Darkened from #767472: a varnished timber board is dark, and at 116 levels of value it could not carry
+          // light serif lettering at FASCIA_MIN_RATIO without the letters clipping at white.
+          const wboard = [95, 92, 88];
+          m.ctx.fillStyle = rgba(wboard[0], wboard[1], wboard[2], 1);
           m.ctx.fillRect(fx0, fy0, fw, fy1 - fy0);
           for (let yy = fy0 + 5; yy < fy1 - 3; yy += rng.range(4, 9)) {
             m.ctx.fillStyle = rgba(0, 0, 0, rng.range(0.08, 0.2));
@@ -2082,7 +2236,7 @@ export class TextureFactory {
               c.fillStyle = rgba(0, 0, 0, 0.45);
               c.fillText(bay.name, (bx0 + bx1) / 2 + 3, ty + 3, fw - 40);
             }
-            c.fillStyle = c === m.ctx ? '#f6ecd6' : '#c8b48c';
+            c.fillStyle = c === m.ctx ? fasciaInk(wboard, [246, 236, 214]) : '#c8b48c';
             c.fillText(bay.name, (bx0 + bx1) / 2, ty, fw - 40);
           }
           n.ctx.fillStyle = grey(0.58);
@@ -2091,7 +2245,8 @@ export class TextureFactory {
           r.ctx.fillRect(fx0, fy0, fw, fy1 - fy0);
         } else {
           // Painted board: a mid-dark panel with a lit top edge, light letters that stay lit at night.
-          m.ctx.fillStyle = '#5e5e5e';
+          const pboard = [94, 94, 94];
+          m.ctx.fillStyle = rgba(pboard[0], pboard[1], pboard[2], 1);
           m.ctx.fillRect(fx0, fy0, fw, fy1 - fy0);
           this.softRect(m.ctx, fx0, fy0, fw, 3, '#fff', 0.2);
           this.softRect(m.ctx, fx0, fy1 - 7, fw, 7, '#000', 0.35);
@@ -2105,7 +2260,7 @@ export class TextureFactory {
               c.fillStyle = rgba(0, 0, 0, 0.35);
               c.fillText(bay.name, (bx0 + bx1) / 2 + 3, ty + 3, fw - 40);
             }
-            c.fillStyle = c === m.ctx ? '#f8f4ea' : '#d8cca8';
+            c.fillStyle = c === m.ctx ? fasciaInk(pboard, [248, 244, 234]) : '#d8cca8';
             c.fillText(bay.name, (bx0 + bx1) / 2, ty, fw - 40);
           }
           n.ctx.fillStyle = grey(0.56);
@@ -2599,41 +2754,80 @@ export class TextureFactory {
     const { canvas, ctx } = this.canvas(S, S);
     const px = S / ROAD_TILE_M;
     const rng = new Random(4401);
-    const area = (S / px) * (S / px);
-    const nCluster = Math.round(area * CHIP.perM2);
-    // One stone: an ellipse, not a rect. At three to six texels a square chip reads as a magnified TEXEL - the pixel
-    // grid itself - which is the one shape a hand-made surface must never have; a rounded stone at the same size
-    // reads as a stone. Wrapped, so a chip crossing the edge is drawn again on the far side and the bed tiles.
-    const chip = (x: number, y: number, w: number, h: number, rot: number, style: string): void => {
-      ctx.fillStyle = style;
+    // Coarse first, fine over it: the fine stones then break the coarse ones' outlines instead of sitting under them,
+    // which is what keeps a 9-texel stone from reading as a painted dot on an otherwise clean bed.
+    this.chipClass(ctx, S, px, rng, CHIP.coarse);
+    this.chipClass(ctx, S, px, rng, CHIP.fine);
+    this.scratch.set(key, canvas);
+    return canvas;
+  }
+
+  /**
+   * One size class of the chip bed (see CHIP): clusters of flat three-tone stones, wrapped so the bed tiles.
+   *
+   * `sides` > 0 draws an ANGULAR stone - a rotated polygon whose vertex radii are jittered +-22 %, so no two stones
+   * are the same outline and none of them is a regular shape. (An ellipse at three to six texels is right for the
+   * fine class; a rectangle at any size reads as a magnified TEXEL - the pixel grid itself - which is the one shape a
+   * hand-made surface must never have.)
+   *
+   * `rim` > 0 shades one side of the stone: the same outline drawn again in CHIP.dark, offset by a fraction of the
+   * stone's width and clipped to it. The offset direction is per-stone random and the rim is always the DARK tone,
+   * never a highlight - a highlight baked in one direction is a lighting decision and this game's sun moves, while
+   * the shaded side of a stone standing proud of the bitumen is occlusion and reads the same at every hour.
+   */
+  private chipClass(ctx: CanvasRenderingContext2D, S: number, px: number, rng: Random, cl: ChipClass): void {
+    const nCluster = Math.round((S / px) * (S / px) * cl.perM2);
+    // Wrapped: a stone crossing the edge is drawn again on the far side, so the bed tiles.
+    const path = (x: number, y: number, w: number, h: number, rot: number, jit: readonly number[]): void => {
+      ctx.beginPath();
       for (let ox = -1; ox <= 1; ox++) {
         for (let oy = -1; oy <= 1; oy++) {
           const cx = x + ox * S, cy = y + oy * S;
           if (cx < -w || cx > S + w || cy < -h || cy > S + h) continue;
-          ctx.beginPath();
-          ctx.ellipse(cx, cy, w * 0.5, h * 0.5, rot, 0, Math.PI * 2);
-          ctx.fill();
+          if (!jit.length) { ctx.ellipse(cx, cy, w * 0.5, h * 0.5, rot, 0, Math.PI * 2); continue; }
+          for (let k = 0; k < jit.length; k++) {
+            const a = rot + (k / jit.length) * Math.PI * 2;
+            const vx = cx + Math.cos(a) * w * 0.5 * jit[k], vy = cy + Math.sin(a) * h * 0.5 * jit[k];
+            if (k === 0) ctx.moveTo(vx, vy); else ctx.lineTo(vx, vy);
+          }
+          ctx.closePath();
         }
       }
     };
+    const jit: number[] = [];
     for (let i = 0; i < nCluster; i++) {
       const cx = rng.range(0, S), cy = rng.range(0, S);
-      const r = rng.range(CHIP.rMin, CHIP.rMax) * px;
-      const n = Math.round(Math.PI * (r / px) * (r / px) * CHIP.density);
+      const r = rng.range(cl.rMin, cl.rMax) * px;
+      const n = Math.round(Math.PI * (r / px) * (r / px) * cl.density);
       for (let j = 0; j < n; j++) {
         // Uniform over the disc, so a bed has a definite edge instead of a gaussian falloff; the clusters overlap
-        // (CHIP.perM2 x their area is well over 1) so what reads is scattered stone, not a field of discs.
+        // (perM2 x their area is well over 1) so what reads is scattered stone, not a field of discs.
         const a = rng.range(0, Math.PI * 2), d = Math.sqrt(rng.next()) * r;
         const x = cx + Math.cos(a) * d, y = cy + Math.sin(a) * d;
-        const w = rng.range(CHIP.min, CHIP.max) * px, h = w * rng.range(0.45, 1.0);
-        const dark = rng.chance(CHIP.darkShare);
-        const c = dark ? CHIP.dark : CHIP.pale;
-        const al = dark ? rng.range(CHIP.darkA[0], CHIP.darkA[1]) : rng.range(CHIP.paleA[0], CHIP.paleA[1]);
-        chip(x, y, w, h, rng.range(0, Math.PI), rgba(c[0], c[1], c[2], al));
+        const w = rng.range(cl.min, cl.max) * px, h = w * rng.range(0.55, 1.0);
+        const rot = rng.range(0, Math.PI);
+        jit.length = 0;
+        for (let k = 0; k < cl.sides; k++) jit.push(rng.range(0.78, 1.0));
+        const t = rng.next();
+        const c = t < cl.shares[0] ? CHIP.pale : t < cl.shares[0] + cl.shares[1] ? CHIP.mid : CHIP.dark;
+        // The dark tone needs the top of the alpha range and the pale tone the bottom of it: against 46-level
+        // bitumen a dark stone has 46 levels to work with and a pale one has 209.
+        const al = c === CHIP.pale ? rng.range(cl.alpha[0], cl.alpha[0] * 2.0)
+          : c === CHIP.mid ? rng.range(cl.alpha[0] * 1.4, cl.alpha[1]) : rng.range(cl.alpha[1] * 0.9, cl.alpha[1] * 1.5);
+        ctx.fillStyle = rgba(c[0], c[1], c[2], al);
+        path(x, y, w, h, rot, jit);
+        ctx.fill();
+        if (cl.rim <= 0 || c === CHIP.dark) continue;
+        const ra = rng.range(0, Math.PI * 2), rd = cl.rim * w;
+        ctx.save();
+        path(x, y, w, h, rot, jit);
+        ctx.clip();
+        ctx.fillStyle = rgba(CHIP.dark[0], CHIP.dark[1], CHIP.dark[2], al * 1.1);
+        path(x + Math.cos(ra) * rd, y + Math.sin(ra) * rd, w, h, rot, jit);
+        ctx.fill();
+        ctx.restore();
       }
     }
-    this.scratch.set(key, canvas);
-    return canvas;
   }
 
   /**
@@ -3198,6 +3392,16 @@ export class TextureFactory {
       ctx.bezierCurveTo(S * 0.3, i * 32 - 6, S * 0.6, i * 32 + 22, S, i * 32 + 8);
       ctx.stroke();
     }
+    // #dcc48e decodes to 0.55 of linear white: a higher albedo than fresh concrete, and about 1.5x what dry sand
+    // actually has. Nothing in the frame notices by day except that the beach clipped (mean 213.6/255 at noon with
+    // its brightest fifth pinned at the tone mapper's 223 ceiling, against 150 on the pavement in the same frame) -
+    // but at night it is the whole of the "beach lit at night" defect: sand read 93.2/255 against a 15.8 sky and a
+    // 36.9 sea, i.e. six times the luminance of the sky lighting it, which no diffuse surface can be. Measured at
+    // source, 55 % of that came from the moon key (sand 93.2 -> 42.3 with SkySystem's night `sun.intensity` zeroed)
+    // and 16 % from the night hemisphere lift (-> 78.7 with SkySystem's `+ nightFactor * 3.2` zeroed); an albedo
+    // this high simply multiplies every one of those terms. 0.62 of linear puts the beach at a 0.34 albedo, which
+    // is dry quartz sand, and scales all three terms with it. Applied in LIGHT, not on the bytes (see scaleLinear).
+    this.scaleLinear(ctx, S, S, 0.55);
     return this.finish(key, canvas, true);
   }
 

@@ -74,6 +74,57 @@ export function shadowExtent(half: number): number {
   return contactExtent(half);
 }
 
+/**
+ * When the COARSE car shells (the static parked batches past the near band, and the live mid-LOD band) are worth their
+ * place in the sun shadow pass. Both numbers come off the phase-1 diagnosis, which measured what a car's cast shadow
+ * is actually worth per hour rather than assuming it:
+ *
+ * - `minSunY` — sine of the shadow-casting light's elevation. SkySystem clamps the key light's elevation at
+ *   `ey = Math.max(ly, 0.28)`, so every hour whose real sun is lower reads back as y ~ 0.27 (07:00 0.270,
+ *   08:00 0.278, 18:00 0.273, 19:00 0.270 — measured off the live light). At exactly those hours 96.9-99.5 % of the
+ *   visible ground is already inside a BUILDING's shadow, and a car's cast shadow landing in one measured 4.99/255
+ *   against the 8/255 visibility bar. The first hour whose ground is genuinely lit is 17:00 at y = 0.343, where the
+ *   same car's shadow measures 16.96/255 and must keep casting — so the gate sits between them, at 0.30, and noon
+ *   (0.759), 09:00 (0.431) and 15:00 (0.642) are untouched.
+ * - `maxNight` — at full night the key light is the MOON at a third of the sun's intensity; SkySystem switches to it
+ *   at nightFactor > 0.9, and its elevation is unrelated to the sun's (21:00 reads y = 0.469). CLAUDE.md's own note
+ *   is that the moon shadow is almost nothing and the blob is the only thing holding a car on the road after dark.
+ *
+ * The near parked tier (inside 8 m) and the full live body (inside 30 m) are deliberately NOT gated: those are the
+ * cars the camera is standing next to, and a mesh that does not cast cannot shadow ITSELF either — at a raking sun
+ * the roof's shadow across the far flank is most of a car's form.
+ */
+export const LOW_SUN_SHADOW = { minSunY: 0.30, maxNight: 0.9 } as const;
+
+const sunLights = new WeakMap<THREE.Scene, THREE.DirectionalLight>();
+const sunVec = new THREE.Vector3();
+let lightProbe: THREE.DirectionalLight | null = null;
+function probeDirectional(o: THREE.Object3D): void {
+  if (!lightProbe && (o as THREE.DirectionalLight).isDirectionalLight) lightProbe = o as THREE.DirectionalLight;
+}
+
+/**
+ * Sine of the key light's elevation, read straight off the scene's directional light (SkySystem owns exactly one, and
+ * it is the moon's direction at night). The renderers that have to decide whether to pay for a shadow are the ones
+ * that submit the geometry, and neither of them is handed a sun direction: `PropRenderer.update` takes a camera
+ * position and `VehicleRenderer.sync` a world, so the light itself is the only path to the number that does not run a
+ * new argument through CityRenderer and Engine. Cached per scene; allocation-free after the first call, and it answers
+ * 1 (i.e. "high sun, keep casting") for a scene with no directional light at all.
+ */
+export function keyLightElevation(scene: THREE.Scene): number {
+  let light = sunLights.get(scene);
+  if (!light) {
+    lightProbe = null;
+    scene.traverse(probeDirectional);
+    if (!lightProbe) return 1;
+    light = lightProbe;
+    sunLights.set(scene, light);
+  }
+  sunVec.copy(light.position).sub(light.target.position);
+  const len = sunVec.length();
+  return len > 1e-6 ? sunVec.y / len : 1;
+}
+
 const KEYS: VehicleKey[] = ['sedan', 'sport', 'van', 'police', 'taxi'];
 /** Head / tail light quads are drawn a little smaller than their anchor so the lamp bezel and lens rim show around them. */
 const LIGHT_QUAD_SCALE = 0.86;
@@ -1235,7 +1286,7 @@ export function parkedShellGeometry(s: VehicleSpec): THREE.BufferGeometry {
 
 /**
  * The four baked wheels of a static parked car (which is not a Vehicle, so nothing instances a lathed wheel for it).
- * `seg`-sided in three grades. `rim` (near): a shouldered tyre with a lathed alloy set into both bead faces. `mid`:
+ * `seg`-sided in three grades. `rim` (near): a shouldered tyre with a recessed lathed alloy dish in both bead faces. `mid`:
  * the same shouldered profile at three bands, with a flat alloy disc plugging each bead — a split sidewall / tread /
  * rim at a third of the near wheel's triangles, which is what a 20-32 m wheel actually reads as. `flat` (far): a plain
  * cylinder whose cap centre carries the bright hub and whose cap edge and tread stay tyre black, so the fan still
@@ -1273,21 +1324,54 @@ function bakedWheels(out: THREE.BufferGeometry[], s: VehicleSpec, profile: Vehic
       continue;
     }
     // Tyre: rings along the axle (authored about y, rotated onto x with the rest). The tread pulls in hard at both
-    // sidewalls, so the outer face is a narrow bead ring rather than the flat black wall a plain cylinder shows.
+    // sidewalls, so the outer face is a narrow bead ring rather than the flat black wall a plain cylinder shows. The
+    // bead seat lands on the rim barrel's own radius below, so the tyre seals on the rim instead of leaving an open
+    // bore whose back faces read as a black hole around the alloy.
+    const rimR = r * 0.55;
     const tyre = tube([
-      { y: -w * 0.5, rx: r * 0.6, rz: r * 0.6 }, { y: -w * 0.4, rx: r * 0.82, rz: r * 0.82 }, { y: -w * 0.26, rx: r, rz: r },
-      { y: w * 0.26, rx: r, rz: r }, { y: w * 0.4, rx: r * 0.82, rz: r * 0.82 }, { y: w * 0.5, rx: r * 0.6, rz: r * 0.6 },
+      { y: -w * 0.5, rx: rimR, rz: rimR }, { y: -w * 0.4, rx: r * 0.82, rz: r * 0.82 }, { y: -w * 0.26, rx: r, rz: r },
+      { y: w * 0.26, rx: r, rz: r }, { y: w * 0.4, rx: r * 0.82, rz: r * 0.82 }, { y: w * 0.5, rx: rimR, rz: rimR },
     ], seg, false, false);
     tyre.rotateZ(Math.PI / 2);
     tyre.translate(x, r, z);
-    out.push(decorate(tyre, TYRE_BLACK, MATTE_MIX));
-    // Alloy plugging the open bead on both flanks (one geometry per corner, so each disc closes its own side): a
-    // bright dish inside a darker rim, shaded by radius from the axle so the lathe's orientation does not matter.
+    // The same four sidewall bands the LATHED wheel carries (wheelGeometry), by radius from the axle: a parked car at
+    // 3 m and a driven one at 3 m are the same object to the eye, and a flat black annulus beside a banded one is the
+    // difference the last critic read as a toy. The steps land on the profile's own rings, so each is a real crease.
+    out.push(shade(decorate(tyre, TYRE_BLACK, MATTE_MIX), (_px, py, pz) => {
+      const rad = Math.hypot(py - r, pz - z) / r;
+      if (rad >= 0.95) return 1.1; // tread
+      if (rad >= 0.88) return 0.62; // shoulder, turning away from the sky
+      if (rad >= 0.74) return 1.0; // moulded sidewall crest
+      return rad >= 0.62 ? 0.72 : 0.5; // sidewall down to the bead seat, deep in the rim's shadow
+    }));
+    // Alloy: the LATHED wheel's arrangement — a barrel through the bead and a dish face set 5 cm inside it — instead
+    // of the flat plate this grade used to lay in the plane of the tyre.
+    //
+    // That plate was a two-ring lathe at EIGHT sides, capped on both faces. Measured in /rendertest abeam a lot car at
+    // 3.1 m (camera 1028.75/0.45/644.6, 1280x720, noon): the wheel is 242 px across there and the plate filled 154 px
+    // of it, so each of its eight straight edges ran about 59 px, inside a ten-sided tyre — the "visible octagon" of
+    // the round-12 critique. It IS the near tier that draws it (prop:parkedNear holds that car; the 8 m hand-over is
+    // doing its job), so the fix is the mesh, not the tier distance. Three things, none of them a new draw call:
+    //  - `seg` 16 at the near grade, as the lathed wheel, so bead and rim are curves at arm's length;
+    //  - the dish is RECESSED and the rim barrel behind it is a real surface, so the alloy reads by its depth break
+    //    rather than by its outline, which no segment count can fix on a flat plate;
+    //  - a five-lobe spoke fan in the vertex colours. A blade of geometry would be 7 x 2 x 16 triangles a wheel for a
+    //    shape the size of a fingernail, and a lobe count that does not divide `seg` keeps the fan off the facet grid.
+    const barrel = new THREE.CylinderGeometry(rimR, rimR, w, seg, 1, true);
+    barrel.rotateZ(Math.PI / 2);
+    barrel.translate(x, r, z);
+    out.push(shade(decorate(barrel, LOD_RIM, MATTE_MIX), () => 0.42)); // deep in the bead's shadow
     for (let e = -1; e <= 1; e += 2) {
-      const face = tube([{ y: -0.008, rx: r * 0.63, rz: r * 0.63 }, { y: 0.008, rx: r * 0.6, rz: r * 0.6 }], 8, true, true);
-      face.rotateZ(Math.PI / 2);
-      face.translate(x + e * w * 0.5, r, z);
-      out.push(shade(decorate(face, LOD_RIM, MATTE_MIX), (_px, py, pz) => (Math.hypot(py - r, pz - z) < r * 0.4 ? 1 : 0.5)));
+      const face = new THREE.CircleGeometry(rimR, seg);
+      face.rotateY(e > 0 ? Math.PI / 2 : -Math.PI / 2);
+      face.translate(x + e * (w * 0.5 - 0.05), r, z);
+      // The fan's centre vertex carries the hub tone and its rim ring the lobes, so every wedge is a spoke widening
+      // out of the hub rather than a painted line across a plate.
+      out.push(shade(decorate(face, LOD_RIM, MATTE_MIX), (_px, py, pz) => {
+        const rad = Math.hypot(py - r, pz - z) / rimR;
+        if (rad <= 0.2) return 1.05; // hub boss
+        return 0.4 + 0.32 * (1 + Math.cos(Math.atan2(py - r, pz - z) * 5));
+      }));
     }
   }
 }
@@ -1323,7 +1407,7 @@ export function parkedMidGeometry(s: VehicleSpec): THREE.BufferGeometry {
  * Near shell for the handful of static parked cars closest to the camera (CityRendererProps' near group, within
  * ~35 m): the player's own body loft — every station at FULL_RING, so the belt crease, the gasket bands and the lens
  * split are all there — with the pillars, shut lines, rocker strip, handles, mirrors, plates, grille, bumpers, the
- * lamp blocks with their lens quads, the arch fenders and the exhaust, plus a 12-sided baked wheel per corner. About
+ * lamp blocks with their lens quads, the arch fenders and the exhaust, plus a 16-sided baked wheel per corner. About
  * seven times the coarse shell's triangles, which is why only a capped near set is drawn from it; the coarse shell
  * takes over past the near range. Same attribute set and paint material, so the batch colour still tints the paint.
  */
@@ -1338,7 +1422,7 @@ export function parkedNearGeometry(s: VehicleSpec): THREE.BufferGeometry {
   }
   geos.push(exhaustGeometry(profile.exhaust.x, profile.exhaust.y, profile.exhaust.zFace));
   geos.push(underbodyGeometry(s, profile, 'near'));
-  bakedWheels(geos, s, profile, 10, 'rim');
+  bakedWheels(geos, s, profile, 16, 'rim');
   const merged = mergeGeometries(geos, false);
   if (!merged) throw new Error('parked near shell merge failed (attribute mismatch)');
   for (let i = 0; i < geos.length; i++) geos[i].dispose();
@@ -1589,6 +1673,8 @@ export class VehicleRenderer {
   private readonly euler = new THREE.Euler(0, 0, 0, 'YXZ');
   private readonly color = new THREE.Color();
   private nightFactor = 1;
+  /** Current state of the mid-LOD sun-shadow gate (LOW_SUN_SHADOW), so the flag is only written when it changes. */
+  private midCast = true;
 
   constructor(scene: THREE.Scene) {
     this.scene = scene;
@@ -1621,7 +1707,8 @@ export class VehicleRenderer {
         lod.name = tier === 0 ? `veh:mid:${key}` : `veh:lod:${key}`;
         lod.count = 0;
         lod.frustumCulled = false;
-        // Mid tier casts (see bodyMidDist); the far shell does not.
+        // Mid tier casts (see bodyMidDist) while the sun is high enough for the shadow to land on lit ground; the far
+        // shell never does. `sync` re-evaluates the mid flag each frame (LOW_SUN_SHADOW).
         lod.castShadow = tier === 0;
         lod.receiveShadow = true;
         lod.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -1698,6 +1785,14 @@ export class VehicleRenderer {
     let lightIdx = 0;
     const sirenPhase = Math.floor(time * R.sirenHz * 2) % 2;
     let spotsSet = false;
+    // Mid-LOD shadow gate (see LOW_SUN_SHADOW). A per-frame boolean on five meshes, not a rebuild: `castShadow` is
+    // read by WebGLShadowMap when it collects the pass, so flipping it here adds or removes the whole 30-70 m band
+    // from the shadow map with no recompile (the depth material is shared and cached by material, not by object).
+    const midCast = this.nightFactor < LOW_SUN_SHADOW.maxNight && keyLightElevation(this.scene) >= LOW_SUN_SHADOW.minSunY;
+    if (midCast !== this.midCast) {
+      this.midCast = midCast;
+      for (let i = 0; i < KEYS.length; i++) this.midBodies[KEYS[i]].castShadow = midCast;
+    }
     this.shadows.begin();
     for (let i = 0; i < list.length; i++) {
       const v = list[i];
